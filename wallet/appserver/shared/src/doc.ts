@@ -13,6 +13,13 @@ const fourSigFigs = new Intl.NumberFormat(languages, {
   maximumSignificantDigits: 4
 })
 
+const usdFormatter = new Intl.NumberFormat(languages, {
+  style: 'currency',
+  currency: 'USD',
+  minimumFractionDigits: 2,
+  maximumFractionDigits: 2
+})
+
 /* A cache for formatters used for Doc.formatCoinValue. */
 const decimalFormatters: Record<number, Intl.NumberFormat> = {}
 
@@ -91,6 +98,23 @@ export default class Doc {
   }
 
   /*
+   * formatConventionalValue formats a value that is already in conventional
+   * (whole) units — e.g. an aggregate summed across an asset's network variants
+   * — rather than atomic units plus a UnitInfo. Rendering mirrors
+   * formatCoinValue: integers show no decimals, otherwise up to prec fractional
+   * digits with insignificant trailing zeros trimmed.
+   *
+   * prec must come from the value's own conversion factor (log10 of it, as
+   * formatCoinValue derives it), not a fixed guess. Assets differ: ETH's atomic
+   * unit is gwei (factor 1e9), so a value smaller than a gwei needs 9 digits and
+   * anything less silently renders it as zero.
+   */
+  static formatConventionalValue (v: number, prec: number): string {
+    if (Number.isInteger(v)) return intFormatter.format(v)
+    return decimalFormatter(prec).format(v)
+  }
+
+  /*
    * formatRateFullPrecision formats rate to represent it exactly at rate step
    * precision, trimming non-effectual zeros if there are any.
    */
@@ -106,6 +130,82 @@ export default class Doc {
   static formatFourSigFigs (n: number, maxDecimals?: number): string {
     return formatSigFigsWithFormatters(intFormatter, fourSigFigs, n, maxDecimals)
   }
+
+  /* formatUSD formats a dollar amount as a USD currency string. */
+  static formatUSD (usd: number): string {
+    return usdFormatter.format(usd)
+  }
+
+  /*
+   * formatInt formats a whole number — block heights, peer counts, fee rates —
+   * with locale grouping and no decimals. Callers use this rather than their own
+   * Intl.NumberFormat so the locale list stays filtered (see `languages`); an
+   * unfiltered navigator.languages throws on an invalid tag.
+   */
+  static formatInt (n: number): string {
+    return intFormatter.format(n)
+  }
+
+  /*
+   * usdString converts an atomic amount to a USD currency string via the
+   * asset's conventional conversion factor and fiat rate, or '' when the rate
+   * is unknown.
+   */
+  static usdString (atomic: number, cFactor: number, rate: number): string {
+    if (!rate) return ''
+    return usdFormatter.format((atomic / cFactor) * rate)
+  }
+
+  /*
+   * timeSince returns a coarse, human-readable duration since the given
+   * timestamp in milliseconds, e.g. "3 h 20 m" or "5 d 2 h".
+   */
+  static timeSince (ms: number): string {
+    return Doc.formatDuration(new Date().getTime() - ms)
+  }
+
+  /*
+   * formatDuration returns a string representation of a duration in ms. A
+   * non-positive duration (e.g. a block timestamp slightly ahead of the local
+   * clock) renders as "0 s"; without the clamp, Math.floor on a negative
+   * quotient would cascade a huge positive remainder into the smaller units.
+   */
+  static formatDuration (dur: number): string {
+    let seconds = Math.floor(Math.max(dur, 0))
+    let result = ''
+    let count = 0
+    const add = (n: number, s: string) => {
+      if (n > 0 || count > 0) count++
+      if (n > 0) result += `${n} ${s} `
+      return count >= 2
+    }
+    let y, mo, d, h, m, s
+    [y, seconds] = timeMod(seconds, aYear)
+    if (add(y, 'y')) { return result.trim() }
+    [mo, seconds] = timeMod(seconds, aMonth)
+    if (add(mo, 'mo')) { return result.trim() }
+    [d, seconds] = timeMod(seconds, aDay)
+    if (add(d, 'd')) { return result.trim() }
+    [h, seconds] = timeMod(seconds, anHour)
+    if (add(h, 'h')) { return result.trim() }
+    [m, seconds] = timeMod(seconds, aMinute)
+    if (add(m, 'm')) { return result.trim() }
+    [s, seconds] = timeMod(seconds, 1000)
+    add(s, 's')
+    return result.trim() || '0 s'
+  }
+}
+
+const aYear = 31536000000
+const aMonth = 2592000000
+const aDay = 86400000
+const anHour = 3600000
+const aMinute = 60000
+
+/* timeMod returns the quotient and remainder of t / dur. */
+function timeMod (t: number, dur: number): [number, number] {
+  const n = Math.floor(t / dur)
+  return [n, t - n * dur]
 }
 
 function formatSigFigsWithFormatters (intFormatter: Intl.NumberFormat, sigFigFormatter: Intl.NumberFormat, n: number, maxDecimals?: number, locales?: string | string[]): string {

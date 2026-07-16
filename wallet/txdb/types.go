@@ -68,6 +68,12 @@ type WalletTransaction struct {
 	// TokenID will be non-nil if the BalanceDelta applies to the balance
 	// of a token.
 	TokenID *uint32 `json:"tokenID,omitempty"`
+	// AssetID identifies the transaction's asset exactly: the token ID for
+	// token transactions, otherwise the native asset of the network the
+	// transaction was made on. It is populated on reads from cross-network
+	// queries (GetTxsByTicker), where the caller cannot otherwise attribute a
+	// native transaction to its network. Wallets do not set it.
+	AssetID *uint32 `json:"assetID,omitempty"`
 	// Recipient will be non-nil for Send/Receive transactions, and specifies the
 	// recipient address of the transaction.
 	Recipient *string `json:"recipient,omitempty"`
@@ -106,8 +112,18 @@ type WalletTransaction struct {
 
 // TxHistoryRequest is a request for transaction history.
 type TxHistoryRequest struct {
-	N           int               `json:"n"`
-	RefID       *string           `json:"refID"`
+	N     int     `json:"n"`
+	RefID *string `json:"refID"`
+	// RefNetwork is the settlement network (primary-key network) of the RefID
+	// transaction. It is only consulted by ticker-scoped history: the ticker
+	// index spans networks and cannot rebuild a primary key from RefID alone,
+	// so RefNetwork lets GetTxsByTicker look up the cursor's effective time and
+	// seek straight to it. It is required whenever RefID is set on a
+	// ticker-scoped request; GetTxsByTicker returns ErrMissingRefNetwork
+	// otherwise. Callers always have it: every returned transaction carries an
+	// AssetID, and a token's network resolves through its Token.NetworkID.
+	// Ignored by network-scoped getTxs, which already has its network.
+	RefNetwork  *uint32           `json:"refNetwork"`
 	Past        bool              `json:"past"`
 	IgnoreTypes []TransactionType `json:"ignoreTypes"`
 }

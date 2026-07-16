@@ -51,8 +51,14 @@ form.modal {
 img.logo-full {
   content: url("/img/bison-full_97x50.png");
 
-  &.small  { height: 25px; width: 48.5px; }
-  &.medium { height: 40px; width: 77.6px; }
+  &.small {
+    height: 25px;
+    width: 48.5px;
+  }
+  &.medium {
+    height: 40px;
+    width: 77.6px;
+  }
 }
 
 // -----------------------------------------------------------------------
@@ -80,7 +86,9 @@ img.logo-full {
   textarea {
     background-color: transparent;
 
-    &:focus { border: none; }
+    &:focus {
+      border: none;
+    }
   }
 }
 
@@ -287,8 +295,12 @@ img.logo-full {
   border-bottom: 1px solid var(--border-color);
   white-space: nowrap;
 
-  &.asset-th-asset { text-align: left; }
-  &.asset-th-num   { text-align: right; }
+  &.asset-th-asset {
+    text-align: left;
+  }
+  &.asset-th-num {
+    text-align: right;
+  }
 }
 
 .asset-row td {
@@ -297,7 +309,9 @@ img.logo-full {
   vertical-align: middle;
 }
 
-.asset-row-asset { text-align: left; }
+.asset-row-asset {
+  text-align: left;
+}
 
 .asset-row-num {
   text-align: right;
@@ -339,7 +353,9 @@ img.logo-full {
     outline-offset: 1px;
   }
 
-  & + .asset-action-icon { margin-left: 4px; }
+  &+.asset-action-icon {
+    margin-left: 4px;
+  }
 }
 
 .asset-logo {
@@ -384,9 +400,15 @@ img.logo-full {
 
 // Row highlight flash, triggered by clicking a ticker pill.
 @keyframes rowHighlight {
-  0%   { background-color: color-mix(in srgb, var(--accent-blue-border) 20%, transparent); }
-  60%  { background-color: color-mix(in srgb, var(--accent-blue-border) 13%, transparent); }
-  100% { background-color: transparent; }
+  0% {
+    background-color: color-mix(in srgb, var(--accent-blue-border) 20%, transparent);
+  }
+  60% {
+    background-color: color-mix(in srgb, var(--accent-blue-border) 13%, transparent);
+  }
+  100% {
+    background-color: transparent;
+  }
 }
 
 .asset-row-highlight {
@@ -411,9 +433,13 @@ img.logo-full {
   &:hover {
     background-color: color-mix(in srgb, var(--accent-blue) 13%, transparent);
 
-    td { opacity: 1; }
+    td {
+      opacity: 1;
+    }
 
-    .asset-row-add-wallet { color: var(--accent-blue-hover); }
+    .asset-row-add-wallet {
+      color: var(--accent-blue-hover);
+    }
   }
 }
 
@@ -422,7 +448,7 @@ img.logo-full {
 }
 
 .asset-row-add-wallet {
-  text-align: center;
+  text-align: right;
   vertical-align: middle;
   color: var(--accent-blue-text);
   font-size: 12px;
@@ -437,12 +463,20 @@ img.logo-full {
   user-select: all;
 }
 
+// Seed/mnemonic display box. Only the line spacing needs a custom rule; the rest
+// (padding, mono, break-all, …) is utilities on the element.
+.seed-phrase {
+  line-height: 1.6;
+}
+
 // Inactive network row in the Receive network picker.
 .receive-inactive-net {
   opacity: 0.65;
   border-bottom: 1px solid var(--border-color);
 
-  &:last-child { border-bottom: none; }
+  &:last-child {
+    border-bottom: none;
+  }
 }
 
 .receive-inactive-logo {
@@ -493,9 +527,11 @@ img.logo-full {
   cursor: pointer;
   z-index: 1;
 
-  &:disabled { cursor: default; }
+  &:disabled {
+    cursor: default;
+  }
 
-  &:focus-visible + .checkbox-pip {
+  &:focus-visible+.checkbox-pip {
     outline: 2px solid var(--accent-blue-border);
     outline-offset: 2px;
   }
@@ -526,7 +562,7 @@ img.logo-full {
   transition: opacity 0.1s, transform 0.1s;
 }
 
-.checkbox-input:checked + .checkbox-pip {
+.checkbox-input:checked+.checkbox-pip {
   background: var(--accent-blue);
   border-color: var(--accent-blue);
 
@@ -536,7 +572,7 @@ img.logo-full {
   }
 }
 
-.checkbox-input:disabled + .checkbox-pip {
+.checkbox-input:disabled+.checkbox-pip {
   opacity: 0.5;
 }
 
@@ -663,14 +699,18 @@ img.logo-full {
   padding: 0 2px;
   line-height: 1;
 
-  &:hover { color: var(--text-color); }
+  &:hover {
+    color: var(--text-color);
+  }
 }
 
 .spv-info-body {
   p {
     margin: 0 0 8px;
 
-    &:last-child { margin-bottom: 0; }
+    &:last-child {
+      margin-bottom: 0;
+    }
   }
 }
 
@@ -692,7 +732,9 @@ img.logo-full {
   &.send-addr--invalid {
     border-color: var(--accent-syncing);
 
-    &:focus { border-color: var(--accent-syncing); }
+    &:focus {
+      border-color: var(--accent-syncing);
+    }
   }
 }
 
@@ -714,7 +756,10 @@ img.logo-full {
     border: none;
     font-size: 18px;
 
-    &:focus { border: none; outline: none; }
+    &:focus {
+      border: none;
+      outline: none;
+    }
   }
 }
 
@@ -722,10 +767,154 @@ img.logo-full {
 .send-maxlink {
   color: var(--accent-blue-text);
 
-  &:hover { color: var(--accent-blue-hover); }
+  &:hover {
+    color: var(--accent-blue-hover);
+  }
 }
 
 .send-summary {
   border-top: 1px solid var(--border-color);
   margin-top: 0.25rem;
+}
+
+// -----------------------------------------------------------------------
+// Networks view — grid of network cards + single-network detail view.
+
+.networks-view {
+  overflow-y: auto;
+}
+
+.networks-inner {
+  max-width: 900px;
+  padding: 2rem 2rem 4rem;
+}
+
+.networks-grid {
+  grid-template-columns: repeat(auto-fill, minmax(210px, 1fr));
+  gap: 1rem;
+}
+
+.network-card {
+  gap: 0.6rem;
+  padding: 1.25rem;
+  border-radius: 10px;
+  background-color: var(--form-input-bg);
+  transition: border-color 0.15s, background-color 0.15s, transform 0.08s;
+
+  &:hover {
+    border-color: var(--accent-blue-border);
+    background-color: color-mix(in srgb, var(--accent-blue) 10%, var(--form-input-bg));
+  }
+
+  &:active {
+    transform: translateY(1px);
+  }
+}
+
+.network-card-header {
+  gap: 0.6rem;
+}
+
+// Dims an unactivated network's logo on its card.
+.logo-off {
+  filter: grayscale(70%);
+  opacity: 0.7;
+}
+
+.network-card-assets {
+  flex-wrap: wrap;
+  gap: 4px;
+}
+
+.network-status {
+  gap: 0.4rem;
+  letter-spacing: 0.03em;
+}
+
+.network-status-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+
+.network-status--on {
+  color: var(--accent-green);
+
+  .network-status-dot {
+    background-color: var(--accent-green);
+  }
+}
+
+.network-status--off {
+  color: var(--text-grey);
+
+  .network-status-dot {
+    background-color: transparent;
+    border: 1.5px solid var(--text-grey);
+  }
+}
+
+// Single-network detail view.
+
+.network-detail-header {
+  gap: 0.9rem;
+}
+
+// Sections stacked below the header: network status, fees, and per-asset
+// balances. Each section is a titled group of rows with hairline separators.
+.network-section {
+  margin-top: 2rem;
+}
+
+.network-section-title {
+  letter-spacing: 0.1em;
+}
+
+.network-stat {
+  padding: 0.55rem 0;
+
+  &:last-child { border-bottom: none; }
+}
+
+.network-asset-row {
+  gap: 0.6rem;
+  padding: 0.6rem 0;
+
+  &:last-child { border-bottom: none; }
+}
+
+// Clickable transaction rows in the asset view.
+.tx-row {
+  gap: 0.6rem;
+  padding: 0.7rem 0;
+  transition: background-color 0.12s;
+
+  &:hover {
+    background-color: color-mix(in srgb, var(--accent-blue) 10%, transparent);
+  }
+
+  &:last-child { border-bottom: none; }
+}
+
+// Incoming (balance-increasing) transaction amounts.
+.tx-amt-pos {
+  color: var(--accent-green);
+}
+
+// Superscript network badge over a token logo (see NetworkedTokenLogo). Size,
+// offset, and ring are proportions of the token logo (the position-relative
+// parent, sized by an icon-N class), so the composite scales as one unit. The
+// ring lives on this wrapper, not the logo img, so the coin artwork is never
+// clipped; the body-bg fill separates the badge from the logo beneath.
+.networked-token-badge {
+  position: absolute;
+  top: -8%;
+  right: -8%;
+  width: 48%;
+  height: 48%;
+  border-radius: 50%;
+  border: 1.5px solid var(--body-bg);
+  background-color: var(--body-bg);
+  box-sizing: border-box;
 }

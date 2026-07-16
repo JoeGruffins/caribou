@@ -25,6 +25,11 @@ export interface SupportedAsset {
   info?: WalletInfo
   token?: Token
   unitInfo: UnitInfo
+  // tickerGroup is the normalized ticker that groups this asset with its
+  // deployments on other networks, with wrapped natives folded onto their base
+  // asset (WETH -> ETH). Computed by the backend (core.normalizeTickerUnit),
+  // which is the single source of the mapping.
+  tickerGroup: string
 }
 
 export interface Token {
@@ -185,6 +190,7 @@ export interface BalanceNote extends CoreNote {
 
 export interface RateNote extends CoreNote {
   fiatRates: Record<number, number>
+  tickerRates: Record<string, number>
 }
 
 export interface WalletConfigNote extends CoreNote {
@@ -310,6 +316,11 @@ export interface WalletTransaction {
   timestamp: number
   blockNumber: number
   tokenID?: number
+  // assetID identifies the transaction's exact asset (token ID for tokens,
+  // the network's native asset otherwise). Only populated on cross-network
+  // ticker-history responses, where it attributes each transaction to its
+  // network.
+  assetID?: number
   recipient?: string
   additionalData: Record<string, string>
   isUserOp: boolean
@@ -357,10 +368,14 @@ export interface PageData {
   query: URLSearchParams
 }
 
+// PortfolioTotals is a fiat-valued breakdown of the portfolio, priced per
+// ticker group. The parts decompose the whole: total = available + locked +
+// immature.
 export interface PortfolioTotals {
   total: number
   available: number
   locked: number
+  immature: number
   numWallets: number
   ratesComplete: boolean
 }

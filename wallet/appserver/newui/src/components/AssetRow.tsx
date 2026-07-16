@@ -1,22 +1,9 @@
 import t, { tvar } from '@bossw/shared/intl'
 import app from '@bossw/shared/application'
+import Doc from '@bossw/shared/doc'
 import { TickerAsset } from '@bossw/shared/assets'
 import CoinLogo from '@bossw/shared/components/CoinLogo'
 import Spinner from './Spinner'
-
-const languages = navigator.languages as string[]
-
-const usdFmt = new Intl.NumberFormat(languages, {
-  style: 'currency',
-  currency: 'USD',
-  minimumFractionDigits: 2,
-  maximumFractionDigits: 2
-})
-
-const balFmt = new Intl.NumberFormat(languages, {
-  minimumFractionDigits: 0,
-  maximumFractionDigits: 8
-})
 
 interface AssetRowProps {
   asset: TickerAsset
@@ -43,9 +30,8 @@ function StatusDot ({ asset }: { asset: TickerAsset }) {
     const pct = Math.round((wallet.syncProgress ?? 0) * 100)
     return (
       <span
-        className="asset-status-syncing-spinner has-tip"
+        className="asset-status-syncing-spinner has-tip accent-syncing"
         aria-label={tvar('syncing_pct', { pct: String(pct) })}
-        style={{ color: 'var(--accent-syncing)' }}
       >
         <Spinner size={10} />
       </span>
@@ -56,13 +42,15 @@ function StatusDot ({ asset }: { asset: TickerAsset }) {
 }
 
 export default function AssetRow ({ asset, fiatRate, portfolioPct, isHighlighted }: AssetRowProps) {
-  const totalConv = asset.total / asset.cFactor
-  const usdValue = totalConv * fiatRate
-  const availFmt = balFmt.format(asset.avail / asset.cFactor)
+  const usdValue = asset.total * fiatRate
+  const availFmt = Doc.formatConventionalValue(asset.avail, asset.precision)
   const pctDisplay = portfolioPct !== null ? `${portfolioPct.toFixed(1)}%` : '—'
 
   return (
-    <tr className={`asset-row ${isHighlighted ? 'asset-row-highlight' : ''}`}>
+    <tr
+      className={`asset-row pointer hoverbg ${isHighlighted ? 'asset-row-highlight' : ''}`}
+      onClick={() => app.loadPage(`asset/${asset.ticker}`)}
+    >
       <td className="asset-row-asset">
         <div className="d-flex align-items-center">
           <CoinLogo ticker={asset.ticker} className="asset-logo" />
@@ -76,13 +64,13 @@ export default function AssetRow ({ asset, fiatRate, portfolioPct, isHighlighted
         </div>
       </td>
       <td className="asset-row-num">
-        {fiatRate > 0 ? usdFmt.format(usdValue) : '—'}
+        {fiatRate > 0 ? Doc.formatUSD(usdValue) : '—'}
       </td>
       <td className="asset-row-num">
         <span className="mono">{availFmt}</span>
       </td>
       <td className="asset-row-num">
-        {fiatRate > 0 ? usdFmt.format(fiatRate) : '—'}
+        {fiatRate > 0 ? Doc.formatUSD(fiatRate) : '—'}
       </td>
       <td className="asset-row-num">
         {pctDisplay}
@@ -92,13 +80,13 @@ export default function AssetRow ({ asset, fiatRate, portfolioPct, isHighlighted
           type="button"
           className="asset-action-icon has-tip ico-download fs16"
           aria-label={tvar('Receive {{ ticker }}', { ticker: asset.ticker })}
-          onClick={() => app.setForm({ form: 'receive', data: { ticker: asset.ticker } })}
+          onClick={(e) => { e.stopPropagation(); app.setForm({ form: 'receive', data: { ticker: asset.ticker } }) }}
         />
         <button
           type="button"
           className="asset-action-icon has-tip ico-upload fs16"
           aria-label={tvar('Send {{ ticker }}', { ticker: asset.ticker })}
-          onClick={() => app.setForm({ form: 'send', data: { ticker: asset.ticker } })}
+          onClick={(e) => { e.stopPropagation(); app.setForm({ form: 'send', data: { ticker: asset.ticker } }) }}
         />
       </td>
     </tr>

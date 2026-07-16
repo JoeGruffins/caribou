@@ -33,6 +33,12 @@ export class AssetVariant {
     }
   }
 
+  // cFactor is the variant's conventional conversion factor (atomic units per
+  // whole unit).
+  get cFactor () {
+    return this.ui.conventional.conversionFactor
+  }
+
   get bal () {
     const w = app.user.assets[this.assetID].wallet
     return w?.balance ?? { available: 0, locked: 0, immature: 0 }
@@ -46,39 +52,24 @@ export class AssetVariant {
 
 export class TickerAsset {
   ticker: string // normalized e.g. WETH -> ETH
-  hasWallets: boolean
-  cFactor: number
-  bestID: number
   name: string
+  hasWallets: boolean
   variants: AssetVariant[]
   variantLookup: Record<number, AssetVariant>
-  haveAllFiatRates: boolean
   isMultiNet: boolean
   hasTokens: boolean
-  ui: UnitInfo
 
   constructor (a: SupportedAsset) {
-    const { id: assetID, name, unitInfo: ui, unitInfo: { conventional: { conversionFactor: cFactor } } } = a
     this.ticker = normalizedTicker(a)
-    this.cFactor = cFactor
+    this.name = a.name
     this.variants = []
     this.variantLookup = {}
-    this.bestID = assetID
-    this.name = name
-    this.ui = ui
     this.addVariant(a)
   }
 
   addVariant (a: SupportedAsset) {
-    const { id: assetID, name, wallet: w, token, unitInfo: ui } = a
-    const xcRate = app.idRate(assetID)
-    if (!xcRate) this.haveAllFiatRates = false
+    const { wallet: w, token } = a
     this.hasTokens = this.hasTokens || Boolean(token)
-    if (!token) { // prefer the native asset data, e.g. weth.polygon -> eth}
-      this.bestID = assetID
-      this.name = name
-      this.ui = ui
-    }
     const v = new AssetVariant(a)
     this.hasWallets = this.hasWallets || Boolean(w) || Boolean(v.token?.networkMade)
     this.variants.push(v)
@@ -86,7 +77,11 @@ export class TickerAsset {
     this.variants.sort((a: AssetVariant, b: AssetVariant) => {
       if (a.token && !b.token) return 1
       if (!a.token && b.token) return -1
-      return a.ticker.localeCompare(b.ticker)
+      // Variants of an all-token group share a conventional ticker, so tie-break
+      // on assetID for a stable, deterministic ordering across app restarts (the
+      // variants render as the per-network balance breakdown).
+      const byTicker = a.ticker.localeCompare(b.ticker)
+      return byTicker !== 0 ? byTicker : a.assetID - b.assetID
     })
     this.isMultiNet = this.variants.length > 1
   }
@@ -120,32 +115,45 @@ export class TickerAsset {
     }
   }
 
+  // avail, locked, immature, and total report the group's balance as conventional
+  // (whole-unit) numbers, summed across network variants. Each variant is divided
+  // by its own conversion factor before summing, so the result is directly
+  // displayable and priceable (multiply by xcRate for fiat) and stays correct
+  // regardless of whether variants share a conversion factor.
   get avail () {
-    return this.variants.reduce((sum: number, v: AssetVariant) => sum + v.bal.available, 0)
+    return this.variants.reduce((sum: number, v: AssetVariant) => sum + v.bal.available / v.cFactor, 0)
   }
 
   get immature () {
-    return this.variants.reduce((sum: number, v: AssetVariant) => sum + v.bal.immature, 0)
+    return this.variants.reduce((sum: number, v: AssetVariant) => sum + v.bal.immature / v.cFactor, 0)
   }
 
   get locked () {
-    return this.variants.reduce((sum: number, v: AssetVariant) => sum + v.bal.locked, 0)
+    return this.variants.reduce((sum: number, v: AssetVariant) => sum + v.bal.locked / v.cFactor, 0)
   }
 
   get total () {
-    return this.variants.reduce((sum: number, { bal: { available, locked, immature } }: AssetVariant) => {
-      return sum + available + locked + immature
+    return this.variants.reduce((sum: number, v: AssetVariant) => {
+      const { available, locked, immature } = v.bal
+      return sum + (available + locked + immature) / v.cFactor
     }, 0)
   }
 
+  // precision is the number of fractional digits needed to render the group's
+  // conventional balances losslessly: the maximum across variants, since a
+  // variant with a larger conversion factor can contribute a quantity the
+  // others cannot represent. Pair it with Doc.formatConventionalValue.
+  get precision () {
+    return this.variants.reduce((max: number, v: AssetVariant) => Math.max(max, Math.round(Math.log10(v.cFactor))), 0)
+  }
+
   get xcRate () {
-    return app.idRate(this.bestID)
+    return app.tickerRate(this.ticker)
   }
 }
 
 export function normalizedTicker (a: SupportedAsset): string {
-  const ticker = a.unitInfo.conventional.unit
-  return ticker === 'WETH' ? 'ETH' : ticker === 'WBTC' ? 'BTC' : ticker
+  return a.tickerGroup || a.unitInfo.conventional.unit
 }
 
 // networkID is the asset whose wallet settles a variant: the parent network for
@@ -164,4 +172,74 @@ export function networkAsset (v: AssetVariant) {
 // isVariantActive reports whether the variant's settlement-network wallet exists.
 export function isVariantActive (v: AssetVariant): boolean {
   return Boolean(networkAsset(v)?.wallet)
+}
+
+// NetworkAssetRef identifies one asset that settles on a network, carrying just
+// enough to render a logo and label.
+export interface NetworkAssetRef {
+  assetID: number
+  ticker: string
+}
+
+// NetworkSummary describes one settlement network — a native blockchain asset —
+// and the assets that settle on it. supportedAssets lists the native asset
+// first, followed by its tokens sorted by ticker; assetCount is its length.
+export interface NetworkSummary {
+  nativeAssetID: number
+  name: string
+  ticker: string
+  // symbol is the native asset's bip symbol (e.g. "polygon", "hype"), used as
+  // the URL path for the network view.
+  symbol: string
+  assetCount: number
+  activated: boolean
+  supportedAssets: NetworkAssetRef[]
+}
+
+// summarizeNetwork builds the NetworkSummary for one native asset, collecting
+// the tokens that settle on it from the full asset map. supportedAssets lists
+// the native asset first, then its tokens sorted by ticker.
+function summarizeNetwork (a: SupportedAsset, assets: Record<number, SupportedAsset>): NetworkSummary {
+  const tokens: NetworkAssetRef[] = []
+  for (const t of Object.values(assets)) {
+    if (t.token?.networkID === a.id) tokens.push({ assetID: t.id, ticker: t.unitInfo.conventional.unit })
+  }
+  tokens.sort((x, y) => x.ticker.localeCompare(y.ticker))
+  const supportedAssets = [{ assetID: a.id, ticker: a.unitInfo.conventional.unit }, ...tokens]
+  return {
+    nativeAssetID: a.id,
+    name: a.name,
+    ticker: a.unitInfo.conventional.unit,
+    symbol: a.symbol,
+    assetCount: supportedAssets.length,
+    activated: Boolean(a.wallet),
+    supportedAssets
+  }
+}
+
+// networkList enumerates the settlement networks. A network corresponds to a
+// native asset (one without a token); tokens are grouped under their parent
+// network rather than listed as networks of their own. The list is sorted
+// alphabetically by name for a stable ordering across renders.
+export function networkList (): NetworkSummary[] {
+  const assets = app.user?.assets ?? {}
+  const networks = Object.values(assets).filter(a => !a.token).map(a => summarizeNetwork(a, assets))
+  networks.sort((x, y) => x.name.localeCompare(y.name))
+  return networks
+}
+
+// networkSummary returns the summary for a single network by its native asset
+// ID, or undefined when the ID is not a known native asset.
+export function networkSummary (nativeAssetID: number): NetworkSummary | undefined {
+  const assets = app.user?.assets ?? {}
+  const a = assets[nativeAssetID]
+  return a && !a.token ? summarizeNetwork(a, assets) : undefined
+}
+
+// networkBySymbol returns the summary for a network by its native asset's bip
+// symbol (e.g. "polygon", "hype"), or undefined when no such network exists.
+export function networkBySymbol (symbol: string): NetworkSummary | undefined {
+  const assets = app.user?.assets ?? {}
+  const a = Object.values(assets).find(x => !x.token && x.symbol === symbol)
+  return a ? summarizeNetwork(a, assets) : undefined
 }

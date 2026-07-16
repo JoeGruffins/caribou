@@ -1,22 +1,10 @@
 import { useEffect, useState, useCallback } from 'react'
 import t, { tvar } from '@bossw/shared/intl'
 import app from '@bossw/shared/application'
+import Doc from '@bossw/shared/doc'
 import { CoreNote } from '@bossw/shared/registry'
 import { TickerAsset } from '@bossw/shared/assets'
 import CoinLogo from '@bossw/shared/components/CoinLogo'
-
-const langs = navigator.languages as string[]
-
-const usdFmt = new Intl.NumberFormat(langs, {
-  style: 'currency',
-  currency: 'USD',
-  minimumFractionDigits: 2,
-  maximumFractionDigits: 2
-})
-
-function coinAmount (ta: TickerAsset): string {
-  return (ta.total / ta.cFactor).toLocaleString(langs, { maximumFractionDigits: 8 })
-}
 
 interface PortfolioProps {
   onSend: () => void
@@ -52,12 +40,11 @@ export default function Portfolio ({ onSend, onReceive, onActivate }: PortfolioP
 
   const totals = app.portfolioTotals()
   const tickerList: TickerAsset[] = app.tickerList ?? []
-  const fiatRates = app.user?.fiatRates ?? {}
 
   const walletAssets = tickerList.filter(ta => ta.hasWallets)
   walletAssets.sort((a, b) => {
-    const aVal = (a.total / a.cFactor) * (fiatRates[a.bestID] ?? 0)
-    const bVal = (b.total / b.cFactor) * (fiatRates[b.bestID] ?? 0)
+    const aVal = a.total * (a.xcRate ?? 0)
+    const bVal = b.total * (b.xcRate ?? 0)
     return bVal - aVal
   })
   const hasInactive = tickerList.some(ta => !ta.hasWallets)
@@ -75,9 +62,9 @@ export default function Portfolio ({ onSend, onReceive, onActivate }: PortfolioP
             )
           : (
             <>
-              <div className='mb-totals-value'>{usdFmt.format(totals.total)}</div>
+              <div className='mb-totals-value'>{Doc.formatUSD(totals.total)}</div>
               <div className='mb-totals-sub mb-muted'>
-                {tvar('{{ amt }} Available', { amt: usdFmt.format(totals.available) })}
+                {tvar('{{ amt }} Available', { amt: Doc.formatUSD(totals.available) })}
               </div>
             </>
             )}
@@ -86,8 +73,8 @@ export default function Portfolio ({ onSend, onReceive, onActivate }: PortfolioP
       {walletAssets.length > 0 && (
         <ul className='mb-asset-list'>
           {walletAssets.map(ta => {
-            const rate = fiatRates[ta.bestID] ?? 0
-            const usdVal = (ta.total / ta.cFactor) * rate
+            const rate = ta.xcRate ?? 0
+            const usdVal = ta.total * rate
             return (
               <li key={ta.ticker} className='mb-asset-row'>
                 <CoinLogo ticker={ta.ticker} alt={ta.name} className='mb-coin-logo' />
@@ -96,8 +83,8 @@ export default function Portfolio ({ onSend, onReceive, onActivate }: PortfolioP
                   <span className='mb-asset-name mb-muted'>{ta.name}</span>
                 </div>
                 <div className='mb-asset-bal'>
-                  <span className='mb-asset-fiat'>{usdFmt.format(usdVal)}</span>
-                  <span className='mb-asset-amt mb-muted'>{coinAmount(ta)} {ta.ticker}</span>
+                  <span className='mb-asset-fiat'>{Doc.formatUSD(usdVal)}</span>
+                  <span className='mb-asset-amt mb-muted'>{Doc.formatConventionalValue(ta.total, ta.precision)} {ta.ticker}</span>
                 </div>
               </li>
             )

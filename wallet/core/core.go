@@ -181,10 +181,17 @@ func New(cfg *Config) (*Core, error) {
 	// shared by all wallets, each of which manages its own transactions through
 	// a network-scoped NetworkTxDB handle.
 	txDBPath := filepath.Join(filepath.Dir(cfg.DBPath), "tx.db")
-	masterTxDB, err := txdb.New(txDBPath, cfg.Logger.SubLogger("TXDB"))
+	txDBLog := cfg.Logger.SubLogger("TXDB")
+	masterTxDB, err := txdb.New(txDBPath, txDBLog)
 	if err != nil {
 		return nil, fmt.Errorf("transaction database initialization error: %w", err)
 	}
+	// The txdb is asset-agnostic and cannot group transactions by ticker on its
+	// own; supply the mapping from asset metadata. Must be set before any wallet
+	// connects and begins storing transactions.
+	masterTxDB.SetTickerResolver(func(assetID uint32) string {
+		return assetTickerGroup(assetID, txDBLog)
+	})
 	if cfg.TorProxy != "" {
 		if _, _, err = net.SplitHostPort(cfg.TorProxy); err != nil {
 			return nil, err
@@ -1037,12 +1044,13 @@ func (c *Core) assetMap() map[uint32]*SupportedAsset {
 			wallet = w.state()
 		}
 		assets[assetID] = &SupportedAsset{
-			ID:       assetID,
-			Symbol:   asset.Symbol,
-			Wallet:   wallet,
-			Info:     asset.Info,
-			Name:     asset.Info.Name,
-			UnitInfo: asset.Info.UnitInfo,
+			ID:          assetID,
+			Symbol:      asset.Symbol,
+			Wallet:      wallet,
+			Info:        asset.Info,
+			Name:        asset.Info.Name,
+			UnitInfo:    asset.Info.UnitInfo,
+			TickerGroup: normalizeTickerUnit(asset.Info.UnitInfo.Conventional.Unit),
 		}
 		for tokenID, token := range asset.Tokens {
 			wallet = nil
@@ -1051,12 +1059,13 @@ func (c *Core) assetMap() map[uint32]*SupportedAsset {
 				wallet = w.state()
 			}
 			assets[tokenID] = &SupportedAsset{
-				ID:       tokenID,
-				Symbol:   util.BipIDSymbol(tokenID),
-				Wallet:   wallet,
-				Token:    token,
-				Name:     token.Name,
-				UnitInfo: token.UnitInfo,
+				ID:          tokenID,
+				Symbol:      util.BipIDSymbol(tokenID),
+				Wallet:      wallet,
+				Token:       token,
+				Name:        token.Name,
+				UnitInfo:    token.UnitInfo,
+				TickerGroup: normalizeTickerUnit(token.UnitInfo.Conventional.Unit),
 			}
 		}
 	}
@@ -1065,11 +1074,13 @@ func (c *Core) assetMap() map[uint32]*SupportedAsset {
 
 // User is a thread-safe getter for the User.
 func (c *Core) User() *User {
+	fiatRates := c.fiatConversions()
 	return &User{
 		Assets:             c.assetMap(),
 		Initialized:        c.IsInitialized(),
 		SeedGenerationTime: c.seedGenerationTime,
-		FiatRates:          c.fiatConversions(),
+		FiatRates:          fiatRates,
+		TickerRates:        c.tickerConversions(fiatRates),
 		Net:                c.net,
 		ExtensionConfig:    c.extensionModeConfig,
 		Actions:            c.requestedActionsList(),
@@ -3145,12 +3156,71 @@ func (c *Core) EstimateSendTxFee(address string, assetID uint32, amount uint64, 
 	return estimator.EstimateSendTxFee(address, amount, 0, subtract, maxWithdraw)
 }
 
-// TxHistory returns all the transactions a wallet has made. If refID
-// is nil, then transactions starting from the most recent are returned
-// (past is ignored). If past is true, the transactions prior to the
-// refID are returned, otherwise the transactions after the refID are
-// returned. n is the number of transactions to return. If n is <= 0,
-// all the transactions will be returned
+// assetTickerGroup returns the ticker group an asset belongs to: its
+// conventional unit, with wrapped natives folded onto their base asset
+// (WETH->ETH, WBTC->BTC) so that, for example, WETH on Polygon groups with
+// ETH. The front end receives the same value via SupportedAsset.TickerGroup,
+// so the stored ticker index and the UI's grouping key agree. An asset with
+// no resolvable unit info maps to "", which excludes its transactions from
+// the ticker index.
+func assetTickerGroup(assetID uint32, log util.Logger) string {
+	ui, err := asset.UnitInfo(assetID)
+	if err != nil {
+		log.Warnf("No unit info for asset ID %d: %v. Transactions for this "+
+			"asset will be omitted from ticker-grouped history.", assetID, err)
+		return ""
+	}
+	return normalizeTickerUnit(ui.Conventional.Unit)
+}
+
+// normalizeTickerUnit folds wrapped-native conventional units onto their base.
+// This is the single source of the mapping: the front end consumes it through
+// SupportedAsset.TickerGroup rather than maintaining its own copy.
+func normalizeTickerUnit(unit string) string {
+	switch unit {
+	case "WETH":
+		return "ETH"
+	case "WBTC":
+		return "BTC"
+	}
+	return unit
+}
+
+// TxHistoryByTicker returns merged, time-ordered transaction history for a
+// ticker group across every network it settles on (e.g. USDC on Ethereum and
+// Polygon), served directly from the master txdb's ticker index.
+//
+// A ticker group with no wallet is an error rather than an empty history, so a
+// caller naming an unknown or unactivated ticker is told so instead of reading
+// the empty result as "no transactions yet". This mirrors TxHistory's
+// missingWalletErr.
+func (c *Core) TxHistoryByTicker(ticker string, req *txdb.TxHistoryRequest) (*txdb.TxHistoryResponse, error) {
+	ticker = normalizeTickerUnit(ticker)
+	if !c.tickerHasWallet(ticker) {
+		return nil, newError(missingWalletErr, "no wallet found for ticker %s", ticker)
+	}
+	return c.txDB.GetTxsByTicker(ticker, req)
+}
+
+// tickerHasWallet reports whether any existing wallet's asset belongs to the
+// ticker group.
+func (c *Core) tickerHasWallet(ticker string) bool {
+	c.walletMtx.RLock()
+	defer c.walletMtx.RUnlock()
+	for assetID := range c.wallets {
+		if assetTickerGroup(assetID, c.log) == ticker {
+			return true
+		}
+	}
+	return false
+}
+
+// TxHistory returns all the transactions a wallet has made. If refID is nil,
+// then transactions starting from the most recent are returned (past is
+// ignored). If past is true, the transactions prior to the refID are
+// returned, otherwise the transactions after the refID are returned. n is the
+// number of transactions to return. If n is <= 0, all the transactions will
+// be returned.
 func (c *Core) TxHistory(assetID uint32, req *txdb.TxHistoryRequest) (*txdb.TxHistoryResponse, error) {
 	wallet, found := c.wallet(assetID)
 	if !found {
@@ -3619,7 +3689,7 @@ func (c *Core) refreshFiatRates(ctx context.Context) {
 
 	fiatRatesMap := c.fiatConversions()
 	if len(fiatRatesMap) != 0 {
-		c.notify(newFiatRatesUpdate(fiatRatesMap))
+		c.notify(newFiatRatesUpdate(fiatRatesMap, c.tickerConversions(fiatRatesMap)))
 	}
 }
 
@@ -3676,6 +3746,36 @@ func (c *Core) fiatConversions() map[uint32]float64 {
 		}
 	}
 	return fiatRatesMap
+}
+
+// tickerConversions collapses per-asset fiat rates into one rate per ticker
+// group, keyed by the normalized ticker (see assetTickerGroup). A group's
+// variants are the same asset economically (USDC on Ethereum and Polygon, ETH
+// and WETH), so their rates are averaged into a single entry.
+func (c *Core) tickerConversions(fiatRates map[uint32]float64) map[string]float64 {
+	type acc struct {
+		sum float64
+		n   int
+	}
+	groups := make(map[string]*acc)
+	for assetID, rate := range fiatRates {
+		ticker := assetTickerGroup(assetID, c.log)
+		if ticker == "" {
+			continue
+		}
+		g := groups[ticker]
+		if g == nil {
+			g = new(acc)
+			groups[ticker] = g
+		}
+		g.sum += rate
+		g.n++
+	}
+	tickerRates := make(map[string]float64, len(groups))
+	for ticker, g := range groups {
+		tickerRates[ticker] = g.sum / float64(g.n)
+	}
+	return tickerRates
 }
 
 // ToggleRateSourceStatus toggles a fiat rate source status. If disable is true,
