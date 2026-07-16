@@ -414,6 +414,65 @@ func TestNextAccountSequence(t *testing.T) {
 	}
 }
 
+// TestReserveSequenceRollbackReuse guards against a stranded sequence gap: if
+// a reservation is rolled back after a concurrent reservation has already
+// advanced nextSeq past it, the rolled-back sequence must still be handed
+// out to the next caller instead of being silently dropped, since XRPL
+// requires an account's sequences to be consumed in order.
+func TestReserveSequenceRollbackReuse(t *testing.T) {
+	w := &xrpWallet{nextSeq: 5}
+
+	seqA, rollbackA, err := w.reserveSequence()
+	if err != nil {
+		t.Fatalf("reserveSequence (A) error: %v", err)
+	}
+	if seqA != 5 {
+		t.Fatalf("seqA = %d, want 5", seqA)
+	}
+
+	seqB, _, err := w.reserveSequence()
+	if err != nil {
+		t.Fatalf("reserveSequence (B) error: %v", err)
+	}
+	if seqB != 6 {
+		t.Fatalf("seqB = %d, want 6", seqB)
+	}
+
+	// A rolls back after B has already advanced nextSeq past it.
+	rollbackA()
+
+	seqC, _, err := w.reserveSequence()
+	if err != nil {
+		t.Fatalf("reserveSequence (C) error: %v", err)
+	}
+	if seqC != seqA {
+		t.Fatalf("seqC = %d, want reused seqA %d (sequence gap was stranded)", seqC, seqA)
+	}
+}
+
+// TestReserveSequenceDropsPoisonedFreeSeq guards against handing out a
+// cross-frame-poisoned freeSeqs entry: a rollback that races a concurrent
+// nextSeq reset can plant a sequence >= nextSeq, which was never validly
+// minted (a legitimate freeSeqs entry always satisfies seq < nextSeq at
+// insertion time). Handing such an entry out would submit a sequence ahead
+// of what the account can accept.
+func TestReserveSequenceDropsPoisonedFreeSeq(t *testing.T) {
+	w := &xrpWallet{nextSeq: 11, freeSeqs: []uint32{15}} // poisoned: 15 >= nextSeq
+
+	seq, _, err := w.reserveSequence()
+	if err != nil {
+		t.Fatalf("reserveSequence error: %v", err)
+	}
+	if seq != 11 {
+		t.Fatalf("seq = %d, want 11 (poisoned freeSeqs entry 15 should have been dropped)", seq)
+	}
+	w.seqMtx.Lock()
+	defer w.seqMtx.Unlock()
+	if len(w.freeSeqs) != 0 {
+		t.Fatalf("freeSeqs = %v, want empty", w.freeSeqs)
+	}
+}
+
 func TestWalletTransactionFromTx(t *testing.T) {
 	const walletAddr = "rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh"
 	const otherAddr = "rPT1Sjq2YGrBMTttX4GZHjKu9dyfzbpAYe"

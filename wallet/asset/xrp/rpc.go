@@ -235,6 +235,16 @@ func (m *txMeta) deliveredAmountDrops() uint64 {
 	return v
 }
 
+// deliveredIssuedAmount returns the actual delivered issued-currency amount,
+// or nil for XRP amounts, pre-2014 transactions where the field is the
+// literal string "unavailable", or when the field is absent. Callers must
+// use this instead of Amount/DeliverMax to credit an incoming IOU payment:
+// a Payment with the tfPartialPayment flag set can validate tesSUCCESS while
+// delivering far less than Amount states.
+func (m *txMeta) deliveredIssuedAmount() *issuedAmount {
+	return issuedAmountFrom(m.DeliveredAmount)
+}
+
 // txResult holds fields from a transaction lookup.
 type txResult struct {
 	Account         string      `json:"Account"`
@@ -372,6 +382,73 @@ func (c *rpcClient) serverState(ctx context.Context) (*serverStateResult, error)
 		return nil, fmt.Errorf("error decoding server_state: %w", err)
 	}
 	return &ss, nil
+}
+
+// accountLine is one trustline entry from account_lines.
+type accountLine struct {
+	Account   string `json:"account"` // the issuer
+	Balance   string `json:"balance"` // signed decimal string; positive = we hold this much
+	Currency  string `json:"currency"`
+	Limit     string `json:"limit"`
+	LimitPeer string `json:"limit_peer"`
+}
+
+type accountLinesResult struct {
+	Lines []accountLine `json:"lines"`
+}
+
+// accountLines queries the trustlines for address, optionally filtered to a
+// single peer (issuer) account.
+func (c *rpcClient) accountLines(ctx context.Context, address, peer string) (*accountLinesResult, error) {
+	params := map[string]interface{}{
+		"account":      address,
+		"ledger_index": "validated",
+	}
+	if peer != "" {
+		params["peer"] = peer
+	}
+	result, err := c.call(ctx, "account_lines", params)
+	if err != nil {
+		return nil, err
+	}
+	var alr accountLinesResult
+	if err := json.Unmarshal(result, &alr); err != nil {
+		return nil, fmt.Errorf("error decoding account_lines: %w", err)
+	}
+	return &alr, nil
+}
+
+// issuedAmount is a parsed XRPL issued-currency Amount object.
+type issuedAmount struct {
+	Currency string
+	Issuer   string
+	Value    string
+}
+
+// issuedAmountFrom extracts an issued-currency amount from an interface{}
+// decoded from an "Amount" or "DeliverMax" JSON field, or nil if v is a
+// native XRP (string) amount or otherwise not a valid IOU object.
+func issuedAmountFrom(v interface{}) *issuedAmount {
+	m, ok := v.(map[string]interface{})
+	if !ok {
+		return nil
+	}
+	currency, _ := m["currency"].(string)
+	issuer, _ := m["issuer"].(string)
+	value, _ := m["value"].(string)
+	if currency == "" || issuer == "" || value == "" {
+		return nil
+	}
+	return &issuedAmount{Currency: currency, Issuer: issuer, Value: value}
+}
+
+// issuedAmount returns the issued-currency amount from Amount or DeliverMax,
+// or nil if this is a native XRP payment.
+func (r *txResult) issuedAmount() *issuedAmount {
+	if ia := issuedAmountFrom(r.Amount); ia != nil {
+		return ia
+	}
+	return issuedAmountFrom(r.DeliverMax)
 }
 
 // isAccountNotFound returns true when the error indicates the account does

@@ -20,10 +20,15 @@ import (
 // --- mocks ---
 
 type mockRPC struct {
-	sigsFunc        func(before, until *string, limit int) ([]signatureInfo, error)
-	txFunc          func(sig string) (*rpcTransaction, error)
-	blockHeightFunc func() (uint64, error)
-	sigStatusesFunc func(ids []string) ([]*signatureStatus, error)
+	sigsFunc         func(before, until *string, limit int) ([]signatureInfo, error)
+	txFunc           func(sig string) (*rpcTransaction, error)
+	blockHeightFunc  func() (uint64, error)
+	sigStatusesFunc  func(ids []string) ([]*signatureStatus, error)
+	tokenBalanceFunc func(addr string) (uint64, bool, error)
+	rentFunc         func(size uint64) (uint64, error)
+	blockhashFunc    func() (string, uint64, error)
+	sendTxFunc       func(txB []byte) (string, error)
+	balanceFunc      func() (uint64, error)
 }
 
 func (m *mockRPC) getSignaturesForAddress(_ context.Context, _ string, before, until *string, limit int) ([]signatureInfo, error) {
@@ -39,20 +44,42 @@ func (m *mockRPC) getBlockHeight(_ context.Context) (uint64, error) {
 	}
 	return 0, nil
 }
-func (m *mockRPC) getBalance(_ context.Context, _ string) (uint64, error) { return 0, nil }
-func (m *mockRPC) getMinimumBalanceForRentExemption(_ context.Context, _ uint64) (uint64, error) {
+func (m *mockRPC) getBalance(_ context.Context, _ string) (uint64, error) {
+	if m.balanceFunc != nil {
+		return m.balanceFunc()
+	}
+	return 0, nil
+}
+func (m *mockRPC) getMinimumBalanceForRentExemption(_ context.Context, size uint64) (uint64, error) {
+	if m.rentFunc != nil {
+		return m.rentFunc(size)
+	}
 	return 0, nil
 }
 func (m *mockRPC) getFeeForMessage(_ context.Context, _ []byte) (uint64, error) { return 0, nil }
 func (m *mockRPC) getLatestBlockhash(_ context.Context) (string, uint64, error) {
+	if m.blockhashFunc != nil {
+		return m.blockhashFunc()
+	}
 	return "", 0, nil
 }
-func (m *mockRPC) sendTransaction(_ context.Context, _ []byte) (string, error) { return "", nil }
+func (m *mockRPC) sendTransaction(_ context.Context, txB []byte) (string, error) {
+	if m.sendTxFunc != nil {
+		return m.sendTxFunc(txB)
+	}
+	return "", nil
+}
 func (m *mockRPC) getSignatureStatuses(_ context.Context, ids []string) ([]*signatureStatus, error) {
 	if m.sigStatusesFunc != nil {
 		return m.sigStatusesFunc(ids)
 	}
 	return nil, nil
+}
+func (m *mockRPC) getTokenAccountBalance(_ context.Context, addr string) (uint64, bool, error) {
+	if m.tokenBalanceFunc != nil {
+		return m.tokenBalanceFunc(addr)
+	}
+	return 0, false, nil
 }
 
 type mockTxDB struct {
@@ -77,8 +104,23 @@ func (m *mockTxDB) GetTxs(_ *txdb.TxHistoryRequest) (*txdb.TxHistoryResponse, er
 	return nil, nil
 }
 func (m *mockTxDB) GetPendingTxs() ([]*txdb.WalletTransaction, error) { return m.pending, nil }
-func (m *mockTxDB) RemoveTx(_ string) error                           { return nil }
-func (m *mockTxDB) Table(_ string) (txdb.StoreTable, error)           { return nil, nil }
+func (m *mockTxDB) GetAssetTxs(_ *uint32, _ *txdb.TxHistoryRequest) (*txdb.TxHistoryResponse, error) {
+	return nil, nil
+}
+func (m *mockTxDB) GetAssetPendingTxs(assetID *uint32) ([]*txdb.WalletTransaction, error) {
+	var out []*txdb.WalletTransaction
+	for _, tx := range m.pending {
+		switch {
+		case assetID == nil && tx.TokenID == nil:
+			out = append(out, tx)
+		case assetID != nil && tx.TokenID != nil && *tx.TokenID == *assetID:
+			out = append(out, tx)
+		}
+	}
+	return out, nil
+}
+func (m *mockTxDB) RemoveTx(_ string) error                 { return nil }
+func (m *mockTxDB) Table(_ string) (txdb.StoreTable, error) { return nil, nil }
 func (m *mockTxDB) AddTxIndex(_ string, _ func(*txdb.WalletTransaction) ([]byte, error)) (txdb.TxIndex, error) {
 	return nil, nil
 }
@@ -202,19 +244,33 @@ func parsedInstruction(src, dst string, lamports uint64) rpcInstruction {
 	return rpcInstruction{
 		Program: "system",
 		Parsed: &struct {
-			Type string `json:"type"`
-			Info struct {
-				Source      string `json:"source"`
-				Destination string `json:"destination"`
-				Lamports    uint64 `json:"lamports"`
-			} `json:"info"`
+			Type string             `json:"type"`
+			Info rpcInstructionInfo `json:"info"`
 		}{
 			Type: "transfer",
-			Info: struct {
-				Source      string `json:"source"`
-				Destination string `json:"destination"`
-				Lamports    uint64 `json:"lamports"`
-			}{Source: src, Destination: dst, Lamports: lamports},
+			Info: rpcInstructionInfo{Source: src, Destination: dst, Lamports: lamports},
+		},
+	}
+}
+
+// parsedSPLInstruction builds an spl-token transferChecked instruction for
+// tests.
+func parsedSPLInstruction(src, dst string, amount uint64) rpcInstruction {
+	return rpcInstruction{
+		Program: "spl-token",
+		Parsed: &struct {
+			Type string             `json:"type"`
+			Info rpcInstructionInfo `json:"info"`
+		}{
+			Type: "transferChecked",
+			Info: rpcInstructionInfo{
+				Source:      src,
+				Destination: dst,
+				TokenAmount: &struct {
+					Amount   string `json:"amount"`
+					Decimals uint8  `json:"decimals"`
+				}{Amount: fmt.Sprintf("%d", amount), Decimals: 6},
+			},
 		},
 	}
 }
@@ -854,6 +910,75 @@ func TestCheckPendingTxs(t *testing.T) {
 			t.Fatal("tx should be marked Rejected")
 		}
 	})
+}
+
+// TestCheckPendingTxsIgnoresTokenPending guards against the native wallet's
+// checkPendingTxs reconciling a token wallet's pending transactions: before
+// scoping GetPendingTxs to the native asset, this loop would fetch a token
+// tx's on-chain data and reparse it via walletTransactionFromRPC from the
+// native wallet's own lamport-transfer perspective, storing wrong data over
+// the token record and misattributing the confirmation note to SOL.
+func TestCheckPendingTxsIgnoresTokenPending(t *testing.T) {
+	ctx := context.Background()
+	tokenID := usdcTokenID
+
+	nativePend := &txdb.WalletTransaction{ID: "native-pend"}
+	setTxData(nativePend, solTxData{LastValidBlockHeight: 100})
+	tokenPend := &txdb.WalletTransaction{ID: "token-pend", TokenID: &tokenID}
+	setTxData(tokenPend, solTxData{LastValidBlockHeight: 100})
+
+	db := &mockTxDB{pending: []*txdb.WalletTransaction{nativePend, tokenPend}}
+	table := newMockTable()
+	var queriedIDs []string
+	rpc := &mockRPC{
+		sigsFunc: func(_, _ *string, _ int) ([]signatureInfo, error) { return nil, nil },
+		txFunc: func(_ string) (*rpcTransaction, error) {
+			return nil, fmt.Errorf("rpc timeout") // transient; leaves tx pending either way
+		},
+		sigStatusesFunc: func(ids []string) ([]*signatureStatus, error) {
+			queriedIDs = append(queriedIDs, ids...)
+			statuses := make([]*signatureStatus, len(ids))
+			return statuses, nil
+		},
+	}
+	w := newTestWallet("addr", rpc, db, table)
+
+	if err := w.checkPendingTxs(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if len(queriedIDs) != 1 || queriedIDs[0] != "native-pend" {
+		t.Fatalf("getSignatureStatuses queried %v, want only [native-pend]", queriedIDs)
+	}
+}
+
+// TestTokenAccountRentCached guards against re-fetching a cluster-wide
+// constant on every send: getMinimumBalanceForRentExemption must only be
+// called once across repeated tokenAccountRent calls on the same wallet.
+func TestTokenAccountRentCached(t *testing.T) {
+	calls := 0
+	rpc := &mockRPC{
+		rentFunc: func(size uint64) (uint64, error) {
+			calls++
+			if size != splTokenAccountSize {
+				t.Fatalf("rent query size = %d, want %d", size, splTokenAccountSize)
+			}
+			return 2_039_280, nil
+		},
+	}
+	w := newTestWallet("addr", rpc, nil, nil)
+
+	for i := 0; i < 3; i++ {
+		rent, err := w.tokenAccountRent(context.Background())
+		if err != nil {
+			t.Fatalf("tokenAccountRent: %v", err)
+		}
+		if rent != 2_039_280 {
+			t.Fatalf("rent = %d, want 2039280", rent)
+		}
+	}
+	if calls != 1 {
+		t.Fatalf("getMinimumBalanceForRentExemption called %d times, want 1", calls)
+	}
 }
 
 func TestKeyFileRoundTrip(t *testing.T) {

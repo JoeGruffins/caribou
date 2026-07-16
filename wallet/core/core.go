@@ -1128,6 +1128,12 @@ func (c *Core) createWallet(crypter encrypt.Crypter, walletPW []byte, form *Wall
 		return fmt.Errorf("%s wallet authentication error: %w", symbol, err)
 	}
 
+	if token != nil {
+		if err := wallet.establishTrustline(); err != nil {
+			return initErr("error establishing trustline for %s: %w", symbol, err)
+		}
+	}
+
 	balances, err := c.walletBalance(wallet)
 	if err != nil {
 		return initErr("error getting wallet balance for %s: %w", symbol, err)

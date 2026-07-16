@@ -16,6 +16,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -135,6 +136,7 @@ var (
 
 func init() {
 	asset.Register(BipID, &Driver{})
+	registerToken(usdcTokenID, "Circle's USDC issued currency on the XRP Ledger.", util.Mainnet)
 }
 
 // Driver implements asset.Driver and asset.Creator.
@@ -216,8 +218,9 @@ type xrpWallet struct {
 	tip     uint64
 	tipTime time.Time
 
-	seqMtx  sync.Mutex
-	nextSeq uint32 // 0 = uninitialized; advance locally after each submit
+	seqMtx   sync.Mutex
+	nextSeq  uint32   // 0 = uninitialized; advance locally after each submit
+	freeSeqs []uint32 // sorted ascending; sequences reserved then rolled back, reused before minting new ones
 
 	reserveMtx   sync.RWMutex
 	baseReserve  uint64 // drops; from server_state, falls back to BaseReserveDrops
@@ -549,6 +552,66 @@ func (w *xrpWallet) OwnsDepositAddress(address string) (bool, error) {
 	return address == w.address, nil
 }
 
+// reserveSequence reserves an account sequence number, querying the network
+// to initialize it on first use. It returns the reserved sequence and a
+// rollback function that returns it if the transaction is known to have
+// never been submitted (or was deterministically rejected).
+//
+// A rolled-back sequence is added to freeSeqs and handed out again before any
+// new sequence is minted, so a rollback that races with a concurrent
+// reservation (which will have already advanced nextSeq past it) doesn't
+// strand the sequence forever — XRPL requires an account's sequences to be
+// consumed in order, so an un-reused gap would block every later send until
+// reconciled.
+func (w *xrpWallet) reserveSequence() (sequence uint32, rollback func(), err error) {
+	// Fetch from the network before taking the lock so seqMtx is not held
+	// across a blocking RPC call.
+	var firstSendInfo *accountInfoResult
+	w.seqMtx.Lock()
+	if w.nextSeq == 0 {
+		w.seqMtx.Unlock()
+		firstSendInfo, err = w.rpc.accountInfoCurrent(w.ctx, w.address)
+		if err != nil {
+			return 0, nil, fmt.Errorf("error querying account info: %w", err)
+		}
+		w.seqMtx.Lock()
+	}
+	// Re-check after re-acquiring the lock; a concurrent send may have
+	// initialized nextSeq while we were fetching.
+	if w.nextSeq == 0 {
+		w.nextSeq = nextAccountSequence(firstSendInfo)
+	}
+	// Drop any freeSeqs entries a stale, cross-frame rollback planted at or
+	// beyond the current mint frame (see the rollback closure below); a
+	// valid entry was always minted as sequence < nextSeq, so anything
+	// outside that bound cannot be safely reused without risking
+	// tefPAST_SEQ. This is a cheap, lock-only backstop for the ceiling side
+	// of the invariant; the floor side (already-consumed sequences) is
+	// purged against live account state in reconcileSeq.
+	w.freeSeqs = slices.DeleteFunc(w.freeSeqs, func(seq uint32) bool { return seq >= w.nextSeq })
+
+	// Reuse a rolled-back sequence before minting a new one, so concurrent
+	// sends each still get a unique value without holding the lock across I/O.
+	if len(w.freeSeqs) > 0 {
+		sequence = w.freeSeqs[0]
+		w.freeSeqs = w.freeSeqs[1:]
+	} else {
+		sequence = w.nextSeq
+		w.nextSeq++
+	}
+	w.seqMtx.Unlock()
+
+	rollback = func() {
+		w.seqMtx.Lock()
+		i, found := slices.BinarySearch(w.freeSeqs, sequence)
+		if !found {
+			w.freeSeqs = slices.Insert(w.freeSeqs, i, sequence)
+		}
+		w.seqMtx.Unlock()
+	}
+	return sequence, rollback, nil
+}
+
 func (w *xrpWallet) Send(address string, value, _ uint64) (asset.Coin, error) {
 	w.opWG.Add(1)
 	defer w.opWG.Done()
@@ -615,39 +678,9 @@ func (w *xrpWallet) Send(address string, value, _ uint64) (asset.Coin, error) {
 	}
 	lastLedgerSeq := uint32(feeInfo.LedgerCurrentIndex + lastLedgerWindow)
 
-	// Initialize nextSeq from current open-ledger account state on first send.
-	// Fetch from the network before taking the lock so seqMtx is not held
-	// across a blocking RPC call.
-	var firstSendInfo *accountInfoResult
-	w.seqMtx.Lock()
-	if w.nextSeq == 0 {
-		w.seqMtx.Unlock()
-		firstSendInfo, err = w.rpc.accountInfoCurrent(w.ctx, w.address)
-		if err != nil {
-			return nil, fmt.Errorf("error querying account info: %w", err)
-		}
-		w.seqMtx.Lock()
-	}
-	// Re-check after re-acquiring the lock; a concurrent send may have
-	// initialized nextSeq while we were fetching.
-	if w.nextSeq == 0 {
-		w.nextSeq = nextAccountSequence(firstSendInfo)
-	}
-	// Reserve this sequence number and pre-increment so concurrent sends
-	// each get a unique value without holding the lock across I/O.
-	sequence := w.nextSeq
-	w.nextSeq++
-	w.seqMtx.Unlock()
-
-	// rollbackSeq attempts to return the reserved sequence when we know the
-	// transaction was never submitted. It only succeeds if no concurrent send
-	// has advanced nextSeq past our reservation.
-	rollbackSeq := func() {
-		w.seqMtx.Lock()
-		if w.nextSeq == sequence+1 {
-			w.nextSeq = sequence
-		}
-		w.seqMtx.Unlock()
+	sequence, rollbackSeq, err := w.reserveSequence()
+	if err != nil {
+		return nil, err
 	}
 
 	// addressToAccountID calls below are effectively unreachable (the address
@@ -817,7 +850,9 @@ func (w *xrpWallet) TxHistory(req *txdb.TxHistoryRequest) (*txdb.TxHistoryRespon
 	if r.N == 0 {
 		r.N = 50
 	}
-	return w.txDB.GetTxs(&r)
+	// nil selects this network's native-asset records, excluding any token
+	// wallet's transactions sharing this NetworkTxDB.
+	return w.txDB.GetAssetTxs(nil, &r)
 }
 
 func (w *xrpWallet) WalletTransaction(ctx context.Context, txID string) (*txdb.WalletTransaction, error) {
@@ -865,7 +900,7 @@ func (w *xrpWallet) PendingTransactions(_ context.Context) []*txdb.WalletTransac
 	if w.txDB == nil {
 		return nil
 	}
-	pending, err := w.txDB.GetPendingTxs()
+	pending, err := w.txDB.GetAssetPendingTxs(nil)
 	if err != nil {
 		w.log.Errorf("Error getting pending txs: %v", err)
 		return nil
@@ -873,6 +908,14 @@ func (w *xrpWallet) PendingTransactions(_ context.Context) []*txdb.WalletTransac
 	return pending
 }
 
+// checkPendingTxs is deliberately unfiltered (every asset sharing this
+// NetworkTxDB, not just the native one): a token wallet's TrustSet/Payment
+// consumes this account's sequence space too, so this loop must see and
+// resolve token pending txs for sequence accounting to stay correct (see
+// reserveSequence/reconcileSeq). This is safe because it never re-derives a
+// tx's type/amount from the wallet's own address — it only updates
+// BlockNumber/Timestamp/Confirmed/Rejected via meta looked up by the tx's
+// own ID.
 func (w *xrpWallet) checkPendingTxs(ctx context.Context) (balanceChanged bool) {
 	if w.txDB == nil {
 		return
@@ -909,6 +952,7 @@ func (w *xrpWallet) checkPendingTxs(ctx context.Context) (balanceChanged bool) {
 				if remaining == 0 {
 					w.seqMtx.Lock()
 					w.nextSeq = 0
+					w.freeSeqs = nil
 					w.seqMtx.Unlock()
 				}
 
@@ -1008,6 +1052,18 @@ func (w *xrpWallet) reconcileSeq(ctx context.Context) {
 	w.seqMtx.Lock()
 	if w.nextSeq == 0 || next > w.nextSeq {
 		w.nextSeq = next
+		// Any tracked rollbacks are for sequences now behind the resynced
+		// truth; they no longer mean anything.
+		w.freeSeqs = nil
+	} else {
+		// A rollback can race a concurrent reset of nextSeq (e.g.
+		// checkPendingTxs zeroing it when it can't see an in-flight
+		// reservation that hasn't been stored yet) and later re-insert a
+		// sequence the chain has since actually consumed. Such an entry is
+		// invisible to the nextSeq-only check above whenever next <=
+		// nextSeq, so purge anything below the account's live next
+		// sequence here — it's the only place with a ground-truth floor.
+		w.freeSeqs = slices.DeleteFunc(w.freeSeqs, func(seq uint32) bool { return seq < next })
 	}
 	w.seqMtx.Unlock()
 }
@@ -1333,9 +1389,21 @@ type xrpPayment struct {
 	txnSig         []byte  // DER-encoded ECDSA signature
 }
 
-// encodePayment serializes a Payment transaction in XRP binary format.
-// When forSigning is true, the TxnSignature field is omitted.
-func encodePayment(p *xrpPayment, forSigning bool) []byte {
+// encodePaymentFields serializes the common shape of a Payment transaction
+// (native XRP or issued-currency) in XRP binary format, deferring the Amount
+// field to writeAmount. When forSigning is true, the TxnSignature field is
+// omitted. Shared by encodePayment and encodeIOUPayment so their field order
+// can't drift out of sync with each other.
+func encodePaymentFields(
+	account, destination [20]byte,
+	sequence uint32,
+	destinationTag *uint32,
+	lastLedgerSeq uint32,
+	writeAmount func(*bytes.Buffer) error,
+	fee uint64,
+	signingPubKey, txnSig []byte,
+	forSigning bool,
+) ([]byte, error) {
 	var b bytes.Buffer
 
 	b.WriteByte(fieldHdrTransactionType)
@@ -1345,38 +1413,49 @@ func encodePayment(p *xrpPayment, forSigning bool) []byte {
 	writeUInt32(&b, 0)
 
 	b.WriteByte(fieldHdrSequence)
-	writeUInt32(&b, p.sequence)
+	writeUInt32(&b, sequence)
 
-	if p.destinationTag != nil {
+	if destinationTag != nil {
 		b.WriteByte(fieldHdrDestTag)
-		writeUInt32(&b, *p.destinationTag)
+		writeUInt32(&b, *destinationTag)
 	}
 
 	b.WriteByte(fieldHdrLastLedgerSeq0)
 	b.WriteByte(fieldHdrLastLedgerSeq1)
-	writeUInt32(&b, p.lastLedgerSeq)
+	writeUInt32(&b, lastLedgerSeq)
 
 	b.WriteByte(fieldHdrAmount)
-	writeXRPAmount(&b, p.amount)
+	if err := writeAmount(&b); err != nil {
+		return nil, err
+	}
 
 	b.WriteByte(fieldHdrFee)
-	writeXRPAmount(&b, p.fee)
+	writeXRPAmount(&b, fee)
 
 	b.WriteByte(fieldHdrSigningPubKey)
-	writeVarBlob(&b, p.signingPubKey)
+	writeVarBlob(&b, signingPubKey)
 
-	if !forSigning && len(p.txnSig) > 0 {
+	if !forSigning && len(txnSig) > 0 {
 		b.WriteByte(fieldHdrTxnSignature)
-		writeVarBlob(&b, p.txnSig)
+		writeVarBlob(&b, txnSig)
 	}
 
 	b.WriteByte(fieldHdrAccount)
-	writeVarBlob(&b, p.account[:])
+	writeVarBlob(&b, account[:])
 
 	b.WriteByte(fieldHdrDestination)
-	writeVarBlob(&b, p.destination[:])
+	writeVarBlob(&b, destination[:])
 
-	return b.Bytes()
+	return b.Bytes(), nil
+}
+
+// encodePayment serializes a native-XRP Payment transaction in XRP binary
+// format. When forSigning is true, the TxnSignature field is omitted.
+func encodePayment(p *xrpPayment, forSigning bool) []byte {
+	b, _ := encodePaymentFields(p.account, p.destination, p.sequence, p.destinationTag, p.lastLedgerSeq,
+		func(b *bytes.Buffer) error { writeXRPAmount(b, p.amount); return nil },
+		p.fee, p.signingPubKey, p.txnSig, forSigning)
+	return b
 }
 
 func writeUInt16(b *bytes.Buffer, v uint16) {
@@ -1418,17 +1497,23 @@ func writeVarBlob(b *bytes.Buffer, data []byte) {
 	b.Write(data)
 }
 
-// signPayment computes the signing hash and returns the DER-encoded ECDSA sig.
-func signPayment(p *xrpPayment, privKey *btcec.PrivateKey) ([]byte, error) {
-	txBytes := encodePayment(p, true)
-
+// signTxBytes computes the XRPL signing hash (STX\0 prefix, SHA-512Half) over
+// an unsigned transaction blob and returns the DER-encoded ECDSA signature.
+// Shared by signPayment, signIOUPayment, and signTrustSet so a future change
+// to the signing procedure can't be applied to one transaction type and
+// missed on another.
+func signTxBytes(txBytes []byte, privKey *btcec.PrivateKey) []byte {
 	h := sha512.New()
 	h.Write(txSigningPrefix)
 	h.Write(txBytes)
 	msgHash := h.Sum(nil)[:32] // SHA-512Half
-
 	sig := ecdsa.Sign(privKey, msgHash)
-	return sig.Serialize(), nil
+	return sig.Serialize()
+}
+
+// signPayment computes the signing hash and returns the DER-encoded ECDSA sig.
+func signPayment(p *xrpPayment, privKey *btcec.PrivateKey) ([]byte, error) {
+	return signTxBytes(encodePayment(p, true), privKey), nil
 }
 
 // computeTxHash returns the XRPL transaction ID (SHA-512Half of "TXN\0" ||

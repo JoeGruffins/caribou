@@ -13,6 +13,7 @@ import (
 	"github.com/bisoncraft/bosswallet/util"
 	"github.com/bisoncraft/bosswallet/util/encode"
 	"github.com/bisoncraft/bosswallet/wallet/asset"
+	dexeth "github.com/bisoncraft/bosswallet/wallet/asset/eth"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/crypto"
@@ -279,8 +280,67 @@ func TestWalletInfoRegistration(t *testing.T) {
 	if reg.Info.Name != WalletInfo.Name {
 		t.Fatalf("registered asset name = %q, want %q", reg.Info.Name, WalletInfo.Name)
 	}
-	if reg.Tokens != nil {
-		t.Fatal("native BNB asset should not register tokens in the initial implementation")
+	if reg.Tokens == nil {
+		t.Fatal("expected native BNB asset to register USDC/USDT tokens")
+	}
+	if _, ok := reg.Tokens[usdcTokenID]; !ok {
+		t.Fatal("expected usdc.bnb to be registered")
+	}
+	if _, ok := reg.Tokens[usdtTokenID]; !ok {
+		t.Fatal("expected usdt.bnb to be registered")
+	}
+}
+
+// TestTokenRegistration verifies the package init() registered USDC and USDT
+// under the BNB parent asset with the expected wallet definition. Per-network
+// address filtering is enforced by asset.SetNetwork at runtime, which is
+// destructive of global registry state and so is not exercised here.
+func TestTokenRegistration(t *testing.T) {
+	cases := []struct {
+		id   uint32
+		name string
+	}{
+		{usdcTokenID, "USDC"},
+		{usdtTokenID, "Tether"},
+	}
+	for _, tc := range cases {
+		tok := asset.TokenInfo(tc.id)
+		if tok == nil {
+			t.Fatalf("TokenInfo(%d) returned nil; %s not registered", tc.id, tc.name)
+		}
+		if tok.Token == nil {
+			t.Fatalf("%s: embedded util.Token is nil", tc.name)
+		}
+		if tok.NetworkID != BipID {
+			t.Fatalf("%s NetworkID = %d, want %d (bnb BipID)", tc.name, tok.NetworkID, BipID)
+		}
+		if tok.Name != tc.name {
+			t.Fatalf("token id %d Name = %q, want %q", tc.id, tok.Name, tc.name)
+		}
+		if tok.Definition == nil {
+			t.Fatalf("%s has nil Definition", tc.name)
+		}
+		if tok.Definition.Type != walletTypeToken {
+			t.Fatalf("%s Definition.Type = %q, want %q", tc.name, tok.Definition.Type, walletTypeToken)
+		}
+		if tok.Definition.Tab != "BNB token" {
+			t.Fatalf("%s Definition.Tab = %q, want %q", tc.name, tok.Definition.Tab, "BNB token")
+		}
+	}
+}
+
+// TestTokenEVMFactor guards against Binance-Peg USDC/USDT being registered
+// with Ethereum's 6-decimal EVMFactor: both use 18 on-chain decimals, unlike
+// their Ethereum counterparts.
+func TestTokenEVMFactor(t *testing.T) {
+	for _, tok := range []*dexeth.Token{TokenUSDC, TokenUSDT} {
+		if tok.EVMFactor == nil || *tok.EVMFactor != 12 {
+			t.Fatalf("%s EVMFactor = %v, want 12 (6 conventional + 12 = 18 on-chain decimals)", tok.Name, tok.EVMFactor)
+		}
+		oneToken := new(big.Int).Exp(big.NewInt(10), big.NewInt(18), nil) // 1 token at 18 decimals
+		if atomic := tok.EVMToAtomic(oneToken); atomic != 1_000_000 {
+			t.Fatalf("%s EVMToAtomic(1e18) = %d, want 1_000_000 (1 %s)", tok.Name, atomic, tok.Name)
+		}
 	}
 }
 
