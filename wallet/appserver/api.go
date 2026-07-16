@@ -588,18 +588,19 @@ func (s *AppServer) apiNotes(w http.ResponseWriter, r *http.Request) {
 
 // apiLogout handles the 'logout' API request.
 func (s *AppServer) apiLogout(w http.ResponseWriter, r *http.Request) {
-	err := s.core.Logout()
-	if err != nil {
-		s.writeAPIError(w, fmt.Errorf("logout error: %w", err))
-		return
-	}
-
-	// With Core locked up, invalidate all known auth tokens and cached passwords
-	// to force any other sessions to login again.
-	s.deauth()
-
+	// Lock locks core and invalidates all known auth tokens and cached passwords,
+	// forcing any other sessions to login again. It deauths even when Logout
+	// errors, so the session these cookies name is gone either way: clear them
+	// regardless, and before the response is written, so a retry starts from a
+	// clean login instead of riding stale cookies into an auth failure.
+	logoutErr := s.Lock()
 	clearCookie(authCK, w)
 	clearCookie(pwKeyCK, w)
+
+	if logoutErr != nil {
+		s.writeAPIError(w, fmt.Errorf("logout error: %w", logoutErr))
+		return
+	}
 
 	response := struct {
 		OK bool `json:"ok"`
@@ -802,6 +803,13 @@ func (s *AppServer) apiChangeAppPass(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Serialize against Lock/Unlock. Changing the password tears down every
+	// session (deauth) and mints a fresh one; without this a concurrent biometric
+	// Unlock could mint a grant against a token this deauth is about to drop,
+	// leaving that unlock stranded on the login gate.
+	s.sessionMtx.Lock()
+	defer s.sessionMtx.Unlock()
+
 	// Update application password.
 	err := s.core.ChangeAppPass(form.AppPW, form.NewAppPW)
 	if err != nil {
@@ -955,6 +963,13 @@ func (s *AppServer) apiSetSendRequirePassword(w http.ResponseWriter, r *http.Req
 // apiActuallyLogin logs the user in. login form private data is expected to be
 // cleared by the caller.
 func (s *AppServer) actuallyLogin(w http.ResponseWriter, r *http.Request, login *loginForm) error {
+	// Serialize against Lock/Unlock. Both mint a session (auth token + cached
+	// password); without this a concurrent biometric Unlock could roll back and
+	// deauth() — wiping the token this login just created — leaving an unrelated,
+	// successful session silently stranded on the login gate.
+	s.sessionMtx.Lock()
+	defer s.sessionMtx.Unlock()
+
 	// Only allow login from the onion address when a companion app is
 	// actively paired. This prevents an unpaired companion app from
 	// re-authenticating with saved credentials.
