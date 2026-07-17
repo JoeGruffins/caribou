@@ -13,12 +13,12 @@ import (
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/types"
 
-	"github.com/bisoncraft/bosswallet/util"
-	"github.com/bisoncraft/bosswallet/util/dexnet"
-	"github.com/bisoncraft/bosswallet/wallet/asset"
-	"github.com/bisoncraft/bosswallet/wallet/asset/erc20"
+	"github.com/bisoncraft/caribou/util"
+	"github.com/bisoncraft/caribou/util/dexnet"
+	"github.com/bisoncraft/caribou/wallet/asset"
+	"github.com/bisoncraft/caribou/wallet/asset/erc20"
 
-	"github.com/bisoncraft/bosswallet/wallet/asset/erc20/across"
+	"github.com/bisoncraft/caribou/wallet/asset/erc20/across"
 )
 
 var (
@@ -225,7 +225,7 @@ func acrossSupportedDestinations(ctx context.Context, assetID uint32, net util.N
 			return nil, fmt.Errorf("token info mismatch for asset %d: %s != %s", assetID, route.OriginToken, originAsset.address.Hex())
 		}
 
-		// Check if the asset is supported by Boss Wallet.
+		// Check if the asset is supported by Caribou.
 		destAssetID, found := acrossAssetToAssetID(net, route.DestinationTokenSymbol, uint64(route.DestinationChainID))
 		if !found {
 			continue

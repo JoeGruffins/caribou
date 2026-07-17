@@ -1,4 +1,4 @@
-// Copyright (c) 2024 The Bison Wallet developers
+// Copyright (c) 2024 The Caribou Developers
 // Copyright (c) The go-electrum-client authors
 // Use of this source code is governed by an ISC
 // license that can be found in the LICENSE file.
@@ -6,7 +6,7 @@
 package electrum
 
 import (
-	"github.com/bisoncraft/bosswallet/wallet/utxowallet/netparams"
+	"github.com/bisoncraft/caribou/wallet/utxowallet/netparams"
 )
 
 // ServerAddr identifies an electrumx server endpoint. It is an alias of

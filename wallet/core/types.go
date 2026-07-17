@@ -7,10 +7,10 @@ import (
 	"encoding/hex"
 	"fmt"
 
-	"github.com/bisoncraft/bosswallet/util"
-	"github.com/bisoncraft/bosswallet/wallet/asset"
-	"github.com/bisoncraft/bosswallet/wallet/db"
-	"github.com/bisoncraft/bosswallet/wallet/txdb"
+	"github.com/bisoncraft/caribou/util"
+	"github.com/bisoncraft/caribou/wallet/asset"
+	"github.com/bisoncraft/caribou/wallet/db"
+	"github.com/bisoncraft/caribou/wallet/txdb"
 	"github.com/decred/dcrd/hdkeychain/v3"
 )
 
@@ -97,7 +97,7 @@ type ExtensionModeConfig struct {
 	// Name of embedding application. Used for messaging with disable features.
 	Name string `json:"name"`
 	// UseDEXBranding will tell the front end to use legacy DCRDEX branding
-	// instead of Boss Wallet branding where possible.
+	// instead of Caribou branding where possible.
 	UseDEXBranding bool `json:"useDEXBranding"`
 	// RestrictedWallets are wallets that need restrictions on reconfiguration
 	// options.

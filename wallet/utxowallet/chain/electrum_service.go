@@ -1,4 +1,4 @@
-// Copyright (c) 2024 The Bison Wallet developers
+// Copyright (c) 2024 The Caribou Developers
 // Use of this source code is governed by an ISC
 // license that can be found in the LICENSE file.
 
@@ -7,7 +7,7 @@ package chain
 import (
 	"context"
 
-	"github.com/bisoncraft/bosswallet/wallet/utxowallet/electrum"
+	"github.com/bisoncraft/caribou/wallet/utxowallet/electrum"
 	"github.com/btcsuite/btcd/chaincfg/chainhash"
 	"github.com/btcsuite/btcd/wire"
 )

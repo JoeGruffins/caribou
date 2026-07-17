@@ -2,7 +2,7 @@
 // also available online at https://blueoakcouncil.org/license/1.0.0.
 
 // Package hyperliquidmock implements a minimal in-memory reproduction of the
-// Hyperliquid REST and WebSocket APIs that the bosswallet HYPE wallet relies
+// Hyperliquid REST and WebSocket APIs that the caribou HYPE wallet relies
 // on (spotClearinghouseState, spotMeta, userNonFundingLedgerUpdates, and the
 // sendAsset exchange action). It exists so wallet behavior — including
 // EIP-712 signature verification — can be exercised end-to-end without a
@@ -24,8 +24,8 @@ import (
 	gethcrypto "github.com/ethereum/go-ethereum/crypto"
 	"github.com/gorilla/websocket"
 
-	"github.com/bisoncraft/bosswallet/util"
-	"github.com/bisoncraft/bosswallet/wallet/asset/hyperliquid"
+	"github.com/bisoncraft/caribou/util"
+	"github.com/bisoncraft/caribou/wallet/asset/hyperliquid"
 )
 
 // hypeTokenID is the spot token identifier the mock advertises for HYPE via

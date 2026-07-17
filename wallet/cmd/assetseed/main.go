@@ -11,9 +11,9 @@ import (
 	"os"
 	"time"
 
-	"github.com/bisoncraft/bosswallet/wallet/asset"
-	"github.com/bisoncraft/bosswallet/wallet/core"
-	"github.com/bisoncraft/bosswallet/wallet/mnemonic"
+	"github.com/bisoncraft/caribou/wallet/asset"
+	"github.com/bisoncraft/caribou/wallet/core"
+	"github.com/bisoncraft/caribou/wallet/mnemonic"
 )
 
 func main() {
@@ -27,8 +27,8 @@ func main() {
 
 func run() error {
 	var appSeedHex, appMnemonic string
-	flag.StringVar(&appSeedHex, "seedhex", "", "Boss Wallet application seed (128 hexadecimal characters)")
-	flag.StringVar(&appMnemonic, "mnemonic", "", "Boss Wallet application seed (15 word mnemonic)")
+	flag.StringVar(&appSeedHex, "seedhex", "", "Caribou application seed (128 hexadecimal characters)")
+	flag.StringVar(&appMnemonic, "mnemonic", "", "Caribou application seed (15 word mnemonic)")
 	var assetID uint
 	flag.UintVar(&assetID, "asset", 0, "Asset ID. BIP-0044 coin type (integer).\n"+
 		"See https://github.com/satoshilabs/slips/blob/master/slip-0044.md")

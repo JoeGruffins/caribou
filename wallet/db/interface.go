@@ -4,11 +4,11 @@
 package db
 
 import (
-	"github.com/bisoncraft/bosswallet/util"
-	"github.com/bisoncraft/bosswallet/util/encrypt"
+	"github.com/bisoncraft/caribou/util"
+	"github.com/bisoncraft/caribou/util/encrypt"
 )
 
-// DB is an interface that must be satisfied by Boss Wallet persistent storage
+// DB is an interface that must be satisfied by Caribou persistent storage
 // manager.
 type DB interface {
 	util.Runner

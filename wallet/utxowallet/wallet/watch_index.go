@@ -1,4 +1,4 @@
-// Copyright (c) 2024 The Bison Wallet developers
+// Copyright (c) 2024 The Caribou Developers
 // Use of this source code is governed by an ISC
 // license that can be found in the LICENSE file.
 
@@ -9,7 +9,7 @@ import (
 	"encoding/binary"
 	"errors"
 
-	"github.com/bisoncraft/bosswallet/wallet/utxowallet/walletdb"
+	"github.com/bisoncraft/caribou/wallet/utxowallet/walletdb"
 )
 
 // The watch-tier index persists, per scripthash, the highest block height at

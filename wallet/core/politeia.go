@@ -3,7 +3,7 @@ package core
 import (
 	"fmt"
 
-	pi "github.com/bisoncraft/bosswallet/util/politeia/pitypes"
+	pi "github.com/bisoncraft/caribou/util/politeia/pitypes"
 )
 
 // PoliteiaDetails retrieves the current Politeia state from the DCR wallet.
@@ -37,8 +37,8 @@ func (c *Core) Proposal(assetID uint32, token string) (*pi.Proposal, error) {
 
 // ProposalsInProgress returns the mini proposals for the proposals that are
 // currently in progress, meaning their vote status is unauthorized, authorized
-// or started. This is used to display the in progress proposals on the Bison
-// Wallet UI.
+// or started. This is used to display the in progress proposals on the Caribou
+// UI.
 func (c *Core) ProposalsInProgress() ([]*pi.MiniProposal, error) {
 	pv, err := c.politeiaVoter()
 	if err != nil {

@@ -21,16 +21,16 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/bisoncraft/bosswallet/util"
-	"github.com/bisoncraft/bosswallet/util/config"
-	"github.com/bisoncraft/bosswallet/util/dexnet"
-	"github.com/bisoncraft/bosswallet/util/encode"
-	"github.com/bisoncraft/bosswallet/util/encrypt"
-	"github.com/bisoncraft/bosswallet/wallet/asset"
-	"github.com/bisoncraft/bosswallet/wallet/db"
-	"github.com/bisoncraft/bosswallet/wallet/db/bolt"
-	"github.com/bisoncraft/bosswallet/wallet/mnemonic"
-	"github.com/bisoncraft/bosswallet/wallet/txdb"
+	"github.com/bisoncraft/caribou/util"
+	"github.com/bisoncraft/caribou/util/config"
+	"github.com/bisoncraft/caribou/util/dexnet"
+	"github.com/bisoncraft/caribou/util/encode"
+	"github.com/bisoncraft/caribou/util/encrypt"
+	"github.com/bisoncraft/caribou/wallet/asset"
+	"github.com/bisoncraft/caribou/wallet/db"
+	"github.com/bisoncraft/caribou/wallet/db/bolt"
+	"github.com/bisoncraft/caribou/wallet/mnemonic"
+	"github.com/bisoncraft/caribou/wallet/txdb"
 	"github.com/decred/dcrd/crypto/blake256"
 	"github.com/decred/dcrd/hdkeychain/v3"
 	"golang.org/x/text/language"
@@ -331,7 +331,7 @@ func New(cfg *Config) (*Core, error) {
 
 // Run runs the core. Satisfies the runner.Runner interface.
 func (c *Core) Run(ctx context.Context) {
-	c.log.Infof("Starting Boss Wallet core")
+	c.log.Infof("Starting Caribou core")
 	// Store the context as a field for use by goroutines spawned during
 	// initialization.
 	c.ctx = ctx
@@ -453,7 +453,7 @@ fetchers:
 		txDBWG.Wait()
 	}
 
-	c.log.Infof("Boss Wallet core off")
+	c.log.Infof("Caribou core off")
 }
 
 // Ready returns a channel that is closed when Run completes its initialization

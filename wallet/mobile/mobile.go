@@ -23,14 +23,14 @@ import (
 	"fmt"
 	"sync"
 
-	"github.com/bisoncraft/bosswallet/util"
-	"github.com/bisoncraft/bosswallet/wallet/app"
-	"github.com/bisoncraft/bosswallet/wallet/appserver"
-	"github.com/bisoncraft/bosswallet/wallet/core"
+	"github.com/bisoncraft/caribou/util"
+	"github.com/bisoncraft/caribou/wallet/app"
+	"github.com/bisoncraft/caribou/wallet/appserver"
+	"github.com/bisoncraft/caribou/wallet/core"
 
 	// Register the assets compiled into the mobile build. The build tags on the
 	// importall files select the set (e.g. add -tags xmr to include Monero).
-	_ "github.com/bisoncraft/bosswallet/wallet/asset/importall"
+	_ "github.com/bisoncraft/caribou/wallet/asset/importall"
 )
 
 // App is the bound application handle. The native shell creates one with
@@ -108,7 +108,7 @@ func (a *App) Start(dataDir, net string) (string, error) {
 
 	logMaker, closeLog := app.InitLogging(cfg.LogPath, cfg.DebugLevel, true, false)
 	a.log = logMaker.Logger("MOBILE")
-	a.log.Infof("Boss Wallet mobile starting for network %q", cfg.Net)
+	a.log.Infof("Caribou mobile starting for network %q", cfg.Net)
 
 	clientCore, err := core.New(cfg.Core(logMaker.Logger("CORE")))
 	if err != nil {
@@ -193,7 +193,7 @@ func (a *App) Start(dataDir, net string) (string, error) {
 	a.capToken = capToken
 
 	// Log the address, never the token.
-	a.log.Infof("Boss Wallet mobile listening at http://%s", srv.Addr())
+	a.log.Infof("Caribou mobile listening at http://%s", srv.Addr())
 	return a.bootstrapURL(), nil
 }
 

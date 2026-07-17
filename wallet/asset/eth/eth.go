@@ -20,14 +20,14 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/bisoncraft/bosswallet/util"
-	"github.com/bisoncraft/bosswallet/util/config"
-	"github.com/bisoncraft/bosswallet/util/encode"
-	"github.com/bisoncraft/bosswallet/util/keygen"
-	"github.com/bisoncraft/bosswallet/wallet/asset"
-	"github.com/bisoncraft/bosswallet/wallet/asset/erc20"
-	multibal "github.com/bisoncraft/bosswallet/wallet/asset/eth/contracts/multibalance"
-	"github.com/bisoncraft/bosswallet/wallet/txdb"
+	"github.com/bisoncraft/caribou/util"
+	"github.com/bisoncraft/caribou/util/config"
+	"github.com/bisoncraft/caribou/util/encode"
+	"github.com/bisoncraft/caribou/util/keygen"
+	"github.com/bisoncraft/caribou/wallet/asset"
+	"github.com/bisoncraft/caribou/wallet/asset/erc20"
+	multibal "github.com/bisoncraft/caribou/wallet/asset/eth/contracts/multibalance"
+	"github.com/bisoncraft/caribou/wallet/txdb"
 	"github.com/bisoncraft/go-bip39"
 	"github.com/decred/dcrd/dcrec/secp256k1/v4/ecdsa"
 	"github.com/decred/dcrd/hdkeychain/v3"
@@ -494,7 +494,7 @@ type baseWallet struct {
 }
 
 // assetWallet is a wallet backend for Ethereum and Eth tokens. The backend is
-// how Boss Wallet communicates with the Ethereum blockchain and wallet.
+// how Caribou communicates with the Ethereum blockchain and wallet.
 // assetWallet satisfies the util.Wallet interface.
 type assetWallet struct {
 	*baseWallet

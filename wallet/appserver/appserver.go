@@ -29,18 +29,18 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/bisoncraft/bosswallet/util"
-	"github.com/bisoncraft/bosswallet/util/dexnet"
-	"github.com/bisoncraft/bosswallet/util/encode"
-	"github.com/bisoncraft/bosswallet/util/encrypt"
-	pi "github.com/bisoncraft/bosswallet/util/politeia/pitypes"
-	"github.com/bisoncraft/bosswallet/util/version"
-	"github.com/bisoncraft/bosswallet/wallet/asset"
-	"github.com/bisoncraft/bosswallet/wallet/core"
-	"github.com/bisoncraft/bosswallet/wallet/db"
-	"github.com/bisoncraft/bosswallet/wallet/tor"
-	"github.com/bisoncraft/bosswallet/wallet/txdb"
-	"github.com/bisoncraft/bosswallet/wallet/websocket"
+	"github.com/bisoncraft/caribou/util"
+	"github.com/bisoncraft/caribou/util/dexnet"
+	"github.com/bisoncraft/caribou/util/encode"
+	"github.com/bisoncraft/caribou/util/encrypt"
+	pi "github.com/bisoncraft/caribou/util/politeia/pitypes"
+	"github.com/bisoncraft/caribou/util/version"
+	"github.com/bisoncraft/caribou/wallet/asset"
+	"github.com/bisoncraft/caribou/wallet/core"
+	"github.com/bisoncraft/caribou/wallet/db"
+	"github.com/bisoncraft/caribou/wallet/tor"
+	"github.com/bisoncraft/caribou/wallet/txdb"
+	"github.com/bisoncraft/caribou/wallet/websocket"
 	"github.com/decred/dcrd/certgen"
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
@@ -253,7 +253,7 @@ type Config struct {
 }
 
 // AppServer is a single-client http and websocket server enabling a browser
-// interface to Boss Wallet.
+// interface to Caribou.
 type AppServer struct {
 	ctx      context.Context
 	dataDir  string
@@ -322,16 +322,16 @@ func New(cfg *Config) (*AppServer, error) {
 	var siteDir string // empty signals embedded files only
 	if cfg.NoEmbed {
 		// Look for the "site" folder in the executable's path, the working
-		// directory, or relative to [repo root]/wallet/cmd/bossw.
-		execPath, err := os.Executable() // e.g. /usr/bin/bossw
+		// directory, or relative to [repo root]/wallet/cmd/caribou.
+		execPath, err := os.Executable() // e.g. /usr/bin/caribou
 		if err != nil {
 			return nil, fmt.Errorf("unable to locate executable path: %w", err)
 		}
-		execPath, err = filepath.EvalSymlinks(execPath) // e.g. /opt/decred/dex/bossw
+		execPath, err = filepath.EvalSymlinks(execPath) // e.g. /opt/caribou/caribou
 		if err != nil {
 			return nil, fmt.Errorf("unable to locate executable path: %w", err)
 		}
-		execPath = filepath.Dir(execPath) // e.g. /opt/decred/dex
+		execPath = filepath.Dir(execPath) // e.g. /opt/caribou
 
 		absDir, _ := filepath.Abs(site)
 		for _, dir := range []string{
@@ -353,8 +353,8 @@ func New(cfg *Config) (*AppServer, error) {
 		if siteDir == "" {
 			return nil, fmt.Errorf("no HTML template files found. "+
 				"Place the 'site' folder in the executable's directory %q or the working directory, "+
-				"or run bossw from within the wallet/cmd/bossw source workspace folder, or specify the"+
-				"'sitedir' configuration directive to bossw", execPath)
+				"or run caribou from within the wallet/cmd/caribou source workspace folder, or specify the"+
+				"'sitedir' configuration directive to caribou", execPath)
 		}
 
 		log.Infof("Located \"site\" folder at %v", siteDir)
