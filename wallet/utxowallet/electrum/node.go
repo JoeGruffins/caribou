@@ -14,6 +14,8 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"strconv"
+	"strings"
 
 	"github.com/btcsuite/btcd/wire"
 )
@@ -367,4 +369,89 @@ func (n *Node) EstimateFee(ctx context.Context, confTarget int32) (int64, error)
 		return 0, errors.New("electrum: server cannot estimate fee for given target")
 	}
 	return int64(coinsPerKB * 1e8), nil
+}
+
+// maxAdvertisedPeers bounds how many peers ServerPeers parses from a single
+// server.peers.subscribe reply. Honest deployments advertise a few dozen
+// peers; a hostile server can pack tens of thousands of fabricated entries
+// into one reply, each of which would become a stored pool candidate and a
+// potential dial. Entries past the cap are ignored. (The wire-level frame
+// size is separately bounded by maxFrameSize in server.go.)
+const maxAdvertisedPeers = 64
+
+// ServerPeers issues `server.peers.subscribe` (a one-shot query despite the
+// name) and parses the reply into dialable ssl candidates, at most
+// maxAdvertisedPeers of them. Each raw entry is [ip, hostname, [features...]]
+// where features include a protocol version ("v1.4") and port tags ("s50002"
+// = ssl, "t50001" = tcp). Only ssl-capable peers speaking protocol 1.4+ are
+// returned; the recommendation conveys no trust — candidates prove themselves
+// at handshake like any other server.
+func (n *Node) ServerPeers(ctx context.Context) ([]*ServerAddr, error) {
+	var raw [][]interface{}
+	if err := n.server.request(ctx, "server.peers.subscribe", nil, &raw); err != nil {
+		return nil, err
+	}
+	var out []*ServerAddr
+	for _, entry := range raw {
+		if len(out) == maxAdvertisedPeers {
+			break
+		}
+		if len(entry) < 3 {
+			continue
+		}
+		host, _ := entry[1].(string)
+		feats, _ := entry[2].([]interface{})
+		if host == "" || feats == nil {
+			continue
+		}
+		var sslPort, version string
+		for _, f := range feats {
+			fs, _ := f.(string)
+			switch {
+			case strings.HasPrefix(fs, "s") && len(fs) > 1:
+				sslPort = fs[1:]
+			case strings.HasPrefix(fs, "v"):
+				version = fs[1:]
+			}
+		}
+		if sslPort == "" || version == "" {
+			continue
+		}
+		if !protoAtLeast(version, 1, 4) {
+			continue
+		}
+		out = append(out, &ServerAddr{
+			Proto:      "ssl",
+			Addr:       host + ":" + sslPort,
+			SkipVerify: true,
+		})
+	}
+	return out, nil
+}
+
+// protoAtLeast reports whether a server-advertised protocol version string
+// ("1.4", "1.4.2", "1.10") is at least major.minor. Numeric comparison —
+// lexicographic ordering would reject a future "1.10".
+func protoAtLeast(version string, major, minor int) bool {
+	parts := strings.SplitN(version, ".", 3)
+	if len(parts) < 2 {
+		return false
+	}
+	maj, err1 := strconv.Atoi(parts[0])
+	min_, err2 := strconv.Atoi(parts[1])
+	if err1 != nil || err2 != nil {
+		return false
+	}
+	return maj > major || (maj == major && min_ >= minor)
+}
+
+// GetMerkle issues `blockchain.transaction.get_merkle`: the merkle branch
+// proving a confirmed transaction's inclusion in the block at height.
+func (n *Node) GetMerkle(ctx context.Context, txid string, height int32) (*MerkleProof, error) {
+	var out MerkleProof
+	if err := n.server.request(ctx, "blockchain.transaction.get_merkle",
+		positional{txid, height}, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
 }

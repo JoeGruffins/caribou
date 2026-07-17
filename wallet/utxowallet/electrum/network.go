@@ -11,9 +11,13 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"path/filepath"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
+	"github.com/bisoncraft/bosswallet/wallet/utxowallet/bisonwire"
 	"github.com/btcsuite/btcd/chaincfg/chainhash"
 	"github.com/btcsuite/btcd/wire"
 )
@@ -23,8 +27,16 @@ type Config struct {
 	// Chain identifies the chain and provides chain parameters.
 	Chain *ChainConfig
 
-	// TrustedServer is the initial server to dial. It is required.
+	// TrustedServer is the preferred server to dial. At least one of
+	// TrustedServer/Servers is required.
 	TrustedServer *ServerAddr
+
+	// Servers are additional candidate servers, in preference order. Start
+	// elects one connection: candidates are tried in health-scored order
+	// (recent failures deprioritized; see serverpool.go) until a dial and
+	// handshake succeed, and a server whose connection later fails is
+	// demoted so the next (re)connect rotates instead of retrying it.
+	Servers []*ServerAddr
 
 	// TorProxy is an optional SOCKS5 proxy address (host:port). When set,
 	// onion services in TrustedServer/Servers are dialed via this proxy.
@@ -82,6 +94,76 @@ type Network struct {
 	// report meaningful sync progress before the local store catches up.
 	serverTipMu sync.RWMutex
 	serverTip   int32
+
+	// spendSuspect is set when an observer presented a conflicting chain
+	// that demonstrated valid work (multi-server phase 2): the wallet
+	// server may be lying, so spend-affecting operations error until a
+	// rotation re-establishes a trusted view. Nothing is surfaced
+	// proactively — the error reaches the user only if they act.
+	spendSuspect atomic.Bool
+
+	// obsMtx guards observers, the live observer connections maintained by
+	// runObservers (observers.go), and obsWalletAddr, the wallet server's
+	// address as visible to observer bookkeeping. The wallet server must
+	// never be its own observer; obsWalletAddr is written in the same
+	// obsMtx section that purges a conflicting observer (attachNode) and
+	// read in the same obsMtx section that inserts one (fillObservers), so
+	// the pair cannot interleave into a self-observer no matter how the
+	// mu-guarded publication and the insert race. nil outside the observer
+	// loop's lifetime.
+	obsMtx        sync.Mutex
+	observers     map[string]*observer
+	obsWalletAddr string
+
+	// pool is the persistent, tiered server database (serverpool.go).
+	pool *serverPool
+
+	// subsMtx guards subs, the scripthashes with live subscriptions. The
+	// Network brokers every subscribe/unsubscribe, so this registry is the
+	// authoritative set a rotation must replay onto a successor node —
+	// server-side session state dies with the old connection.
+	subsMtx sync.Mutex
+	subs    map[string]struct{}
+
+	// rot serializes rotations (rotation.go).
+	rot rotationGuard
+
+	// loops is the goroutine group bound to the current wallet node
+	// (scripthashLoop, watchNode, and headersLoop — which in Start's group
+	// is preceded, in the same member, by the initial header sync).
+	// Rotation joins the old group before attaching a successor so two
+	// groups never interleave header appends or status forwards. Guarded
+	// by mu, and always published together with node, with every member's
+	// count already reserved: a group observable before its full count is
+	// raised can transiently drain to zero under a joiner's Wait, making
+	// the remaining Add an add-from-zero during Wait (sync.WaitGroup
+	// misuse). Start reserves then spawns; attachNode spawns under rotMtx
+	// before any joiner can run.
+	loops *loopGroup
+}
+
+// loopGroup tracks the goroutines bound to one wallet node. join blocks
+// until every loop in the group has exited — they do so when their node's
+// notify channels close (node death) or the network context ends; Start's
+// initial-sync member instead exits when syncHeaders errors on the dead
+// connection.
+type loopGroup struct {
+	node *Node
+	wg   sync.WaitGroup
+}
+
+func (g *loopGroup) join() { g.wg.Wait() }
+
+// spawnLoop runs fn tracked by both the group (rotation joins it) and the
+// network WaitGroup (WaitForShutdown waits for it).
+func (n *Network) spawnLoop(g *loopGroup, fn func()) {
+	g.wg.Add(1)
+	n.wg.Add(1)
+	go func() {
+		defer n.wg.Done()
+		defer g.wg.Done()
+		fn()
+	}()
 }
 
 // NewNetwork constructs a Network ready to be Started.
@@ -92,8 +174,8 @@ func NewNetwork(cfg *Config) (*Network, error) {
 	if cfg.Chain == nil {
 		return nil, errors.New("electrum: network config missing Chain")
 	}
-	if cfg.TrustedServer == nil {
-		return nil, errors.New("electrum: network config missing TrustedServer")
+	if cfg.TrustedServer == nil && len(cfg.Servers) == 0 {
+		return nil, errors.New("electrum: network config has no servers")
 	}
 	if cfg.DataDir == "" {
 		return nil, errors.New("electrum: network config missing DataDir")
@@ -105,18 +187,39 @@ func NewNetwork(cfg *Config) (*Network, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Network{
+	n := &Network{
 		cfg:           cfg,
 		headers:       h,
 		done:          make(chan struct{}),
 		tipChangeChan: make(chan *TipChange, notifyBufSize),
 		scripthashCh:  make(chan *ScripthashStatus, notifyBufSize),
-	}, nil
+	}
+	// The persistent server pool lives beside the header store (created by
+	// NewHeaders above): shipped seeds plus discovered peers with durable
+	// reputation (multi-server phase 4).
+	n.pool = newServerPool(
+		filepath.Join(cfg.DataDir, "electrum", string(cfg.Chain.Chain)),
+		n.candidates())
+	return n, nil
 }
 
 // Headers returns the underlying header store. Useful for chain.Backend
 // implementations that need direct read access.
 func (n *Network) Headers() *Headers { return n.headers }
+
+// candidates returns the deduplicated configured server pool.
+func (n *Network) candidates() []*ServerAddr {
+	out := make([]*ServerAddr, 0, len(n.cfg.Servers)+1)
+	seen := make(map[string]bool)
+	for _, sv := range append([]*ServerAddr{n.cfg.TrustedServer}, n.cfg.Servers...) {
+		if sv == nil || seen[sv.Addr] {
+			continue
+		}
+		seen[sv.Addr] = true
+		out = append(out, sv)
+	}
+	return out
+}
 
 // Start connects to the trusted server, subscribes to header notifications,
 // and returns promptly. The initial header chain download (which can take
@@ -164,6 +267,9 @@ func (n *Network) Start(parent context.Context) error {
 			n.cancel()
 		}
 		n.doneClosed.Do(func() {
+			// Persist failures recorded by the dial loop that are still
+			// waiting on the pool's coalescing delay.
+			n.pool.flush()
 			close(n.tipChangeChan)
 			close(n.scripthashCh)
 			close(n.done)
@@ -171,25 +277,53 @@ func (n *Network) Start(parent context.Context) error {
 		return err
 	}
 
-	node, err := NewNode(n.ctx, n.cfg.TrustedServer, n.cfg.TorProxy,
-		n.cfg.Chain.Params.GenesisHash.String())
-	if err != nil {
-		return failed(err)
-	}
-
-	// Subscribe FIRST so syncHeaders knows the server-reported tip. That
-	// height becomes the tipHint for AppendBatch: headers within the
-	// trailing recentPoWWindow get per-header PoW, older headers are
-	// validated only by checkpoint match + retarget structure (much
-	// faster than per-header scrypt over millions of LTC blocks).
+	// Elect one connection from the candidate pool: dial in health-scored
+	// order until a handshake and header subscription succeed. Failures are
+	// recorded so subsequent elections (including full wallet reconnects,
+	// which rebuild this Network) rotate away from dead servers.
 	//
-	// Tip-change notifications that arrive during the background sync are
-	// buffered by the server's headersNotify channel; headersLoop drains
-	// them after sync completes.
-	tip, err := node.SubscribeHeaders(n.ctx)
-	if err != nil {
-		node.Close()
-		return failed(fmt.Errorf("electrum: subscribe headers: %w", err))
+	// The subscribe happens FIRST so syncHeaders knows the server-reported
+	// tip. That height becomes the tipHint for AppendBatch: headers within
+	// the trailing recentPoWWindow get per-header PoW, older headers are
+	// validated only by checkpoint match + retarget structure (much faster
+	// than per-header scrypt over millions of LTC blocks). Tip-change
+	// notifications that arrive during the background sync are buffered by
+	// the server's headersNotify channel; headersLoop drains them after
+	// sync completes.
+	candidates := n.pool.walletCandidates()
+	if len(candidates) == 0 {
+		// Every shipped server is quarantined (divergence audits persist
+		// quarantine for 24 hours, and the discovered fallback opens only
+		// on recorded failures, not quarantine). tryElect and the degraded
+		// loop tolerate an empty election; Start must too, or the dial
+		// loop below leaves tip nil and the publish dereferences it.
+		return failed(errors.New(
+			"electrum: no eligible wallet servers (all quarantined)"))
+	}
+	var node *Node
+	var tip *HeadersTip
+	var dialErr error
+	for _, sv := range candidates {
+		node, dialErr = NewNode(n.ctx, sv, n.cfg.TorProxy,
+			n.cfg.Chain.Params.GenesisHash.String())
+		if dialErr != nil {
+			n.pool.recordFailure(sv.Addr)
+			log.Warnf("electrum: server %s failed: %v", sv.Addr, dialErr)
+			continue
+		}
+		tip, dialErr = node.SubscribeHeaders(n.ctx)
+		if dialErr != nil {
+			node.Close()
+			n.pool.recordFailure(sv.Addr)
+			log.Warnf("electrum: server %s failed: subscribe headers: %v", sv.Addr, dialErr)
+			continue
+		}
+		n.pool.recordSuccess(sv.Addr)
+		break
+	}
+	if dialErr != nil {
+		return failed(fmt.Errorf("electrum: all %d candidate servers failed, last: %w",
+			len(candidates), dialErr))
 	}
 
 	// Record the server's reported tip so TargetTip() can report meaningful
@@ -198,46 +332,92 @@ func (n *Network) Start(parent context.Context) error {
 	n.serverTip = tip.Height
 	n.serverTipMu.Unlock()
 
-	// Commit: publish the node and flip started/launched. From here on,
-	// watchNode owns the channel-close — never call failed() after this point.
+	// Commit: publish the node and its loop group together, with every
+	// member's group count RESERVED up front. From here on, watchNode owns
+	// the channel-close — never call failed() after this point.
+	//
+	// The reservation and the single publication section both matter. A
+	// node that dies instantly fires watchNode's rotate the moment the
+	// member spawns; rotate reads (n.node, n.loops) and joins the group.
+	// Publishing the node before the group would let that rotation observe
+	// a nil group and skip the join — proceeding while this node's loops
+	// spawn around it. Publishing the group with fewer than its final
+	// member count would let the counter transiently drain to zero with
+	// the join in Wait, making the remaining spawn's Add an add-from-zero
+	// concurrent with Wait, which sync.WaitGroup forbids. attachNode needs
+	// neither precaution: its spawns complete under rotMtx before any
+	// joiner can observe the group.
+	group := &loopGroup{node: node}
+	group.wg.Add(3)
 	n.mu.Lock()
 	n.node = node
 	n.started = true
 	n.launched = true
+	n.loops = group
 	n.mu.Unlock()
+	n.spawnReserved(group, func() { n.scripthashLoop(node) })
+	n.spawnReserved(group, func() { n.watchNode(node) })
 
-	// scripthashLoop and watchNode start immediately; they don't depend on
-	// the header sync completing.
-	n.wg.Add(2)
-	go n.scripthashLoop()
-	go n.watchNode(node)
+	// Seed the observer-side wallet address before the observer loop can
+	// run its first fill (see obsWalletAddr).
+	n.obsMtx.Lock()
+	n.obsWalletAddr = node.Addr().Addr
+	n.obsMtx.Unlock()
 
-	// The background sync goroutine is wg-tracked so WaitForShutdown waits
-	// for it. It runs syncHeaders, then (on success) hands off to headersLoop.
-	// On failure it calls Stop(), which triggers the same teardown path that a
-	// node-drop uses (Stop → cancel/node.Close → watchNode unblocks → child
-	// goroutine closes channels after wg.Wait). It does NOT call failed()
-	// because launched is already true and failed() would double-close.
-	n.wg.Add(1)
-	go func() {
-		defer n.wg.Done()
+	// Observer connections (multi-server phase 2): header-only
+	// subscriptions on the remaining candidates, watching for a lagging or
+	// lying wallet server. Only meaningful when there is anyone else to
+	// ask.
+	if len(n.candidates()) > 1 {
+		n.wg.Add(1)
+		go n.runObservers()
+	}
+
+	// The background sync runs as a member of the node's loop group, with
+	// headersLoop running inline in the same member once sync succeeds
+	// (headersLoop must not race the initial batch-writes to the header
+	// store). Membership means a rotation's join() waits out a
+	// still-running initial sync; that wait is bounded because rotate
+	// closes the node before joining and BlockHeaders fails fast on a dead
+	// connection. On sync failure this member calls Stop() — the same
+	// teardown path a node-drop uses — but only while this node still
+	// holds the wallet slot: a rotation may already have replaced a node
+	// that died mid-sync, and tearing the network down then would kill a
+	// healthy successor. Stop itself never waits on the group, so a member
+	// may call it; failed() is off-limits here because launched is already
+	// true and it would double-close the channels.
+	n.spawnReserved(group, func() {
 		if err := n.syncHeaders(n.ctx, node, tip.Height); err != nil {
 			if n.ctx.Err() == nil {
 				// Context is still live, so this is a real sync error
-				// (not a graceful shutdown). Log it before tearing down.
+				// (not a graceful shutdown) — bad or hostile server.
+				// Demote it so the reconnect rotates.
+				n.pool.recordFailure(node.Addr().Addr)
 				log.Errorf("electrum: initial header sync failed: %v", err)
 			}
-			n.Stop()
+			n.mu.Lock()
+			current := n.node
+			n.mu.Unlock()
+			if current == node {
+				n.Stop()
+			}
 			return
 		}
-		// Sync succeeded. headersLoop must run AFTER syncHeaders so it
-		// doesn't race the initial batch-writes to the header store. It is
-		// wg-tracked so WaitForShutdown correctly waits for it.
-		n.wg.Add(1)
-		go n.headersLoop(tip)
-	}()
+		n.headersLoop(node, tip)
+	})
 
 	return nil
+}
+
+// spawnReserved runs fn as a member of a group whose counter was reserved at
+// construction (see Start); it adds only the network-level tracking.
+func (n *Network) spawnReserved(g *loopGroup, fn func()) {
+	n.wg.Add(1)
+	go func() {
+		defer n.wg.Done()
+		defer g.wg.Done()
+		fn()
+	}()
 }
 
 // Stop initiates teardown. Done closes once teardown finishes. Safe to call
@@ -255,6 +435,7 @@ func (n *Network) Stop() {
 		// watchNode) closes directly; there are no senders to race.
 		if !launched {
 			n.doneClosed.Do(func() {
+				n.pool.flush()
 				close(n.tipChangeChan)
 				close(n.scripthashCh)
 				close(n.done)
@@ -303,6 +484,11 @@ func (n *Network) ScripthashChan() <-chan *ScripthashStatus { return n.scripthas
 // Tip returns the current best block height as known to this network.
 func (n *Network) Tip() int32 { return n.headers.Tip() }
 
+// StartHeight returns the lowest header height the store syncs from — the
+// checkpoint anchor on mainnet/testnet, 0 on regtest. Headers below it do
+// not exist locally.
+func (n *Network) StartHeight() int32 { return n.headers.StartHeight() }
+
 // Synced reports whether the initial header sync has completed.
 func (n *Network) Synced() bool { return n.headers.Synced() }
 
@@ -344,11 +530,67 @@ func (n *Network) SubscribeScripthash(ctx context.Context, scripthash string) (*
 	if err != nil {
 		return nil, err
 	}
-	return node.SubscribeScripthash(ctx, scripthash)
+	st, err := node.SubscribeScripthash(ctx, scripthash)
+	if err != nil {
+		return nil, err
+	}
+	n.subsMtx.Lock()
+	if n.subs == nil {
+		n.subs = make(map[string]struct{})
+	}
+	n.subs[scripthash] = struct{}{}
+	n.subsMtx.Unlock()
+	return st, nil
+}
+
+// replaySubscriptions re-establishes every registered scripthash
+// subscription on node — a rotation successor holds none — and forwards each
+// returned status through the normal notification channel. The consumer's
+// status/history diff then delivers exactly the activity missed while blind:
+// an unchanged status is a hash commitment that nothing happened, a changed
+// one triggers a full-history diff. Returns the first error so the caller
+// can treat the successor as failed.
+func (n *Network) replaySubscriptions(ctx context.Context, node *Node) error {
+	n.subsMtx.Lock()
+	subs := make([]string, 0, len(n.subs))
+	for sh := range n.subs {
+		subs = append(subs, sh)
+	}
+	n.subsMtx.Unlock()
+	for _, sh := range subs {
+		st, err := node.SubscribeScripthash(ctx, sh)
+		if err != nil {
+			return fmt.Errorf("electrum: replay subscribe %s: %w", sh, err)
+		}
+		if st.Status == "" {
+			continue // no history; nothing to reconcile
+		}
+		select {
+		case n.scripthashCh <- st:
+		case <-n.ctx.Done():
+			return n.ctx.Err()
+		}
+	}
+	if len(subs) > 0 {
+		log.Infof("electrum: replayed %d scripthash subscriptions", len(subs))
+	}
+	return nil
+}
+
+// GetMerkle fetches the merkle inclusion proof for a confirmed transaction.
+func (n *Network) GetMerkle(ctx context.Context, txid string, height int32) (*MerkleProof, error) {
+	node, err := n.getNode()
+	if err != nil {
+		return nil, err
+	}
+	return node.GetMerkle(ctx, txid, height)
 }
 
 // UnsubscribeScripthash undoes a previous subscription.
 func (n *Network) UnsubscribeScripthash(ctx context.Context, scripthash string) {
+	n.subsMtx.Lock()
+	delete(n.subs, scripthash)
+	n.subsMtx.Unlock()
 	node, err := n.getNode()
 	if err != nil {
 		return
@@ -394,11 +636,102 @@ func (n *Network) GetTransactionVerbose(ctx context.Context, txid string) (*Verb
 
 // Broadcast issues `blockchain.transaction.broadcast`.
 func (n *Network) Broadcast(ctx context.Context, rawTxHex string) (string, error) {
+	if n.spendSuspect.Load() {
+		log.Errorf("electrum: refusing broadcast: chain integrity suspect " +
+			"(conflicting chain with valid work observed); pending rotation")
+		return "", errors.New("electrum: chain integrity suspect (conflicting " +
+			"chain with valid work observed); broadcasts suspended pending rotation")
+	}
 	node, err := n.getNode()
 	if err != nil {
 		return "", err
 	}
-	return node.Broadcast(ctx, rawTxHex)
+
+	// Broadcast fan-out (multi-server phase 3): the wallet server's answer
+	// is authoritative, but a lone server can accept a transaction and
+	// silently never relay it, so the observers get it too — censorship
+	// then requires every connected operator to collude. The transaction is
+	// being published to the whole network, so fanning it out costs no
+	// privacy.
+	observers := n.observerNodes()
+	txid, err := node.Broadcast(ctx, rawTxHex)
+	if err == nil {
+		for _, on := range observers {
+			// Deliberately NOT wg-tracked: Broadcast can race Stop, and
+			// wg.Add concurrent with the teardown path's wg.Wait is
+			// WaitGroup misuse. These goroutines touch no Network
+			// channels and their requests die with n.ctx/node.Close.
+			go func(on *Node) {
+				if _, oerr := on.Broadcast(n.ctx, rawTxHex); oerr != nil &&
+					!broadcastDuplicate(oerr) {
+					log.Debugf("electrum: observer %s broadcast fan-out: %v",
+						on.Addr().Addr, oerr)
+				}
+			}(on)
+		}
+		return txid, nil
+	}
+	// A duplicate response means the network already has the transaction —
+	// success for (re)broadcast purposes.
+	if broadcastDuplicate(err) {
+		log.Debugf("electrum: broadcast: %s reports tx already known", node.Addr().Addr)
+		return txidFromRaw(n.cfg.Chain.Chain, rawTxHex)
+	}
+	// The wallet server refused. Try the observers synchronously — an
+	// accept here both publishes the transaction and flags the wallet
+	// server's refusal as suspect.
+	log.Warnf("electrum: wallet server %s rejected broadcast (%v); trying %d observers",
+		node.Addr().Addr, err, len(observers))
+	for _, on := range observers {
+		otxid, oerr := on.Broadcast(ctx, rawTxHex)
+		if oerr == nil {
+			log.Warnf("electrum: observer %s accepted a broadcast the wallet "+
+				"server rejected", on.Addr().Addr)
+			return otxid, nil
+		}
+		if broadcastDuplicate(oerr) {
+			return txidFromRaw(n.cfg.Chain.Chain, rawTxHex)
+		}
+	}
+	// Unanimous rejection: surface the wallet server's error.
+	return "", err
+}
+
+// broadcastDuplicate reports whether a broadcast error means the transaction
+// is already known to the server — success for our purposes. Server
+// implementations word this differently (electrumx, Fulcrum, and the daemons
+// behind them), so this is substring matching over the known variants rather
+// than error codes.
+func broadcastDuplicate(err error) bool {
+	msg := strings.ToLower(err.Error())
+	for _, marker := range []string{
+		"already known",
+		"already in block chain",
+		"already in the mempool",
+		"already in mempool",
+		"txn-already",
+		"duplicate transaction",
+	} {
+		if strings.Contains(msg, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+// txidFromRaw computes the transaction id of a raw hex transaction, used
+// when every server reported the transaction as already known and none
+// returned an id.
+func txidFromRaw(chain bisonwire.Chain, rawTxHex string) (string, error) {
+	raw, err := hex.DecodeString(rawTxHex)
+	if err != nil {
+		return "", fmt.Errorf("electrum: undecodable raw tx: %w", err)
+	}
+	tx := bisonwire.Tx{Chain: string(chain)}
+	if err := tx.Deserialize(bytes.NewReader(raw)); err != nil {
+		return "", fmt.Errorf("electrum: undecodable raw tx: %w", err)
+	}
+	return tx.TxHash().String(), nil
 }
 
 // EstimateFee returns satoshis per kilobyte for confTarget confirmations.
@@ -428,10 +761,22 @@ func (n *Network) getNode() (*Node, error) {
 
 // syncHeaders pulls headers from `Tip()+1` until the server reports a short
 // batch (i.e. we've caught up). It runs as a single-threaded blocking call
-// during Start. tipHint is the server-reported best height learned from the
-// initial subscribe; it lets AppendBatch decide which trailing window of
-// headers gets full per-header PoW.
+// during Start and during attachNode's rotation catch-up. tipHint is the
+// server-reported best height learned from the initial subscribe; it lets
+// AppendBatch decide which trailing window of headers gets full per-header
+// PoW.
+//
+// When the server's chain diverges below the stored tip — a reorg landed
+// while no node was attached: a successor after a fork, or a restart against
+// a moved chain — the first batch fails to connect. That is recoverable, not
+// fatal: rewind toward the fork point (bounded like catchUpFrom) and retry,
+// surfacing the disconnects so consumers roll back what the store dropped.
+// Treating it as fatal made every candidate on the honest chain fail
+// identically after an ordinary one-block reorg, leaving rotation degraded
+// forever and Start unable to open the wallet until the header file was
+// deleted by hand.
 func (n *Network) syncHeaders(ctx context.Context, node *Node, tipHint int32) error {
+	var rewound int32
 	for {
 		nextHeight := max(n.headers.Tip()+1, n.cfg.Chain.StartHeight)
 		batch, err := node.BlockHeaders(ctx, nextHeight, n.cfg.HeaderBatchSize)
@@ -446,7 +791,23 @@ func (n *Network) syncHeaders(ctx context.Context, node *Node, tipHint int32) er
 			return fmt.Errorf("electrum: decode header batch: %w", err)
 		}
 		if _, err := n.headers.AppendBatch(nextHeight, raw, tipHint); err != nil {
-			return err
+			if !errors.Is(err, errHeaderDoesNotConnect) {
+				return err
+			}
+			rewound += reorgRewindDepth
+			if rewound > maxReorgDepth {
+				return fmt.Errorf("electrum: reorg deeper than %d blocks "+
+					"near height %d; resync required: %w",
+					maxReorgDepth, nextHeight, err)
+			}
+			disc, rerr := n.headers.Rewind(reorgRewindDepth)
+			if rerr != nil {
+				return fmt.Errorf("electrum: reorg rewind: %w", rerr)
+			}
+			if len(disc) > 0 && !n.deliverTipChange(&TipChange{Disconnected: disc}) {
+				return ctx.Err()
+			}
+			continue
 		}
 		log.Debugf("electrum: appended %d headers at height %d (tip now %d)",
 			batch.Count, nextHeight, n.headers.Tip())
@@ -478,9 +839,7 @@ func (n *Network) syncHeaders(ctx context.Context, node *Node, tipHint int32) er
 
 // headersLoop consumes tip notifications from the node and applies them to
 // the headers store, fanning out structured TipChange events to subscribers.
-func (n *Network) headersLoop(initialTip *HeadersTip) {
-	defer n.wg.Done()
-
+func (n *Network) headersLoop(node *Node, initialTip *HeadersTip) {
 	// lastDeliveredTip is the highest height we've published in a
 	// Connected entry. The first iteration uses the headers-store tip
 	// after we apply the subscription's initial reply, then walks forward
@@ -504,10 +863,6 @@ func (n *Network) headersLoop(initialTip *HeadersTip) {
 		}
 	}
 
-	node := n.peekNode()
-	if node == nil {
-		return
-	}
 	ch := node.HeadersNotifyChan()
 	for {
 		select {
@@ -535,14 +890,6 @@ func (n *Network) deliverConnectRange(lastDelivered, newTip int32) bool {
 		connected = append(connected, h)
 	}
 	return n.deliverTipChange(&TipChange{Connected: connected})
-}
-
-// peekNode returns the current node without an error path, for goroutines
-// that have already verified Start succeeded and just want a snapshot.
-func (n *Network) peekNode() *Node {
-	n.mu.RLock()
-	defer n.mu.RUnlock()
-	return n.node
 }
 
 // applyTipNotification processes one tip notification from the server and
@@ -768,12 +1115,7 @@ func (n *Network) deliverTipChange(tc *TipChange) bool {
 
 // scripthashLoop fans out scripthash notifications from the node to the
 // per-network channel.
-func (n *Network) scripthashLoop() {
-	defer n.wg.Done()
-	node := n.peekNode()
-	if node == nil {
-		return
-	}
+func (n *Network) scripthashLoop(node *Node) {
 	ch := node.ScripthashNotifyChan()
 	for {
 		select {
@@ -806,19 +1148,24 @@ func (n *Network) scripthashLoop() {
 // waitgroup. Returning lets our own `defer n.wg.Done()` fire so the wait can
 // complete; the child then closes the public channels and signals done.
 func (n *Network) watchNode(node *Node) {
-	defer n.wg.Done()
 	select {
 	case <-node.Done():
-		log.Warnf("electrum: trusted server %s disconnected; stopping network", node.Addr())
-		n.Stop()
+		if n.ctx.Err() == nil {
+			// Unexpected death with the network still live: demote and
+			// hand off to surgical rotation, which owns teardown from
+			// here (installs a successor group or spawns the closer).
+			// rotate runs outside this loop group — it joins the group,
+			// and a member joining itself would deadlock.
+			n.pool.recordFailure(node.Addr().Addr)
+			log.Warnf("electrum: wallet server %s disconnected; rotating", node.Addr())
+			n.wg.Add(1)
+			go func() {
+				defer n.wg.Done()
+				n.rotate(node, "", "connection lost")
+			}()
+			return
+		}
 	case <-n.ctx.Done():
 	}
-	go func() {
-		n.wg.Wait()
-		n.doneClosed.Do(func() {
-			close(n.tipChangeChan)
-			close(n.scripthashCh)
-			close(n.done)
-		})
-	}()
+	n.spawnCloser()
 }

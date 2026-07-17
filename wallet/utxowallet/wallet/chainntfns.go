@@ -160,6 +160,12 @@ func (w *Wallet) handleChainNotifications() {
 					return w.connectBlock(tx, wtxmgr.BlockMeta(n))
 				})
 				notificationName = "block connected"
+				if err == nil {
+					// Outside the db tx: unwatching does a
+					// network round-trip per backend call.
+					w.reapWatches(chainClient, n.Height)
+					w.maybeSweep(chainClient, n.Height)
+				}
 			case chain.BlockDisconnected:
 				err = walletdb.Update(w.db, func(tx walletdb.ReadWriteTx) error {
 					return w.disconnectBlock(tx, wtxmgr.BlockMeta(n))
@@ -324,6 +330,17 @@ func (w *Wallet) addRelevantTx(dbtx walletdb.ReadWriteTx, rec *wtxmgr.TxRecord,
 	if err != nil {
 		return err
 	}
+
+	// The watch policy is fed BEFORE the duplicate early-return: a sweep can
+	// re-deliver a known transaction (a reorg-margin overlap, or a block
+	// shared with another entry's hit), and the sweep promotes its hits out
+	// of the cold set expecting ingestion to re-track them. Skipping the
+	// note on duplicates left a promoted address in neither the tracked nor
+	// the cold set — watched by the backend but invisible to the policy for
+	// the rest of the process lifetime. Duplicates arrive only for watched
+	// addresses' transactions, so this cannot re-track an aged wallet's
+	// whole history.
+	w.noteActivity(dbtx, rec, block)
 
 	// If the transaction has already been recorded, we can return early.
 	// Note: Returning here is safe as we're within the context of an atomic

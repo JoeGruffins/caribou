@@ -36,10 +36,10 @@ func UseLogger(backend *btclog.Backend) {
 	}
 
 	spv.UseLogger(sub("NTRNO", btclog.LevelDebug))
-	chain.UseLogger(sub("CHAIN", btclog.LevelInfo))
+	chain.UseLogger(sub("CHAIN", btclog.LevelDebug))
 	electrum.UseLogger(sub("ELEC", btclog.LevelDebug))
 	peer.UseLogger(sub("PEER", btclog.LevelInfo))
-	wallet.UseLogger(sub("WLLT", btclog.LevelInfo))
+	wallet.UseLogger(sub("WLLT", btclog.LevelDebug))
 	wtxmgr.UseLogger(sub("TXMGR", btclog.LevelInfo))
 	waddrmgr.UseLogger(sub("ADDR", btclog.LevelInfo))
 	blockntfns.UseLogger(sub("BLKN", btclog.LevelInfo))

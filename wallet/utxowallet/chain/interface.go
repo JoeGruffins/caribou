@@ -55,9 +55,57 @@ type Backend interface {
 //
 // "Used" means any history, confirmed or in mempool — a used-then-emptied
 // address must still report true, so implementations test history presence,
-// not balance.
+// not balance. earliest is the lowest CONFIRMED height in the history (0
+// when the history is empty or mempool-only): the caller needs it to place a
+// discovered address's sweep floor below its first activity, since the
+// history predates anything the wallet has ingested.
 type AddressProber interface {
-	ProbeAddress(addr btcutil.Address) (used bool, err error)
+	ProbeAddress(addr btcutil.Address) (used bool, earliest int32, err error)
+}
+
+// AddressWatcher is an optional capability for a Backend whose per-address
+// watches (established via NotifyReceived) can be dropped again. It lets the
+// wallet bound its persistent watch set by ending an address's watch once no
+// time-uncontrolled event can occur on it — e.g. a change address whose every
+// transaction is final. Backends that don't implement it (neutrino's cfilter
+// watch list is add-only today) keep the historical watch-forever behaviour;
+// see docs/address-watching-plan.md.
+//
+// Watch remains NotifyReceived: every existing feed watches at a hot moment
+// (address creation, change creation, broadcast), so only the removal and
+// sweep verbs are new.
+type AddressWatcher interface {
+	Unwatch(addrs []btcutil.Address) error
+
+	// Sweep is the metered safety net for unwatched (cold) addresses: it
+	// checks each entry for activity strictly above its own FromHeight (or
+	// in the mempool), re-establishes the watch for those with hits, and
+	// ingests the new history in block order. It returns the hit addresses
+	// (for promotion out of the cold set) and the addresses whose check
+	// FAILED — the caller must not advance any known-history floor past a
+	// failed address, or the heights it skipped are never examined again.
+	Sweep(entries []SweepEntry) (hits, failed []btcutil.Address, err error)
+}
+
+// SweepEntry is one cold address in a Sweep request. Floors are per-entry
+// because cold addresses are demoted at different tips: judging every entry
+// against a set-wide minimum floor sweeps each entry above the minimum from
+// below its own verified floor, re-hitting its own already-ingested history
+// on every sweep.
+type SweepEntry struct {
+	Addr btcutil.Address
+	// FromHeight is exclusive: activity strictly above it counts as a hit.
+	FromHeight int32
+	// OutPoints are the address's known unspent outpoints. A block-scanning
+	// backend (neutrino) matches spends against them exactly: the prevout
+	// script reconstructed from an input's signature data covers only the
+	// classes ComputePkScript understands, and a taproot keyspend witness
+	// reconstructs to a wrong script with no error — an outpoint match
+	// cannot be fooled that way, and the phantom-balance harm of a missed
+	// spend is confined to exactly these known UTXOs. History-based
+	// backends (electrum) see spends in the address's own history and may
+	// ignore this.
+	OutPoints []wire.OutPoint
 }
 
 // Notification types.  These are defined here and processed from from reading

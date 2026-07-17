@@ -9,6 +9,8 @@ import (
 	"context"
 	"encoding/hex"
 	"errors"
+	"fmt"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -29,15 +31,16 @@ import (
 // deterministically. It owns its own header chain and notification channels;
 // no actual electrumx server is contacted.
 type stubNetwork struct {
-	mu       sync.Mutex
-	headers  []*wire.BlockHeader
-	hashIdx  map[chainhash.Hash]int32
-	synced   bool
-	subs     map[string]string // scripthash → status
-	history  map[string][]electrum.HistoryEntry
-	rawTxs   map[string]string // txid → hex
-	bcasted  []string
-	bcastErr error
+	lyingMerkle bool
+	mu          sync.Mutex
+	headers     []*wire.BlockHeader
+	hashIdx     map[chainhash.Hash]int32
+	synced      bool
+	subs        map[string]string // scripthash → status
+	history     map[string][]electrum.HistoryEntry
+	rawTxs      map[string]string // txid → hex
+	bcasted     []string
+	bcastErr    error
 
 	// subscribeHook, if non-nil, is invoked at the top of each
 	// SubscribeScripthash call (under s.mu). The returned error is
@@ -119,6 +122,8 @@ func (s *stubNetwork) Stop()                         { close(s.done) }
 func (s *stubNetwork) Done() <-chan struct{}         { return s.done }
 func (s *stubNetwork) WaitForShutdown()              { <-s.done }
 
+func (s *stubNetwork) StartHeight() int32 { return 0 }
+
 func (s *stubNetwork) Tip() int32 {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -138,7 +143,63 @@ func (s *stubNetwork) HeaderByHeight(height int32) *wire.BlockHeader {
 	if height < 0 || int(height) >= len(s.headers) {
 		return nil
 	}
-	return s.headers[height]
+	// Fix the header's merkle root before handing it out, then return a
+	// COPY. The real Network serves headers read-only; the stub instead
+	// derives each seeded height's root from its leaves. Stamping here — the
+	// single choke point every header consumer passes through, including the
+	// single-threaded pre-fan-out defer/flush checks and both concurrent
+	// fan-out readers — and returning a copy keeps the s.headers mutation
+	// entirely under s.mu, so the lock-free header serialization in
+	// buildRelevantTx never races a concurrent stamp.
+	s.stampMerkleRootLocked(height)
+	hdr := *s.headers[height]
+	return &hdr
+}
+
+// leavesAtHeight returns the distinct txids the stub serves at the given
+// height, sorted for determinism. Callers must hold s.mu.
+func (s *stubNetwork) leavesAtHeight(height int32) ([]chainhash.Hash, error) {
+	seen := map[string]struct{}{}
+	var leaves []chainhash.Hash
+	for _, entries := range s.history {
+		for _, e := range entries {
+			if e.Height != height {
+				continue
+			}
+			if _, ok := seen[e.TxHash]; ok {
+				continue
+			}
+			seen[e.TxHash] = struct{}{}
+			h, err := chainhash.NewHashFromStr(e.TxHash)
+			if err != nil {
+				return nil, err
+			}
+			leaves = append(leaves, *h)
+		}
+	}
+	sort.Slice(leaves, func(i, j int) bool {
+		return leaves[i].String() < leaves[j].String()
+	})
+	return leaves, nil
+}
+
+// stampMerkleRootLocked fixes the header at height to the merkle root of the
+// tree over that height's leaves, so a GetMerkle proof folds to it. It is a
+// no-op for a height with no seeded leaves, preserving any root a test set
+// directly. Callers must hold s.mu.
+func (s *stubNetwork) stampMerkleRootLocked(height int32) {
+	if height < 0 || int(height) >= len(s.headers) {
+		return
+	}
+	leaves, err := s.leavesAtHeight(height)
+	if err != nil || len(leaves) == 0 {
+		return
+	}
+	root, _, _, err := stubMerkle(leaves, leaves[0].String())
+	if err != nil {
+		return
+	}
+	s.headers[height].MerkleRoot = root
 }
 
 func (s *stubNetwork) HeaderByHash(h *chainhash.Hash) (int32, *wire.BlockHeader, bool) {
@@ -190,6 +251,78 @@ func (s *stubNetwork) GetHistory(_ context.Context, sh string) ([]electrum.Histo
 
 func (s *stubNetwork) ListUnspent(_ context.Context, _ string) ([]electrum.UnspentEntry, error) {
 	return nil, nil
+}
+
+// GetMerkle returns a genuine inclusion proof against a real merkle tree the
+// stub builds from every txid it serves at the height — so distinct txids in
+// one block fold, via distinct branches, to a single shared root. It is a pure
+// reader: the header's merkle root is stamped by HeaderByHeight (which every
+// verifyInclusion call goes through first), so GetMerkle never mutates a header
+// and cannot race the concurrent header serialization in buildRelevantTx. Tests
+// exercising a LYING server override stub behavior instead.
+func (s *stubNetwork) GetMerkle(_ context.Context, txid string, height int32) (*electrum.MerkleProof, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.lyingMerkle {
+		// Empty branch: the fold yields the txid, deliberately NOT the
+		// header root, modeling a server that cannot prove inclusion.
+		return &electrum.MerkleProof{BlockHeight: height, Pos: 0}, nil
+	}
+	if height < 0 || int(height) >= len(s.headers) {
+		return nil, fmt.Errorf("stub: no header at %d", height)
+	}
+	leaves, err := s.leavesAtHeight(height)
+	if err != nil {
+		return nil, err
+	}
+	_, branch, pos, err := stubMerkle(leaves, txid)
+	if err != nil {
+		return nil, err
+	}
+	sib := make([]string, len(branch))
+	for i, b := range branch {
+		sib[i] = b.String()
+	}
+	return &electrum.MerkleProof{BlockHeight: height, Merkle: sib, Pos: pos}, nil
+}
+
+// stubMerkle builds a bitcoin-style merkle tree over leaves and returns the
+// root plus the inclusion branch and position for target.
+func stubMerkle(leaves []chainhash.Hash, target string) (chainhash.Hash, []chainhash.Hash, uint32, error) {
+	tgt, err := chainhash.NewHashFromStr(target)
+	if err != nil {
+		return chainhash.Hash{}, nil, 0, err
+	}
+	pos := -1
+	for i, l := range leaves {
+		if l == *tgt {
+			pos = i
+			break
+		}
+	}
+	if pos < 0 {
+		return chainhash.Hash{}, nil, 0, fmt.Errorf("stub: %s not among height leaves", target)
+	}
+	level := append([]chainhash.Hash(nil), leaves...)
+	var branch []chainhash.Hash
+	idx := pos
+	for len(level) > 1 {
+		if len(level)%2 == 1 {
+			level = append(level, level[len(level)-1])
+		}
+		sibIdx := idx ^ 1
+		branch = append(branch, level[sibIdx])
+		var next []chainhash.Hash
+		for i := 0; i < len(level); i += 2 {
+			var cat [64]byte
+			copy(cat[:32], level[i][:])
+			copy(cat[32:], level[i+1][:])
+			next = append(next, chainhash.DoubleHashH(cat[:]))
+		}
+		level = next
+		idx /= 2
+	}
+	return level[0], branch, uint32(pos), nil
 }
 
 func (s *stubNetwork) GetRawTransaction(_ context.Context, txid string) (string, error) {
@@ -1171,7 +1304,7 @@ func TestElectrumFilterBlocks(t *testing.T) {
 	stub.history[sh] = []electrum.HistoryEntry{{Height: 3, TxHash: txid}}
 	stub.rawTxs[txid] = rawHex
 
-	scopedIdx := waddrmgr.ScopedIndex{Scope: waddrmgr.KeyScopeBIP0084}
+	scopedIdx := waddrmgr.ScopedIndex{Scope: waddrmgr.KeyScope{Purpose: 84, Coin: 0}}
 	req := &FilterBlocksRequest{
 		ExternalAddrs: map[waddrmgr.ScopedIndex]btcutil.Address{scopedIdx: addr},
 	}
@@ -1341,7 +1474,7 @@ func TestElectrumFilterBlocksSameBlockParentChild(t *testing.T) {
 		{Height: 3, TxHash: parentTxid},
 	}
 
-	scopedIdx := waddrmgr.ScopedIndex{Scope: waddrmgr.KeyScopeBIP0084}
+	scopedIdx := waddrmgr.ScopedIndex{Scope: waddrmgr.KeyScope{Purpose: 84, Coin: 0}}
 	req := &FilterBlocksRequest{
 		ExternalAddrs: map[waddrmgr.ScopedIndex]btcutil.Address{scopedIdx: addr},
 	}
@@ -1427,4 +1560,93 @@ func synthTxWithScript(t *testing.T, pkScript []byte) (txid, rawHex string) {
 		t.Fatalf("Serialize: %v", err)
 	}
 	return tx.TxHash().String(), hex.EncodeToString(buf.Bytes())
+}
+
+// TestVerifyInclusionRejectsFabrication covers rotation plan R7: a proof that
+// does not fold to the validated local header's merkle root is refused, so a
+// server cannot inject a confirmed transaction that was never mined.
+func TestVerifyInclusionRejectsFabrication(t *testing.T) {
+	stub := newStubNetwork()
+	// Two real headers; height 1 carries a known merkle root.
+	genesis := &wire.BlockHeader{}
+	realRoot := chainhash.DoubleHashH([]byte("real-block"))
+	blk1 := &wire.BlockHeader{PrevBlock: genesis.BlockHash(), MerkleRoot: realRoot}
+	stub.headers = []*wire.BlockHeader{genesis, blk1}
+	stub.hashIdx = map[chainhash.Hash]int32{
+		genesis.BlockHash(): 0, blk1.BlockHash(): 1,
+	}
+
+	stub.synced = true
+	c, err := NewElectrumClient(testParams(), stub)
+	if err != nil {
+		t.Fatalf("NewElectrumClient: %v", err)
+	}
+	if err := c.Start(); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	t.Cleanup(c.Stop)
+
+	// A tx whose (empty-branch) proof folds to txid != realRoot must be
+	// refused. lyingMerkle returns an empty branch for any txid, so the
+	// fold yields the txid, which cannot equal realRoot.
+	stub.lyingMerkle = true
+	fake := chainhash.DoubleHashH([]byte("never-mined")).String()
+	if err := c.verifyInclusion(fake, 1); err == nil {
+		t.Fatal("fabricated transaction accepted")
+	}
+
+	// The honest single-tx case: set the header root to the txid so the
+	// empty-branch proof folds cleanly.
+	honest := chainhash.DoubleHashH([]byte("mined")).String()
+	h, _ := chainhash.NewHashFromStr(honest)
+	blk1.MerkleRoot = *h
+	if err := c.verifyInclusion(honest, 1); err != nil {
+		t.Fatalf("honest inclusion rejected: %v", err)
+	}
+}
+
+// TestBuildRelevantTxBindsTxid covers SEC-1: a server that returns raw bytes
+// whose hash differs from the requested (merkle-proven) txid is refused, so
+// the merkle authentication cannot be bypassed at the fetch hop.
+func TestBuildRelevantTxBindsTxid(t *testing.T) {
+	stub := newStubNetwork()
+	stub.synced = true
+	c, err := NewElectrumClient(testParams(), stub)
+	if err != nil {
+		t.Fatalf("NewElectrumClient: %v", err)
+	}
+	if err := c.Start(); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	t.Cleanup(c.Stop)
+
+	// A real transaction the stub will serve.
+	realTx := wire.NewMsgTx(2)
+	realTx.AddTxIn(wire.NewTxIn(&wire.OutPoint{Index: 3}, nil, nil))
+	realTx.AddTxOut(wire.NewTxOut(1e8, []byte{0x51}))
+	var buf bytes.Buffer
+	if err := realTx.Serialize(&buf); err != nil {
+		t.Fatal(err)
+	}
+	realHex := hex.EncodeToString(buf.Bytes())
+
+	// The server answers get_raw for the WRONG txid with realTx's bytes.
+	wanted := chainhash.DoubleHashH([]byte("some-other-txid")).String()
+	stub.mu.Lock()
+	stub.rawTxs[wanted] = realHex
+	stub.mu.Unlock()
+
+	if _, err := c.buildRelevantTx(electrum.HistoryEntry{TxHash: wanted, Height: 1}); err == nil {
+		t.Fatal("accepted raw bytes whose hash differs from the requested txid")
+	}
+
+	// Sanity: the correct txid for those bytes is accepted.
+	stub.mu.Lock()
+	stub.rawTxs[realTx.TxHash().String()] = realHex
+	stub.mu.Unlock()
+	if _, err := c.buildRelevantTx(electrum.HistoryEntry{
+		TxHash: realTx.TxHash().String(), Height: 1,
+	}); err != nil {
+		t.Fatalf("rejected the correct bytes: %v", err)
+	}
 }

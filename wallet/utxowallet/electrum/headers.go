@@ -17,6 +17,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/bisoncraft/bosswallet/wallet/utxowallet/bisonwire"
 	"github.com/bisoncraft/bosswallet/wallet/utxowallet/netparams"
 	"github.com/btcsuite/btcd/blockchain"
 	"github.com/btcsuite/btcd/chaincfg/chainhash"
@@ -101,6 +102,14 @@ func NewHeaders(cfg *ChainConfig, dataDir string) (*Headers, error) {
 		filePath: filepath.Join(dir, headerFileName),
 		byHeight: make(map[int32]*wire.BlockHeader, 4096),
 		byHash:   make(map[chainhash.Hash]int32, 4096),
+	}
+	// A non-zero StartHeight skips the linkage check for its first header
+	// (there is no parent in the store), so its identity MUST be pinned by
+	// a checkpoint at exactly that height — otherwise a hostile server
+	// could seed an arbitrary chain.
+	if cfg.StartHeight > 0 && h.anchorCheckpointHash() == nil {
+		return nil, fmt.Errorf("electrum: StartHeight %d has no checkpoint anchor",
+			cfg.StartHeight)
 	}
 	h.tip.Store(cfg.StartHeight - 1) // pre-genesis if StartHeight == 0
 	if err := h.loadFromDisk(); err != nil {
@@ -216,7 +225,10 @@ func (h *Headers) AppendBatch(startHeight int32, raw []byte, tipHint int32) (int
 	}
 	for i, hdr := range headers {
 		height := startHeight + int32(i)
-		if hdr.PrevBlock != prevHash {
+		if h.anchoredStart(height) {
+			// First header of a checkpoint-anchored store: no parent
+			// to link against; validateCheckpoint below pins it.
+		} else if hdr.PrevBlock != prevHash {
 			return 0, fmt.Errorf("%w at %d: prev %s, want %s",
 				errHeaderDoesNotConnect, height, hdr.PrevBlock, prevHash)
 		}
@@ -278,7 +290,7 @@ func (h *Headers) AppendOne(hdr *wire.BlockHeader) (connected bool, disconnected
 	if err != nil {
 		return false, nil, err
 	}
-	if hdr.PrevBlock != prevHash {
+	if hdr.PrevBlock != prevHash && !h.anchoredStart(tip+1) {
 		log.Debugf("electrum: incoming header at %d does not connect (prev %s, want %s); rewinding %d",
 			tip+1, hdr.PrevBlock, prevHash, reorgRewindDepth)
 		disc, err := h.rewindLocked(reorgRewindDepth)
@@ -463,12 +475,23 @@ func (h *Headers) validateRetargetLocked(height int32, hdr *wire.BlockHeader,
 		return nil
 	}
 	prior := h.headerAt(height-1, inBatch, batchStart)
-	chunkStart := h.headerAt(height-retargetInterval, inBatch, batchStart)
+	// Bitcoin samples the retarget timespan from the first block OF the
+	// period (height-2016). Litecoin deliberately goes back one block
+	// further (height-2017, its 51%-attack fix), except at the first-ever
+	// retarget — a consensus difference that shows up as a slightly wrong
+	// computed target at every boundary if ignored.
+	chunkStartHeight := height - retargetInterval
+	if h.cfg.Chain == bisonwire.ChainLTC && height != retargetInterval {
+		chunkStartHeight--
+	}
+	chunkStart := h.headerAt(chunkStartHeight, inBatch, batchStart)
 	if prior == nil || chunkStart == nil {
 		// Can't validate without the prior chunk; soft-pass rather
-		// than reject. This only triggers when a batch is so deep
-		// that it predates loadFromDisk's range, which we don't
-		// support in practice.
+		// than reject. This triggers at the first boundary above a
+		// checkpoint-anchored StartHeight (LTC's sample block is one
+		// below the anchor) and for batches predating loadFromDisk's
+		// range; the anchor checkpoint and the tip PoW window still
+		// guard those.
 		return nil
 	}
 	want := computeNextWorkRequired(h.cfg.Params, prior, chunkStart)
@@ -549,14 +572,36 @@ func (h *Headers) checkPoW(hdr *wire.BlockHeader) error {
 	return nil
 }
 
-// prevHashAt returns the hash that a header at `height` must reference as
-// PrevBlock. For the very first header (at StartHeight) there is no local
-// parent to compare against — at StartHeight == 0 the parent is genesis and
-// PrevBlock is the zero hash; at a non-zero StartHeight checkpoint we'd need
-// a stored checkpoint hash to validate against, which we don't yet support,
-// so we accept what the server gave us.
+// anchorCheckpointHash returns the checkpoint hash pinning the header at
+// StartHeight, or nil when no checkpoint applies there. NewHeaders requires
+// an anchor checkpoint for any non-zero StartHeight, so nil means
+// StartHeight is 0 (regtest and no-checkpoint test configs), where genesis
+// linkage authenticates the chain instead.
+func (h *Headers) anchorCheckpointHash() *chainhash.Hash {
+	if h.cfg.Params == nil {
+		return nil
+	}
+	for _, cp := range h.cfg.Params.Checkpoints {
+		if cp.Height == h.cfg.StartHeight && cp.Hash != nil {
+			return cp.Hash
+		}
+	}
+	return nil
+}
+
+// anchoredStart reports whether height is a non-genesis sync anchor: the
+// first stored header, whose parent is deliberately absent. Linkage cannot be
+// checked there; the checkpoint at that height authenticates it instead
+// (enforced in NewHeaders).
+func (h *Headers) anchoredStart(height int32) bool {
+	return height == h.cfg.StartHeight && h.cfg.StartHeight > 0
+}
+
 func (h *Headers) prevHashAt(height int32) (chainhash.Hash, error) {
 	if height == h.cfg.StartHeight {
+		// Genesis when StartHeight is 0 (its PrevBlock really is the
+		// zero hash); for a non-zero anchor callers skip the linkage
+		// comparison via anchoredStart.
 		return chainhash.Hash{}, nil
 	}
 	prev := h.byHeight[height-1]
@@ -613,6 +658,29 @@ func (h *Headers) loadFromDisk() error {
 	if err != nil {
 		return err
 	}
+	// The file carries no record of which height its first entry belongs
+	// to — entries are indexed as StartHeight+i on every load. If the
+	// configured anchor moved since the file was written (the checkpoint
+	// lists are refreshed at each release), that re-indexing silently
+	// mislabels every stored header; with a newer anchor the relabeled tip
+	// typically overshoots the real chain, so the first sync request comes
+	// back empty and stale headers are served as current. Pin the file's
+	// identity the same way the append path does: the first stored header
+	// must hash to the anchor checkpoint. On mismatch (either bump
+	// direction), discard the file and start clean from the configured
+	// anchor; the normal first sync repopulates it.
+	if want := h.anchorCheckpointHash(); want != nil {
+		if got := h.headerHash(hdrs[0]); got != *want {
+			log.Warnf("electrum: stored %s header file does not match the anchor "+
+				"checkpoint at height %d (stored %s, want %s); the anchor has "+
+				"moved — discarding %d stale headers and resyncing",
+				h.cfg.Chain, h.cfg.StartHeight, got, want, count)
+			if err := os.Remove(h.filePath); err != nil {
+				return fmt.Errorf("electrum: remove stale header file: %w", err)
+			}
+			return nil
+		}
+	}
 	for i, hdr := range hdrs {
 		height := h.cfg.StartHeight + int32(i)
 		h.byHeight[height] = hdr
@@ -621,4 +689,19 @@ func (h *Headers) loadFromDisk() error {
 	h.tip.Store(h.cfg.StartHeight + count - 1)
 	log.Infof("electrum: loaded %d headers, tip at %d", count, h.tip.Load())
 	return nil
+}
+
+// workRange returns the cumulative proof-of-work of the stored headers over
+// [from, to], for comparison against a dissenting chain's claimed work.
+// Missing headers contribute nothing (the range is clamped to what exists).
+func (h *Headers) workRange(from, to int32) *big.Int {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	work := new(big.Int)
+	for height := from; height <= to; height++ {
+		if hdr := h.byHeight[height]; hdr != nil {
+			work.Add(work, blockchain.CalcWork(hdr.Bits))
+		}
+	}
+	return work
 }

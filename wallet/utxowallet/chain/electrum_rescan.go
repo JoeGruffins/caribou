@@ -7,9 +7,13 @@ package chain
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
 	"sort"
+	"strings"
+	"sync"
+	"time"
 
 	"github.com/bisoncraft/bosswallet/wallet/utxowallet/bisonwire"
 	"github.com/bisoncraft/bosswallet/wallet/utxowallet/electrum"
@@ -31,11 +35,186 @@ const rescanProgressInterval = 10_000
 // being watched is a no-op.
 func (c *ElectrumClient) NotifyReceived(addrs []btcutil.Address) error {
 	for _, addr := range addrs {
-		if err := c.subscribeAddress(addr); err != nil {
+		if err := c.subscribeAddress(addr, false); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+// Unwatch drops the scripthash subscriptions for the given addresses (see
+// chain.AddressWatcher). Unknown or never-subscribed addresses are skipped;
+// an address whose subscription is still in flight is left alone (a later
+// Unwatch gets it once the entry settles). A handleScripthashStatus run
+// concurrent with the removal re-checks entry identity before committing, so
+// dropping the entry mid-flight is safe.
+func (c *ElectrumClient) Unwatch(addrs []btcutil.Address) error {
+	if err := c.ctx.Err(); err != nil {
+		// Refuse rather than silently dropping cache entries whose
+		// server-side unsubscribes can no longer be delivered.
+		return fmt.Errorf("electrum: unwatch on stopped client: %w", err)
+	}
+	for _, addr := range addrs {
+		sh, err := addrScripthash(addr)
+		if err != nil {
+			return err
+		}
+		c.addrCacheMtx.Lock()
+		entry, ok := c.addrCache[sh]
+		if !ok || entry.ready != nil {
+			c.addrCacheMtx.Unlock()
+			continue
+		}
+		delete(c.addrCache, sh)
+		c.addrCacheMtx.Unlock()
+		c.net.UnsubscribeScripthash(c.ctx, sh)
+	}
+	log.Debugf("electrum: unwatched %d addresses, %d subscriptions remain",
+		len(addrs), c.SubscriptionCount())
+	return nil
+}
+
+// SubscriptionCount reports the number of scripthash subscriptions currently
+// held — the persistent watch-set gauge (docs/address-watching-plan.md
+// Phase 0).
+func (c *ElectrumClient) SubscriptionCount() int {
+	c.addrCacheMtx.Lock()
+	defer c.addrCacheMtx.Unlock()
+	return len(c.addrCache)
+}
+
+// sweepConcurrency bounds the concurrent get_history calls of a Sweep, for
+// the same reason as proberConcurrency in the wallet's recovery scan:
+// unbounded concurrency risks rate-limiting on public servers.
+const sweepConcurrency = 16
+
+// Sweep implements the chain.AddressWatcher metered safety net for cold
+// (unwatched) addresses. Each entry's history is fetched with bounded
+// concurrency and parked in the probe cache; an entry hits when any history
+// entry is above its own FromHeight or in the mempool (per-entry floors,
+// chain.SweepEntry). Hits are re-subscribed through the rescan-setup path
+// (mempool-only initial emission, reusing the parked reply), and their
+// confirmed entries above their floors are then emitted in ascending block
+// order through emitFilteredBlock — the per-address live path cannot order
+// cross-address chains, which corrupts wtxmgr's spend tracking (see
+// subscribeAddress).
+func (c *ElectrumClient) Sweep(entries []SweepEntry) (hits, failed []btcutil.Address, err error) {
+	if err := c.ctx.Err(); err != nil {
+		return nil, nil, fmt.Errorf("electrum: sweep on stopped client: %w", err)
+	}
+
+	type result struct {
+		entry SweepEntry
+		hist  []electrum.HistoryEntry
+		err   error
+	}
+	results := make([]result, len(entries))
+	sem := make(chan struct{}, sweepConcurrency)
+	var wg sync.WaitGroup
+	for i, entry := range entries {
+		wg.Add(1)
+		sem <- struct{}{}
+		go func(i int, entry SweepEntry) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			sh, err := addrScripthash(entry.Addr)
+			if err != nil {
+				results[i] = result{entry: entry, err: err}
+				return
+			}
+			hist, err := c.net.GetHistory(c.ctx, sh)
+			if err != nil {
+				results[i] = result{entry: entry, err: err}
+				return
+			}
+			c.probeMtx.Lock()
+			c.probeCache[sh] = &probeHistory{status: statusFromHistory(hist), hist: hist}
+			c.probeMtx.Unlock()
+			results[i] = result{entry: entry, hist: hist}
+		}(i, entry)
+	}
+	wg.Wait()
+
+	matches := make(map[int32][]electrum.HistoryEntry)
+	for _, r := range results {
+		if r.err != nil {
+			// A failed check is retried next sweep; don't fail the
+			// batch — but the caller must know this address was NOT
+			// verified, so its known-history floor doesn't advance
+			// past heights that were never examined.
+			log.Warnf("electrum: sweep %s: %v", r.entry.Addr, r.err)
+			failed = append(failed, r.entry.Addr)
+			continue
+		}
+		hit := false
+		for _, h := range r.hist {
+			if h.Height <= 0 || h.Height > r.entry.FromHeight {
+				hit = true
+				break
+			}
+		}
+		if !hit {
+			continue
+		}
+		hits = append(hits, r.entry.Addr)
+		// Re-promotion: subscribe through the rescan-setup path so the
+		// initial emission is mempool-only and the parked history
+		// becomes the diff baseline without a refetch.
+		if err := c.subscribeAddress(r.entry.Addr, true); err != nil {
+			return nil, nil, err
+		}
+		// The emission set derives from the baseline the subscribe pass
+		// COMMITTED, not from the worker's earlier fetch: the two diverge
+		// whenever the server's state moved between the fetch and the
+		// subscribe (the parked reply's status no longer matches and the
+		// prime refetches) — a mempool entry confirming mid-sweep, for
+		// example, lands only in the committed baseline. Any entry
+		// committed as seen but never emitted is suppressed by the diff
+		// path forever; deriving emission from the committed set makes the
+		// two identical by construction.
+		sh, err := addrScripthash(r.entry.Addr)
+		if err != nil {
+			return nil, nil, err
+		}
+		for _, h := range c.committedHistory(sh) {
+			if h.Height > r.entry.FromHeight {
+				matches[h.Height] = append(matches[h.Height], h)
+			}
+		}
+	}
+
+	// Ingest the new confirmed history in ascending block order.
+	heights := make([]int32, 0, len(matches))
+	for h := range matches {
+		heights = append(heights, h)
+	}
+	sort.Slice(heights, func(i, j int) bool { return heights[i] < heights[j] })
+	for _, height := range heights {
+		hdr := c.net.HeaderByHeight(height)
+		if hdr == nil {
+			// Do NOT skip: the subscribe pass above already committed
+			// these entries to the diff baseline, so a dropped emission
+			// here would never be retried by the status path. Failing
+			// the sweep leaves the cold floors unadvanced and the next
+			// interval re-delivers (ingestion is idempotent).
+			return nil, nil, fmt.Errorf("electrum: sweep missing header at %d", height)
+		}
+		block := wtxmgr.BlockMeta{
+			Block: wtxmgr.Block{Hash: c.chainParams.HeaderHash(hdr), Height: height},
+			Time:  hdr.Timestamp,
+		}
+		if err := c.emitFilteredBlock(c.ctx, block, matches[height]); err != nil {
+			return nil, nil, err
+		}
+	}
+
+	c.clearProbeCache()
+	if len(hits) > 0 {
+		log.Infof("electrum: sweep re-promoted %d of %d cold addresses "+
+			"(%d subscriptions now held)", len(hits), len(entries),
+			c.SubscriptionCount())
+	}
+	return hits, failed, nil
 }
 
 // subscribeAddress computes the scripthash for addr, subscribes if not
@@ -53,10 +232,20 @@ func (c *ElectrumClient) NotifyReceived(addrs []btcutil.Address) error {
 // wallet layer would believe the address was subscribed when the server never
 // actually heard about it. Retries are bounded so a persistently failing
 // server eventually surfaces an error to the caller.
-func (c *ElectrumClient) subscribeAddress(addr btcutil.Address) error {
+//
+// rescanSetup marks a subscribe made from Rescan's setup pass. The initial
+// synthesized emission is then limited to mempool entries: confirmed history
+// belongs to the rescan walk, which ingests it in global block order. The
+// per-address emission path has no cross-address ordering — an address's
+// full history is emitted before the next address's — so emitting confirmed
+// entries here can insert a spending tx into wtxmgr before the tx that funded
+// the spent output. wtxmgr never retroactively marks a credit spent when the
+// spender was inserted first, so that order leaves a stale "unspent" credit
+// the wallet will later try to double-spend.
+func (c *ElectrumClient) subscribeAddress(addr btcutil.Address, rescanSetup bool) error {
 	const maxAttempts = 3
 	for range maxAttempts {
-		retry, err := c.trySubscribeAddress(addr)
+		retry, err := c.trySubscribeAddress(addr, rescanSetup)
 		if err != nil {
 			return err
 		}
@@ -70,7 +259,7 @@ func (c *ElectrumClient) subscribeAddress(addr btcutil.Address) error {
 // trySubscribeAddress performs a single subscribe attempt. It returns
 // (retry=true, nil) when the caller observed an in-flight subscribe that
 // failed and bailed; the outer loop should re-enter.
-func (c *ElectrumClient) trySubscribeAddress(addr btcutil.Address) (retry bool, err error) {
+func (c *ElectrumClient) trySubscribeAddress(addr btcutil.Address, rescanSetup bool) (retry bool, err error) {
 	sh, err := addrScripthash(addr)
 	if err != nil {
 		return false, err
@@ -126,36 +315,154 @@ func (c *ElectrumClient) trySubscribeAddress(addr btcutil.Address) (retry bool, 
 	// this, transactions already pending (or confirmed) at subscribe time
 	// would only surface after the server's next status change — pending
 	// mempool txs in particular would stay invisible until they confirm.
-	// Synthesize an initial status notification so the existing
-	// diff-and-emit path runs once. If the server reported no activity
-	// (empty status) there's nothing to do.
+	// If the server reported no activity (empty status) there's nothing to
+	// do. During Rescan setup, only mempool entries are emitted and the
+	// full history is committed as the diff baseline (see subscribeAddress);
+	// otherwise, synthesize an initial status notification so the existing
+	// diff-and-emit path runs once.
 	if status.Status != "" {
-		if err := c.handleScripthashStatus(status); err != nil {
+		if rescanSetup {
+			if err := c.primeScripthashForRescan(sh, status.Status); err != nil {
+				log.Debugf("electrum: prime scripthash %s: %v", sh, err)
+			}
+		} else if err := c.handleScripthashStatus(status); err != nil {
 			log.Debugf("electrum: prime scripthash %s: %v", sh, err)
 		}
 	}
 	return false, nil
 }
 
-// ProbeAddress reports whether addr has any confirmed or mempool history, via a
-// one-shot blockchain.scripthash.get_history with no subscription. It is the
+// primeScripthashForRescan establishes the subscription diff baseline for a
+// scripthash subscribed during Rescan setup. It fetches the full history
+// (reusing a discovery probe's parked reply when the status still matches),
+// emits only the mempool entries, and commits the full history as
+// lastStatus/lastHistory. Confirmed entries are deliberately NOT emitted here:
+// the rescan walk that follows ingests them in global block order (bounded
+// below by the rescan start height), which per-address emission cannot
+// guarantee — see subscribeAddress. Marking them seen keeps the live diff
+// path from re-emitting them later; a mempool entry whose emission fails
+// self-heals at confirmation, when its height change makes it a new entry.
+func (c *ElectrumClient) primeScripthashForRescan(sh, status string) error {
+	c.addrCacheMtx.Lock()
+	entry, ok := c.addrCache[sh]
+	c.addrCacheMtx.Unlock()
+	if !ok {
+		return nil
+	}
+
+	entry.proc.Lock()
+	defer entry.proc.Unlock()
+
+	c.addrCacheMtx.Lock()
+	if entry.lastStatus == status {
+		c.addrCacheMtx.Unlock()
+		return nil
+	}
+	c.addrCacheMtx.Unlock()
+
+	hist, ok := c.probedHistory(sh, status)
+	if ok {
+		log.Debugf("electrum: rescan prime using probed history for %s", sh)
+	} else {
+		var err error
+		hist, err = c.net.GetHistory(c.ctx, sh)
+		if err != nil {
+			return fmt.Errorf("get history: %w", err)
+		}
+	}
+
+	var mempool []electrum.HistoryEntry
+	for _, h := range hist {
+		if h.Height <= 0 {
+			mempool = append(mempool, h)
+		}
+	}
+	c.emitRelevantTxs(mempool)
+
+	c.addrCacheMtx.Lock()
+	if e, ok := c.addrCache[sh]; ok && e == entry {
+		entry.lastStatus = status
+		entry.lastHistory = hist
+	}
+	c.addrCacheMtx.Unlock()
+	return nil
+}
+
+// probeHistory is a get_history reply parked by ProbeAddress, tagged with the
+// electrum scripthash status derived from it so later consumers can verify the
+// server state hasn't changed since the probe.
+type probeHistory struct {
+	status string
+	hist   []electrum.HistoryEntry
+}
+
+// statusFromHistory derives the electrum scripthash status for a get_history
+// reply: the hex-encoded sha256 of the concatenated "tx_hash:height:" entries
+// in server order (protocol 1.4, blockchain.scripthash.subscribe). An empty
+// history has an empty status, matching the server's null.
+func statusFromHistory(hist []electrum.HistoryEntry) string {
+	if len(hist) == 0 {
+		return ""
+	}
+	var b strings.Builder
+	for _, h := range hist {
+		fmt.Fprintf(&b, "%s:%d:", h.TxHash, h.Height)
+	}
+	sum := sha256.Sum256([]byte(b.String()))
+	return hex.EncodeToString(sum[:])
+}
+
+// ProbeAddress reports whether addr has any confirmed or mempool history —
+// and the lowest confirmed height in it — via a one-shot
+// blockchain.scripthash.get_history with no subscription. It is the
 // gap-limit recovery probe (see chain.AddressProber).
 //
-// TODO(recovery): prime the per-scripthash history cache here so the rescan
-// over a discovered address doesn't refetch it. Today fetchAndCacheHistory only
-// caches subscribed scripthashes, so the discovered-range addresses are fetched
-// twice (once here, once by the rescan). The redundant range is bounded by the
-// last used index, so this is a follow-up optimization, not a correctness gap.
-func (c *ElectrumClient) ProbeAddress(addr btcutil.Address) (bool, error) {
+// The reply is parked in probeCache — priming discovery→ingestion reuse is part
+// of the AddressProber contract, since the sweep that follows discovery
+// otherwise refetches every probed address (the subscribe-time status fetch and
+// collectHistories both call get_history). Empty replies are parked too: they
+// let the rescan skip the fetch for the gap-window addresses inside the pool.
+func (c *ElectrumClient) ProbeAddress(addr btcutil.Address) (bool, int32, error) {
 	sh, err := addrScripthash(addr)
 	if err != nil {
-		return false, err
+		return false, 0, err
 	}
 	hist, err := c.net.GetHistory(c.ctx, sh)
 	if err != nil {
-		return false, err
+		return false, 0, err
 	}
-	return len(hist) > 0, nil
+	c.probeMtx.Lock()
+	c.probeCache[sh] = &probeHistory{status: statusFromHistory(hist), hist: hist}
+	c.probeMtx.Unlock()
+	earliest := int32(0)
+	for _, h := range hist {
+		if h.Height > 0 && (earliest == 0 || h.Height < earliest) {
+			earliest = h.Height
+		}
+	}
+	return len(hist) > 0, earliest, nil
+}
+
+// probedHistory returns the history ProbeAddress parked for the scripthash iff
+// its derived status matches status — i.e. the server state is unchanged since
+// the probe. The second return distinguishes a hit with empty history from a
+// miss.
+func (c *ElectrumClient) probedHistory(sh, status string) ([]electrum.HistoryEntry, bool) {
+	c.probeMtx.Lock()
+	defer c.probeMtx.Unlock()
+	if p, ok := c.probeCache[sh]; ok && p.status == status {
+		return p.hist, true
+	}
+	return nil, false
+}
+
+// clearProbeCache drops all parked probe histories. Called once the rescan
+// setup following discovery has consumed them; anything left is stale-guarded
+// by the status check but no longer useful.
+func (c *ElectrumClient) clearProbeCache() {
+	c.probeMtx.Lock()
+	c.probeCache = make(map[string]*probeHistory)
+	c.probeMtx.Unlock()
 }
 
 // Rescan kicks off a chain rescan: walking from startHash to the current tip,
@@ -182,14 +489,39 @@ func (c *ElectrumClient) Rescan(startHash *chainhash.Hash,
 	// chain and never emit RescanFinished (tryDispatchRescanFinished has no
 	// header at tip -1). Callers must wait for IsCurrent first; surface a
 	// clear error rather than hanging if they don't.
-	if c.net.Tip() < 0 {
+	//
+	// The walk's tip is snapshotted HERE, before the history collection
+	// below, and that same value bounds both the collected baselines and
+	// the walk. Reading the tip again after collection races a mid-setup
+	// rewind: histories fetched against the higher tip would carry entries
+	// the lowered walk never visits, committed as seen but never emitted —
+	// suppressed for good. Entries above this snapshot are deferred to the
+	// pending set instead and flush once their headers connect.
+	walkTip := c.net.Tip()
+	if walkTip < 0 {
 		return fmt.Errorf("electrum: rescan before initial header sync")
 	}
+
+	// Resolve startHash to a height. If it's the zero hash, start from
+	// the very beginning (genesis). The height doubles as the confirmed-
+	// ingestion floor: entries below it are contractually pre-birthday and
+	// are neither walked by the rescan nor emitted by the notification path.
+	startHeight := int32(0)
+	if startHash != nil && (*startHash != chainhash.Hash{}) {
+		h, _, ok := c.net.HeaderByHash(startHash)
+		if !ok {
+			return fmt.Errorf("electrum: rescan start hash %s not in headers", startHash)
+		}
+		startHeight = h
+	}
+	c.rescanFloor.Store(startHeight)
 
 	// Subscribe to every address we plan to scan so we keep receiving
 	// updates after the rescan completes. Watched outpoints arrive on
 	// every FilterBlocksRequest, so we don't cache them here — the
-	// scripthash subscriptions are the durable state.
+	// scripthash subscriptions are the durable state. rescanSetup limits
+	// the initial emission to mempool entries; the walk below owns the
+	// confirmed history.
 	scripthashes := make([]string, 0, len(addrs)+len(outpoints))
 	for _, addr := range addrs {
 		sh, err := addrScripthash(addr)
@@ -197,7 +529,7 @@ func (c *ElectrumClient) Rescan(startHash *chainhash.Hash,
 			return err
 		}
 		scripthashes = append(scripthashes, sh)
-		if err := c.subscribeAddress(addr); err != nil {
+		if err := c.subscribeAddress(addr, true); err != nil {
 			return err
 		}
 	}
@@ -207,29 +539,30 @@ func (c *ElectrumClient) Rescan(startHash *chainhash.Hash,
 			return err
 		}
 		scripthashes = append(scripthashes, sh)
-		if err := c.subscribeAddress(addr); err != nil {
+		if err := c.subscribeAddress(addr, true); err != nil {
 			return err
 		}
-	}
-
-	// Resolve startHash to a height. If it's the zero hash, start from
-	// the very beginning (genesis).
-	startHeight := int32(0)
-	if startHash != nil && (*startHash != chainhash.Hash{}) {
-		h, _, ok := c.net.HeaderByHash(startHash)
-		if !ok {
-			return fmt.Errorf("electrum: rescan start hash %s not in headers", startHash)
-		}
-		startHeight = h
 	}
 
 	// Build a map of {height: []history entries} aggregated across all
 	// watched scripthashes. We do one GetHistory per scripthash up-front
 	// and bucket the results so the walk that follows is purely local.
-	matches, err := c.collectHistories(scripthashes, startHeight)
+	matches, err := c.collectHistories(scripthashes, startHeight, walkTip)
 	if err != nil {
 		return err
 	}
+
+	// The subscribe pass and collectHistories above were the consumers of any
+	// histories parked by discovery probes; drop them. (On the error paths
+	// above the cache is left in place — a retried sync re-probes, and stale
+	// leftovers are inert behind the status check.)
+	c.clearProbeCache()
+
+	// Watch-set gauge (docs/address-watching-plan.md Phase 0): electrumx
+	// enforces a per-session subscription cap, so growth here is the number
+	// to watch as a wallet ages.
+	log.Infof("electrum: rescan established %d scripthash subscriptions",
+		c.SubscriptionCount())
 
 	// Cancel any in-flight rescan and wait for its goroutine to exit
 	// before starting ours. This keeps the notification stream coherent.
@@ -251,7 +584,7 @@ func (c *ElectrumClient) Rescan(startHash *chainhash.Hash,
 	go func() {
 		defer c.wg.Done()
 		defer close(done)
-		c.runRescan(ctx, startHeight, matches)
+		c.runRescan(ctx, startHeight, walkTip, matches)
 	}()
 
 	return nil
@@ -270,10 +603,9 @@ func (c *ElectrumClient) Rescan(startHash *chainhash.Hash,
 // birthdays but unnecessarily expensive for imported / deep-birthday wallets.
 // catchUpHashes in chainntfns.go walks syncedTo forward on every
 // RescanProgress, so the wallet's progress is still recorded.
-func (c *ElectrumClient) runRescan(ctx context.Context, startHeight int32,
-	matches map[int32][]electrum.HistoryEntry) {
+func (c *ElectrumClient) runRescan(ctx context.Context, startHeight, tip int32,
+	matches map[int32][]shHistoryEntry) {
 
-	tip := c.net.Tip()
 	if tip < startHeight {
 		if ctx.Err() == nil {
 			c.tryDispatchRescanFinished(tip)
@@ -285,9 +617,44 @@ func (c *ElectrumClient) runRescan(ctx context.Context, startHeight int32,
 		if ctx.Err() != nil {
 			return
 		}
+		// A mid-rescan rewind (a non-linking headers.subscribe
+		// notification) drops up to reorgRewindDepth headers, and the store
+		// sits short until the server's next notification refills it — up
+		// to a block interval. Retry briefly, then finish the walk EARLY
+		// rather than abandoning it: the walk is the only dispatcher of
+		// RescanFinished and the goLive handoff, and returning without them
+		// gates live tip delivery closed forever (no BlockConnected is ever
+		// delivered again, and every queued rescan batch waits on a
+		// completion that never comes) while the failure reads as success
+		// to the rescan RPC. Finishing early is safe: the unwalked matches
+		// are deferred to their scripthashes' pending sets and flush as
+		// their headers connect, and goLive's catch-up delivers the
+		// remaining heights the moment the store heals.
 		hdr := c.net.HeaderByHeight(height)
+		for attempt := 0; hdr == nil && attempt < missingHeaderRetries; attempt++ {
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(missingHeaderRetryDelay):
+			}
+			hdr = c.net.HeaderByHeight(height)
+		}
 		if hdr == nil {
-			log.Errorf("electrum: rescan missing header at %d", height)
+			log.Warnf("electrum: rescan header at %d still missing after "+
+				"%d retries; finishing at %d and deferring %d heights",
+				height, missingHeaderRetries, height-1, tip-height+1)
+			c.deferMatchesFrom(matches, height)
+			// Same M4 guard as the normal completion below: a newer Rescan
+			// may have cancelled this walk during the retries or the
+			// deferral (deferMatchesFrom blocks on per-entry proc locks); a
+			// stale RescanFinished would rotate the wallet's batch state
+			// and set ChainSynced under the superseding walk. The deferral
+			// itself is safe to have run — the new walk's emissions
+			// duplicate idempotently.
+			if ctx.Err() != nil {
+				return
+			}
+			c.tryDispatchRescanFinished(height - 1)
 			return
 		}
 		if entries := matches[height]; len(entries) > 0 {
@@ -295,7 +662,7 @@ func (c *ElectrumClient) runRescan(ctx context.Context, startHeight int32,
 				Block: wtxmgr.Block{Hash: c.chainParams.HeaderHash(hdr), Height: height},
 				Time:  hdr.Timestamp,
 			}
-			if err := c.emitFilteredBlock(ctx, block, entries); err != nil {
+			if err := c.emitFilteredBlock(ctx, block, histEntries(entries)); err != nil {
 				return // shutdown or rescan cancelled
 			}
 		}
@@ -318,12 +685,78 @@ func (c *ElectrumClient) runRescan(ctx context.Context, startHeight int32,
 	c.tryDispatchRescanFinished(tip)
 }
 
+// missingHeaderRetries and missingHeaderRetryDelay bound runRescan's wait for
+// a header dropped by a mid-rescan rewind. The store usually refills on the
+// server's next notification; a short wait avoids churning the pending set
+// for sub-second gaps, while the early-finish path (safe, self-healing)
+// handles anything longer.
+const (
+	missingHeaderRetries    = 20
+	missingHeaderRetryDelay = 250 * time.Millisecond
+)
+
+// deferMatchesFrom parks every match at or above cutoff in its scripthash's
+// pending set, where the tip-change flush re-emits it once its header is
+// local. Entries already committed to the diff baseline would otherwise be
+// suppressed forever if dropped unemitted.
+func (c *ElectrumClient) deferMatchesFrom(matches map[int32][]shHistoryEntry, cutoff int32) {
+	bySh := make(map[string][]electrum.HistoryEntry)
+	for height, entries := range matches {
+		if height < cutoff {
+			continue
+		}
+		for _, e := range entries {
+			bySh[e.sh] = append(bySh[e.sh], e.HistoryEntry)
+		}
+	}
+	for sh, entries := range bySh {
+		// Ascending heights: the flush emits pending in slice order, and
+		// while the store tolerates child-before-parent arrivals (the
+		// deferred-debit scan), delivering funding before spends keeps
+		// that path the backstop rather than the norm.
+		sort.Slice(entries, func(i, j int) bool {
+			return entries[i].Height < entries[j].Height
+		})
+		c.addrCacheMtx.Lock()
+		entry := c.addrCache[sh]
+		c.addrCacheMtx.Unlock()
+		if entry == nil {
+			continue
+		}
+		entry.proc.Lock()
+		c.addrCacheMtx.Lock()
+		entry.pending = mergePendingEntries(entry.pending, entries)
+		c.addrCacheMtx.Unlock()
+		entry.proc.Unlock()
+	}
+}
+
+// histEntries strips the scripthash tags for emission.
+func histEntries(entries []shHistoryEntry) []electrum.HistoryEntry {
+	out := make([]electrum.HistoryEntry, len(entries))
+	for i, e := range entries {
+		out[i] = e.HistoryEntry
+	}
+	return out
+}
+
 // tryDispatchRescanFinished enqueues a RescanFinished notification, logging
 // (but not propagating) any error so the caller doesn't have to.
 func (c *ElectrumClient) tryDispatchRescanFinished(tip int32) {
 	hdr := c.net.HeaderByHeight(tip)
+	// The requested tip can be gone after a mid-rescan rewind. The store's
+	// current tip always has a header, but Tip() and HeaderByHeight() are
+	// separate reads, so another rewind can land between them; retry the
+	// pair rather than skipping the terminal protocol — RescanFinished plus
+	// the goLive handoff below is the only opener of live tip delivery, and
+	// skipping it wedges the client until restart. Rewinds arrive at most
+	// once per server notification, so consecutive losses exhaust fast.
+	for tries := 0; hdr == nil && tries < 5; tries++ {
+		tip = c.net.Tip()
+		hdr = c.net.HeaderByHeight(tip)
+	}
 	if hdr == nil {
-		log.Warnf("electrum: rescan finished but no header at %d", tip)
+		log.Errorf("electrum: rescan finished but no header at store tip %d", tip)
 		return
 	}
 	h := c.chainParams.HeaderHash(hdr)
@@ -343,20 +776,34 @@ func (c *ElectrumClient) tryDispatchRescanFinished(tip int32) {
 	c.goLive(tip)
 }
 
+// shHistoryEntry is a history entry tagged with its scripthash, so a walk
+// that cannot emit an entry can defer it to the right entry's pending set.
+type shHistoryEntry struct {
+	sh string
+	electrum.HistoryEntry
+}
+
 // collectHistories fetches the history for every scripthash and groups the
-// entries by block height. Entries below startHeight are discarded.
-func (c *ElectrumClient) collectHistories(scripthashes []string, startHeight int32) (map[int32][]electrum.HistoryEntry, error) {
-	out := make(map[int32][]electrum.HistoryEntry)
+// entries by block height. Entries below startHeight are discarded; entries
+// above walkTip — confirmed after the walk's tip snapshot, or reported by a
+// server ahead of the local store — are deferred to the entry's pending set
+// (inside fetchAndCacheHistory) rather than collected: the walk never visits
+// their heights, and an entry committed to the diff baseline but never
+// emitted is suppressed forever.
+func (c *ElectrumClient) collectHistories(scripthashes []string,
+	startHeight, walkTip int32) (map[int32][]shHistoryEntry, error) {
+
+	out := make(map[int32][]shHistoryEntry)
 	for _, sh := range scripthashes {
 		// fetchAndCacheHistory caches the history (under the entry's proc
 		// lock) so the live notification path can diff against it without a
 		// lost-update race.
-		hist, err := c.fetchAndCacheHistory(sh)
+		hist, err := c.fetchAndCacheHistory(sh, walkTip)
 		if err != nil {
 			return nil, fmt.Errorf("electrum: get history for %s: %w", sh, err)
 		}
 		for _, h := range hist {
-			if h.Height < startHeight {
+			if h.Height < startHeight || h.Height > walkTip {
 				continue
 			}
 			// Mempool entries (height == 0) are not part of the
@@ -365,7 +812,7 @@ func (c *ElectrumClient) collectHistories(scripthashes []string, startHeight int
 			if h.Height <= 0 {
 				continue
 			}
-			out[h.Height] = append(out[h.Height], h)
+			out[h.Height] = append(out[h.Height], shHistoryEntry{sh: sh, HistoryEntry: h})
 		}
 	}
 	return out, nil
@@ -420,7 +867,7 @@ func (c *ElectrumClient) fetchRawTx(ctx context.Context, txid string) ([]byte, e
 // records. ctx allows the rescan to be cancelled mid-block.
 func (c *ElectrumClient) emitFilteredBlock(ctx context.Context, block wtxmgr.BlockMeta, entries []electrum.HistoryEntry) error {
 	uniq := dedupHistoryByTxid(entries)
-	// Sort by txid for determinism.
+	// Sort by txid for determinism; dependency order is restored below.
 	sort.Slice(uniq, func(i, j int) bool { return uniq[i].TxHash < uniq[j].TxHash })
 
 	ntfn := FilteredBlockConnected{Block: &block}
@@ -431,9 +878,18 @@ func (c *ElectrumClient) emitFilteredBlock(ctx context.Context, block wtxmgr.Blo
 		if err := ctx.Err(); err != nil {
 			return err
 		}
+		if err := c.verifyInclusion(e.TxHash, block.Height); err != nil {
+			log.Errorf("electrum: refusing tx %s at %d: %v", e.TxHash,
+				block.Height, err)
+			continue
+		}
 		raw, err := c.fetchRawTx(ctx, e.TxHash)
 		if err != nil {
 			log.Warnf("electrum: rescan fetch %s: %v", e.TxHash, err)
+			continue
+		}
+		if len(raw) == 64 {
+			log.Errorf("electrum: refusing 64-byte tx %s", e.TxHash)
 			continue
 		}
 		rec, err := wtxmgr.NewTxRecord(string(c.chain), raw, block.Time)
@@ -441,9 +897,49 @@ func (c *ElectrumClient) emitFilteredBlock(ctx context.Context, block wtxmgr.Blo
 			log.Warnf("electrum: tx record %s: %v", e.TxHash, err)
 			continue
 		}
+		// Bind fetched bytes to the merkle-proven txid (see buildRelevantTx).
+		if rec.Hash.String() != e.TxHash {
+			log.Errorf("electrum: server returned tx %s for requested %s",
+				rec.Hash, e.TxHash)
+			continue
+		}
 		ntfn.RelevantTxs = append(ntfn.RelevantTxs, rec)
 	}
+	// Parent before child within the block: the wallet ingests RelevantTxs in
+	// order, and wtxmgr never retroactively marks a credit spent when the
+	// spender was inserted first — a child-first order would leave a stale
+	// unspent credit (same invariant as FilterBlocks' orderTxsByDependency).
+	ntfn.RelevantTxs = orderRecsByDependency(ntfn.RelevantTxs)
 	return c.enqueueCtx(ctx, ntfn)
+}
+
+// orderRecsByDependency topologically orders tx records so that any record
+// spending another's output comes after it. The record analogue of
+// orderTxsByDependency.
+func orderRecsByDependency(recs []*wtxmgr.TxRecord) []*wtxmgr.TxRecord {
+	idxByHash := make(map[chainhash.Hash]int, len(recs))
+	for i, rec := range recs {
+		idxByHash[rec.Hash] = i
+	}
+	visited := make([]bool, len(recs))
+	order := make([]*wtxmgr.TxRecord, 0, len(recs))
+	var visit func(i int)
+	visit = func(i int) {
+		if visited[i] {
+			return
+		}
+		visited[i] = true
+		for _, in := range recs[i].Tx.TxIn {
+			if p, ok := idxByHash[in.PreviousOutPoint.Hash]; ok {
+				visit(p)
+			}
+		}
+		order = append(order, recs[i])
+	}
+	for i := range recs {
+		visit(i)
+	}
+	return order
 }
 
 // enqueue pushes a notification onto the queue, blocking only on shutdown.
@@ -660,6 +1156,20 @@ func (c *ElectrumClient) FilterBlocks(req *FilterBlocksRequest) (*FilterBlocksRe
 	return nil, nil
 }
 
+// committedHistory returns a snapshot of the scripthash's committed diff
+// baseline (the entry's lastHistory), or nil when the scripthash isn't
+// subscribed. Everything in it is treated as already seen by the live diff
+// path, so a consumer that owes emissions must emit from exactly this set.
+func (c *ElectrumClient) committedHistory(sh string) []electrum.HistoryEntry {
+	c.addrCacheMtx.Lock()
+	defer c.addrCacheMtx.Unlock()
+	entry, ok := c.addrCache[sh]
+	if !ok {
+		return nil
+	}
+	return append([]electrum.HistoryEntry(nil), entry.lastHistory...)
+}
+
 // fetchHistory returns a scripthash's history, using the per-address cache
 // when available to avoid redundant network round-trips.
 func (c *ElectrumClient) fetchHistory(scripthash string) ([]electrum.HistoryEntry, error) {
@@ -670,7 +1180,7 @@ func (c *ElectrumClient) fetchHistory(scripthash string) ([]electrum.HistoryEntr
 		return hist, nil
 	}
 	c.addrCacheMtx.Unlock()
-	return c.fetchAndCacheHistory(scripthash)
+	return c.fetchAndCacheHistory(scripthash, 0)
 }
 
 // fetchAndCacheHistory fetches a scripthash's history and stores it as the
@@ -680,7 +1190,12 @@ func (c *ElectrumClient) fetchHistory(scripthash string) ([]electrum.HistoryEntr
 // rescan/FilterBlocks fetch can't clobber a concurrent handleScripthashStatus
 // result and cause a later duplicate emission. If the scripthash isn't cached,
 // it just fetches.
-func (c *ElectrumClient) fetchAndCacheHistory(scripthash string) ([]electrum.HistoryEntry, error) {
+//
+// For a subscribed scripthash, a history parked by a discovery probe is reused
+// instead of refetching when its derived status matches the entry's last
+// processed status — the subscription guarantees lastStatus tracks the server,
+// so a match means the probe's reply is still current.
+func (c *ElectrumClient) fetchAndCacheHistory(scripthash string, maxHeight int32) ([]electrum.HistoryEntry, error) {
 	c.addrCacheMtx.Lock()
 	entry := c.addrCache[scripthash]
 	c.addrCacheMtx.Unlock()
@@ -689,13 +1204,50 @@ func (c *ElectrumClient) fetchAndCacheHistory(scripthash string) ([]electrum.His
 		entry.proc.Lock()
 		defer entry.proc.Unlock()
 	}
-	hist, err := c.net.GetHistory(c.ctx, scripthash)
-	if err != nil {
-		return nil, err
-	}
+	var hist []electrum.HistoryEntry
+	ok := false
 	if entry != nil {
 		c.addrCacheMtx.Lock()
-		entry.lastHistory = hist
+		lastStatus := entry.lastStatus
+		c.addrCacheMtx.Unlock()
+		hist, ok = c.probedHistory(scripthash, lastStatus)
+	}
+	if ok {
+		log.Debugf("electrum: history fetch using probed history for %s", scripthash)
+	} else {
+		var err error
+		hist, err = c.net.GetHistory(c.ctx, scripthash)
+		if err != nil {
+			return nil, err
+		}
+	}
+	if entry != nil {
+		// Entries confirmed above maxHeight (the rescan walk's tip
+		// snapshot; 0 disables the bound) are deferred to the pending set
+		// instead of committed to the diff baseline: the walk never visits
+		// their heights, and a baseline entry that was never emitted is
+		// suppressed forever. The tip-change flush emits them once their
+		// headers connect. New slices — hist may alias a parked probe
+		// reply.
+		commit := hist
+		if maxHeight > 0 {
+			var deferred []electrum.HistoryEntry
+			commit = make([]electrum.HistoryEntry, 0, len(hist))
+			for _, h := range hist {
+				if h.Height > maxHeight {
+					deferred = append(deferred, h)
+					continue
+				}
+				commit = append(commit, h)
+			}
+			if len(deferred) > 0 {
+				c.addrCacheMtx.Lock()
+				entry.pending = mergePendingEntries(entry.pending, deferred)
+				c.addrCacheMtx.Unlock()
+			}
+		}
+		c.addrCacheMtx.Lock()
+		entry.lastHistory = commit
 		c.addrCacheMtx.Unlock()
 	}
 	return hist, nil

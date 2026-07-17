@@ -72,6 +72,7 @@ type NeutrinoClient struct {
 // A compile-time check to ensure that RPCClient satisfies the chain.Backend
 // interface.
 var _ Backend = (*NeutrinoClient)(nil)
+var _ AddressWatcher = (*NeutrinoClient)(nil)
 
 // NewNeutrinoClient creates a new NeutrinoClient struct with a backing
 // ChainService.
@@ -558,6 +559,204 @@ func (s *NeutrinoClient) NotifyReceived(addrs []btcutil.Address) error {
 	s.rescan = newRescan
 	s.rescanErr = s.rescan.Start()
 	s.clientMtx.Unlock()
+	return nil
+}
+
+// Unwatch drops addresses from the cfilter watch list so an aged wallet stops
+// matching its cold addresses on every block (chain.AddressWatcher). When no
+// rescan is running there is nothing being watched, so it is a no-op; while
+// one runs, the removal is applied on the rescan goroutine and the ongoing
+// per-block match uses the reduced set.
+func (s *NeutrinoClient) Unwatch(addrs []btcutil.Address) error {
+	s.rescanMtx.Lock()
+	defer s.rescanMtx.Unlock()
+
+	s.clientMtx.Lock()
+	scanning := s.scanning
+	s.clientMtx.Unlock()
+	if !scanning {
+		return nil
+	}
+	return s.rescan.Update(spv.RemoveAddrs(addrs...))
+}
+
+// sweepBlockDelay throttles the cold-address sweep: a pause between blocks so
+// the background range rescan caps CPU and never spins the fan, unlike the
+// critical-path catch-up. A variable so tests can tighten it.
+var sweepBlockDelay = 2 * time.Millisecond
+
+// Sweep is the chain.AddressWatcher metered check for cold (unwatched)
+// addresses on neutrino: a bounded, THROTTLED cfilter rescan over
+// (min FromHeight, tip]. For each block it tests the block's compact filter
+// against the cold scripts and, on a match, fetches the block and emits the
+// transactions that pay to or spend from a cold address so the wallet
+// ingests them — an address's matches count only strictly above its own
+// entry's FromHeight (per-entry floors, chain.SweepEntry). Hits are re-added
+// to the watch list (re-promotion). The check is all-or-nothing: any error
+// fails the whole range (retried next interval, ingestion is idempotent), so
+// failed is always nil and errors flow through err.
+func (s *NeutrinoClient) Sweep(entries []SweepEntry) (hits, failed []btcutil.Address, err error) {
+	if len(entries) == 0 {
+		return nil, nil, nil
+	}
+	scripts := make([][]byte, 0, len(entries))
+	byScript := make(map[string]SweepEntry, len(entries))
+	byOutpoint := make(map[wire.OutPoint]SweepEntry)
+	// The walk covers every entry's range in one pass: it starts just above
+	// the lowest floor, exclusive — activity strictly above an entry's own
+	// floor, per chain.AddressWatcher and matching the electrum backend's
+	// h > FromHeight — so the caller's reorg-margin arithmetic holds
+	// exactly. Clamp to -1 so a floor of -1 (or below) scans from genesis.
+	minFrom := int32(-1)
+	for i, e := range entries {
+		script, err := txscript.PayToAddrScript(e.Addr)
+		if err != nil {
+			return nil, nil, err
+		}
+		scripts = append(scripts, script)
+		if e.FromHeight < -1 {
+			e.FromHeight = -1
+		}
+		byScript[string(script)] = e
+		for _, op := range e.OutPoints {
+			byOutpoint[op] = e
+		}
+		if i == 0 || e.FromHeight < minFrom {
+			minFrom = e.FromHeight
+		}
+	}
+
+	best, err := s.CS.BestBlock()
+	if err != nil {
+		return nil, nil, err
+	}
+	tip := best.Height
+
+	hitAddrs := make(map[string]btcutil.Address)
+	for height := minFrom + 1; height <= tip; height++ {
+		select {
+		case <-s.quit:
+			return nil, nil, errors.New("neutrino: sweep aborted")
+		default:
+		}
+		hash, err := s.CS.GetBlockHash(int64(height))
+		if err != nil {
+			return nil, nil, err
+		}
+		filter, err := s.CS.GetCFilter(*hash, wire.GCSFilterRegular)
+		if err != nil {
+			return nil, nil, err
+		}
+		if filter != nil {
+			key := builder.DeriveKey(hash)
+			matched, err := filter.MatchAny(key, scripts)
+			if err != nil {
+				return nil, nil, err
+			}
+			if matched {
+				if err := s.sweepMatchedBlock(height, hash, byScript,
+					byOutpoint, hitAddrs); err != nil {
+					return nil, nil, err
+				}
+			}
+		}
+		time.Sleep(sweepBlockDelay)
+	}
+
+	for _, a := range hitAddrs {
+		hits = append(hits, a)
+	}
+	if len(hits) > 0 {
+		// Re-promote: re-establish the watch on the hit addresses.
+		if err := s.NotifyReceived(hits); err != nil {
+			return nil, nil, err
+		}
+		log.Infof("neutrino: sweep re-promoted %d of %d cold addresses",
+			len(hits), len(entries))
+	}
+	return hits, nil, nil
+}
+
+// sweepMatchedBlock fetches a filter-matched block, emits the transactions
+// that pay to or spend from a cold address, and records the hit addresses. A
+// cfilter match is probabilistic, so the block is scanned to confirm the
+// actual matches. A script match counts for its entry only strictly above
+// the entry's own floor: the single walk starts at the set's minimum, and
+// matches at or below an entry's own FromHeight are that entry's
+// already-ingested history, not activity.
+func (s *NeutrinoClient) sweepMatchedBlock(height int32, hash *chainhash.Hash,
+	byScript map[string]SweepEntry, byOutpoint map[wire.OutPoint]SweepEntry,
+	hitAddrs map[string]btcutil.Address) error {
+
+	blk, err := s.CS.GetBlock(*hash)
+	if err != nil {
+		return err
+	}
+	var relevant []*bisonwire.Tx
+	for _, tx := range blk.Block.Transactions {
+		var matched bool
+		for _, out := range tx.TxOut {
+			if e, ok := byScript[string(out.PkScript)]; ok && height > e.FromHeight {
+				hitAddrs[e.Addr.String()] = e.Addr
+				matched = true
+			}
+		}
+		// A spend of a cold address's UTXO also matches the block filter:
+		// BIP-158 filters commit the prevout scripts of inputs. Without the
+		// input side, an externally-spent cold UTXO (the same seed loaded
+		// elsewhere) would be dropped here as a false positive and never
+		// re-examined once the sweep floor advances, leaving the credit
+		// unspent in the wallet forever. Known outpoints are matched
+		// exactly; the script reconstruction covers spends of UTXOs the
+		// wallet has not ingested, but only for the classes
+		// ComputePkScript understands — a taproot keyspend witness
+		// reconstructs to a WRONG script with a nil error, which is why
+		// the outpoint match exists and comes first.
+		for _, in := range tx.TxIn {
+			if e, ok := byOutpoint[in.PreviousOutPoint]; ok && height > e.FromHeight {
+				hitAddrs[e.Addr.String()] = e.Addr
+				matched = true
+				continue
+			}
+			pkScript, err := txscript.ComputePkScript(
+				in.SignatureScript, in.Witness,
+			)
+			if err != nil {
+				continue // e.g. a coinbase or non-standard input
+			}
+			if e, ok := byScript[string(pkScript.Script())]; ok && height > e.FromHeight {
+				hitAddrs[e.Addr.String()] = e.Addr
+				matched = true
+			}
+		}
+		if matched {
+			relevant = append(relevant, tx)
+		}
+	}
+	if len(relevant) == 0 {
+		return nil // false positive
+	}
+	header := blk.Block.Header
+	ntfn := FilteredBlockConnected{
+		Block: &wtxmgr.BlockMeta{
+			Block: wtxmgr.Block{Hash: *hash, Height: height},
+			Time:  header.Timestamp,
+		},
+	}
+	for _, tx := range relevant {
+		rec, err := wtxmgr.NewTxRecordFromMsgTx(s.chainParams.Chain, &tx.MsgTx,
+			header.Timestamp)
+		if err != nil {
+			log.Errorf("neutrino: sweep tx record: %v", err)
+			continue
+		}
+		ntfn.RelevantTxs = append(ntfn.RelevantTxs, rec)
+	}
+	select {
+	case s.enqueueNotification <- ntfn:
+	case <-s.quit:
+		return errors.New("neutrino: sweep aborted")
+	}
 	return nil
 }
 

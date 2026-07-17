@@ -128,6 +128,10 @@ type Wallet struct {
 	Manager *waddrmgr.Manager
 	TxStore *wtxmgr.Store
 
+	// watchPol tracks watched internal addresses for unwatch-at-finality;
+	// see watch_policy.go. The zero value is ready to use.
+	watchPol watchPolicy
+
 	chainClient        chain.Backend
 	chainClientLock    sync.Mutex
 	chainClientSynced  bool
@@ -191,17 +195,12 @@ func (w *Wallet) ScopeForPurpose(purpose uint32) waddrmgr.KeyScope {
 	return waddrmgr.KeyScope{Purpose: purpose, Coin: w.chainParams.HDCoinType}
 }
 
-// PrimaryScope returns the key scope for the wallet's primary (and, for
-// non-segwit chains, only) address type. The BIP-43 purpose comes from
-// netparams.ChainParams.AddrPurpose, defaulting to BIP-84 (native segwit) when
-// unset. Dash sets it to 44 (legacy P2PKH, no segwit). Address derivation,
-// sends, and gap-limit recovery all use this scope so they stay consistent.
+// PrimaryScope returns the key scope for the wallet's primary address type: the
+// zeroth entry of netparams.ChainParams.KeyPurposes at the chain's coin type
+// (84 for BTC/LTC, 44 for Dash). Address derivation, sends, and gap-limit
+// recovery all use this scope so they stay consistent.
 func (w *Wallet) PrimaryScope() waddrmgr.KeyScope {
-	purpose := w.chainParams.AddrPurpose
-	if purpose == 0 {
-		purpose = 84
-	}
-	return w.ScopeForPurpose(purpose)
+	return w.ScopeForPurpose(w.chainParams.KeyPurposes[0])
 }
 
 // Start starts the goroutines necessary to manage a wallet.
@@ -634,12 +633,19 @@ func (w *Wallet) syncWithChain(birthdayStamp *waddrmgr.BlockStamp) error {
 	// If the wallet requested an on-chain recovery of its funds, we'll do
 	// so now. Backends that can probe per-address history (electrum) discover
 	// used addresses by gap-limit scanning instead of walking blocks; the scan
-	// extends the address pool so the rescan below ingests the funds. A probe
-	// error is logged, not fatal — the rescan still syncs the known addresses.
+	// extends the address pool — on a fresh or restored wallet the rescan
+	// below ingests the funds, and on an aged wallet (whose rescan starts at
+	// SyncedTo, above the discovered history) the scan seeds the sweep tier
+	// to ingest them (see recoverViaScan). A probe error is fatal: it aborts
+	// syncWithChain so the caller's sync-retry loop reruns discovery. Swallowing
+	// it would let a seed restore report fully synced with an omitted balance
+	// when a transient get_history failure or a server rotation interrupts the
+	// probes; recoverViaScan is idempotent, so the retry is safe.
 	if w.recoveryWindow > 0 {
 		if prober, ok := chainClient.(chain.AddressProber); ok {
 			if err := w.recoverViaScan(prober, w.recoveryWindow); err != nil {
-				log.Errorf("Address-probe recovery failed: %v", err)
+				return fmt.Errorf("unable to perform address-probe "+
+					"recovery: %w", err)
 			}
 		} else if err := w.recovery(chainClient, birthdayStamp); err != nil {
 			return fmt.Errorf("unable to perform wallet recovery: "+
@@ -734,9 +740,25 @@ func (w *Wallet) syncWithChain(birthdayStamp *waddrmgr.BlockStamp) error {
 		addrs   []btcutil.Address
 		unspent []wtxmgr.Credit
 	)
+	// Watch policy: when the backend can unwatch, load only the hot
+	// addresses into the watch set — hot judged from the persisted
+	// last-active index against the on-disk SyncedTo (the header at last
+	// shutdown), so an aged wallet does not re-watch its whole accumulated
+	// address set on restart. Cold addresses drop to the metered sweep.
+	_, watchTiered := chainClient.(chain.AddressWatcher)
+
 	err = walletdb.Update(w.db, func(dbtx walletdb.ReadWriteTx) error {
 		addrs, unspent, err = w.activeData(dbtx)
-		return err
+		if err != nil {
+			return err
+		}
+		if watchTiered {
+			addrs, unspent, err = w.classifyWatchSet(dbtx, addrs, unspent)
+			if err != nil {
+				return err
+			}
+		}
+		return nil
 	})
 	if err != nil {
 		return err
@@ -783,8 +805,14 @@ func (w *Wallet) waitUntilBackendSynced(chainClient chain.Backend) error {
 func locateBirthdayBlock(chainClient chainConn,
 	birthday time.Time) (*waddrmgr.BlockStamp, error) {
 
-	// Retrieve the lookup range for our block.
+	// Retrieve the lookup range for our block. Backends whose header store
+	// starts at a checkpoint anchor (electrum) cannot serve anything below
+	// it, so the bisection floor comes from the backend; probing below
+	// would error out the sync.
 	startHeight := int32(0)
+	if e, ok := chainClient.(interface{ EarliestBlockHeight() int32 }); ok {
+		startHeight = e.EarliestBlockHeight()
+	}
 	_, bestHeight, err := chainClient.GetBestBlock()
 	if err != nil {
 		return nil, err
@@ -4260,5 +4288,23 @@ func OpenWithRetry(db walletdb.DB, pubPass []byte,
 		w.NtfnServer.notifyUnspentOutput(0, hash, index)
 	}
 
+	// The external-quiet depth is "~one day of blocks" — derived from the
+	// chain's target block time, not a fixed count, so it means a day on
+	// every chain (144 on BTC, 576 on LTC) rather than only on BTC. The
+	// cold-set sweep cadence defaults to the same chain-derived day (see
+	// sweepDue).
+	w.watchPol.extQuietDefault = chainQuietDepth(chainParams)
+
 	return w, nil
+}
+
+// chainQuietDepth returns the number of blocks in roughly one day at the
+// chain's target block time: the depth after which a quiet address is
+// considered cold, and the default cadence of the cold-set sweep. Falls back
+// to the BTC-scale default if the params omit a block time.
+func chainQuietDepth(params *netparams.ChainParams) int32 {
+	if params == nil || params.TargetTimePerBlock <= 0 {
+		return externalQuietDepth
+	}
+	return int32(24 * time.Hour / params.TargetTimePerBlock)
 }

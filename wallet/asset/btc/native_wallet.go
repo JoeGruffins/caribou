@@ -81,6 +81,15 @@ func extendAddresses(extIdx, intIdx uint32, btcw *wallet.Wallet) error {
 // implementation across both the electrum and SPV wallet types. (The
 // implementation lives here in asset/btc for now; it will move to a neutral home
 // later, together with the other shared wallet.Wallet stack. asset/ltc imports it.)
+// ElectrumRecoveryWindow is the default address-recovery window (gap limit)
+// for electrum-backed wallets. It drives the address-probe discovery scan
+// (chain.AddressProber) that runs during syncWithChain: on a fresh-seed
+// restore the scan discovers used addresses branch-wide; on an ordinary
+// reconnect it probes only this many addresses beyond each branch's pool top,
+// so the per-connect cost is bounded regardless of wallet age. 20 is the
+// standard BIP44/electrum gap limit.
+const ElectrumRecoveryWindow = 20
+
 type ChainConfig struct {
 	Chain       bisonwire.Chain
 	ChainParams *chaincfg.Params
@@ -91,9 +100,11 @@ type ChainConfig struct {
 	// BackendNeutrino. The wallet constructs the backend from its chainParams and
 	// dataDir on the first Synchronize() call.
 	BackendKind wallet.BackendKind
-	// RecoveryWindow is the default address-recovery window. Electrum leaves it 0;
-	// neutrino sets it >0 so btcwallet's recovery drives the compact-filter scan.
-	// The "recoverywindow" wallet setting, when present, overrides this.
+	// RecoveryWindow is the default address-recovery window. Electrum sets
+	// ElectrumRecoveryWindow, driving the address-probe discovery scan; neutrino
+	// sets it >0 so btcwallet's recovery drives the compact-filter scan. The
+	// "recoverywindow" wallet setting, when present, overrides this ("0"
+	// disables recovery).
 	RecoveryWindow uint32
 	// FeeRateSources are the external fee-rate APIs the wallet composites into
 	// its FeeRate estimate, consulted before the electrum-server fallback. The
@@ -111,6 +122,7 @@ func btcElectrumChainConfig(chainParams *chaincfg.Params) ChainConfig {
 		Info:           WalletInfo,
 		BackendKind:    wallet.BackendElectrum,
 		FeeRateSources: BitcoinFeeSources(),
+		RecoveryWindow: ElectrumRecoveryWindow,
 	}
 }
 
@@ -203,10 +215,16 @@ type NativeWallet struct {
 	// nil only for a chain configured without sources.
 	feeFetcher *feeratefetcher.Fetcher
 
-	// recoveryWindow is the address-probe gap limit. 0 (the default) disables
-	// recovery; a restore sets it >0 (via the "recoverywindow" setting) to scan
-	// for funds at gap-limit addresses. See wallet.syncWithChain.
+	// recoveryWindow is the address-recovery window: the address-probe gap
+	// limit for electrum (default ElectrumRecoveryWindow), the block-walk
+	// recovery window for neutrino. 0 disables recovery. See
+	// wallet.syncWithChain.
 	recoveryWindow uint32
+
+	// watchDepths carries the "externalquietdepth" and "sweepinterval"
+	// settings (0 = default) into the loader; test knobs for the watch
+	// policy's cold-address lifecycle.
+	watchDepths [2]int32
 
 	// populated during Connect
 	btcw   *wallet.Wallet
@@ -369,6 +387,16 @@ func NewNativeWallet(cc ChainConfig, cfg *asset.WalletConfig, log util.Logger) *
 	if len(cc.FeeRateSources) > 0 {
 		feeFetcher = feeratefetcher.New(cc.FeeRateSources, log.SubLogger("FEE"))
 	}
+	var watchDepths [2]int32
+	for i, key := range []string{"externalquietdepth", "sweepinterval"} {
+		if s := cfg.Settings[key]; s != "" {
+			if n, err := strconv.ParseInt(s, 10, 32); err == nil {
+				watchDepths[i] = int32(n)
+			} else {
+				log.Errorf("native: ignoring invalid %s setting %q: %v", key, s, err)
+			}
+		}
+	}
 	return &NativeWallet{
 		cfg:            cc,
 		log:            log,
@@ -379,6 +407,7 @@ func NewNativeWallet(cc ChainConfig, cfg *asset.WalletConfig, log util.Logger) *
 		peersChange:    cfg.PeersChange,
 		feeFetcher:     feeFetcher,
 		recoveryWindow: recoveryWindow,
+		watchDepths:    watchDepths,
 		txdb:           cfg.NetworkTxDB,
 		pendingTxs:     make(map[chainhash.Hash]txdb.WalletTransaction),
 	}
@@ -431,18 +460,25 @@ func (w *NativeWallet) Locked() bool {
 func (w *NativeWallet) Connect(ctx context.Context) (*sync.WaitGroup, error) {
 	w.ctx.Store(ctx)
 
-	// recoveryWindow drives on-open address recovery, and the two backends use it
-	// differently. Recovery only runs when the window is > 0 (syncWithChain). For
-	// neutrino it gates the block-walk that scans compact filters for the wallet's
-	// addresses, so SPV wallets default the window > 0 (see RecoveryWindow). For
-	// electrum a window > 0 instead drives the AddressProber path (per-address
-	// GetHistory probing, not an O(chain length) block walk), but electrum
-	// defaults the window to 0, so a default electrum wallet runs NO recovery —
-	// from-seed restore discovery is a follow-up. The "recoverywindow" setting
-	// overrides either default and is the only way to enable electrum probing today.
+	// recoveryWindow drives on-open address recovery, and the two backends use
+	// it differently. Recovery only runs when the window is > 0 (syncWithChain).
+	// For neutrino it gates the block-walk that scans compact filters for the
+	// wallet's addresses (default neutrinoRecoveryWindow). For electrum it
+	// drives the AddressProber path (per-address GetHistory probing, not an
+	// O(chain length) block walk; default ElectrumRecoveryWindow): a fresh-seed
+	// restore's empty pool gets a branch-wide discovery scan, while an ordinary
+	// reconnect probes only the window beyond each branch's pool top. The
+	// "recoverywindow" setting overrides either default ("0" disables).
+	loaderOpts := []wallet.LoaderOption{wallet.WithBackendKind(w.cfg.BackendKind)}
+	// Undocumented test knobs: shrink the watch policy's depths so harness
+	// tests can exercise the cold-address lifecycle in a few blocks.
+	if w.watchDepths[0] > 0 || w.watchDepths[1] > 0 {
+		loaderOpts = append(loaderOpts,
+			wallet.WithWatchDepths(w.watchDepths[0], w.watchDepths[1]))
+	}
 	w.loader = wallet.NewLoader(
 		w.netParams, w.dir, true, dbTimeout, w.recoveryWindow,
-		wallet.WithBackendKind(w.cfg.BackendKind),
+		loaderOpts...,
 	)
 	exists, err := w.loader.WalletExists()
 	if err != nil {
@@ -695,7 +731,7 @@ func (w *NativeWallet) Send(address string, value, feeRate uint64) (asset.Coin, 
 // segwit P2WPKH otherwise (BTC/LTC).
 func (w *NativeWallet) StandardSendFee(feeRate uint64) uint64 {
 	var sz uint64
-	if w.netParams.AddrPurpose == 44 {
+	if w.netParams.KeyPurposes[0] == 44 {
 		// legacy: 1 P2PKH input + 2 P2PKH outputs
 		sz = uint64(MinimumTxOverhead) + uint64(RedeemP2PKHInputSize) + P2PKHOutputSize*2
 	} else {
@@ -769,7 +805,7 @@ func (w *NativeWallet) EstimateSendTxFee(address string, value, feeRate uint64, 
 	}
 
 	txOut := wire.NewTxOut(int64(value), pkScript)
-	scope := w.btcw.ScopeForPurpose(84)
+	scope := w.btcw.PrimaryScope()
 	satPerKB := btcutil.Amount(feeRate * 1000)
 
 	sendAllFee := func() (uint64, error) {

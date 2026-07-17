@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"slices"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/bisoncraft/bosswallet/wallet/utxowallet/bisonwire"
@@ -60,6 +61,24 @@ type ElectrumClient struct {
 	// changes via the subscription notifications. Mutex-guarded.
 	addrCacheMtx sync.Mutex
 	addrCache    map[string]*scripthashEntry
+
+	// probeCache parks get_history replies fetched by ProbeAddress (gap-limit
+	// discovery) so the rescan that follows discovery doesn't refetch them,
+	// keyed by scripthash. Each entry carries the electrum status derived from
+	// its history; consumers holding a server-reported status may reuse the
+	// parked history iff the statuses match, which makes staleness between
+	// probe time and use time detectable exactly. Cleared once the rescan
+	// setup has consumed it. Guarded by probeMtx (never held together with
+	// addrCacheMtx or an entry's proc lock).
+	probeMtx   sync.Mutex
+	probeCache map[string]*probeHistory
+
+	// rescanFloor is the confirmed-ingestion floor: the start height of the
+	// most recent Rescan (the wallet's birthday block on initial sync).
+	// History entries confirmed below it are contractually pre-birthday and
+	// are skipped by the notification path (the rescan walk applies the same
+	// bound via collectHistories). Zero until the first Rescan.
+	rescanFloor atomic.Int32
 
 	// dirtyMtx guards dirty/dirtyWake, the coalescing buffer between the
 	// scripthash reader and processor goroutines. A scripthash status is
@@ -146,6 +165,7 @@ type scripthashEntry struct {
 var _ Backend = (*ElectrumClient)(nil)
 var _ ElectrumBackend = (*ElectrumClient)(nil)
 var _ AddressProber = (*ElectrumClient)(nil)
+var _ AddressWatcher = (*ElectrumClient)(nil)
 
 // NewElectrumClient constructs an ElectrumClient backed by the given network.
 // The network must not be started; ElectrumClient.Start will start it.
@@ -171,11 +191,18 @@ func NewElectrumClient(chainParams *netparams.ChainParams, network ElectrumNetwo
 		btcParams:   chainParams.BTCDParams(),
 		chain:       chain,
 		addrCache:   make(map[string]*scripthashEntry),
+		probeCache:  make(map[string]*probeHistory),
 	}, nil
 }
 
 // BackEnd returns the name of the backend.
 func (c *ElectrumClient) BackEnd() string { return ElectrumBackEnd }
+
+// EarliestBlockHeight returns the lowest height for which the backend can
+// serve headers — the checkpoint anchor the header store starts at. Callers
+// walking or bisecting the chain (e.g. the wallet's birthday-block search)
+// must not probe below it.
+func (c *ElectrumClient) EarliestBlockHeight() int32 { return c.net.StartHeight() }
 
 // Network returns the underlying ElectrumNetwork. Useful for asset-layer
 // callers that need direct access to electrum-specific operations.
@@ -440,15 +467,20 @@ func (c *ElectrumClient) dispatchTipChange(ev *electrum.TipChange) {
 
 // applyTip processes a single network tip change under connMtx, returning the
 // number of BlockConnected notifications delivered. While the initial rescan is
-// still running (liveDelivery false) it suppresses connects entirely — goLive
-// will deliver the contiguous catch-up at RescanFinished.
+// still running (liveDelivery false) it suppresses connects — goLive will
+// deliver the contiguous catch-up at RescanFinished — but NOT disconnects: the
+// header store is already truncated by the time the event arrives and the
+// rollback cannot be regenerated later (goLive's catch-up delivers connects
+// only), so dropping one would leave the wallet holding orphaned blocks. The
+// wallet's rollback path is safe at any point in the sync, and the rescan
+// handlers re-advance SyncedTo from the wallet's own (rolled-back) position.
 func (c *ElectrumClient) applyTip(ev *electrum.TipChange) int {
 	c.connMtx.Lock()
 	defer c.connMtx.Unlock()
+	c.deliverDisconnectsLocked(ev.Disconnected)
 	if !c.liveDelivery {
 		return 0
 	}
-	c.deliverDisconnectsLocked(ev.Disconnected)
 	return c.deliverConnectsLocked()
 }
 
@@ -614,17 +646,34 @@ func (c *ElectrumClient) handleScripthashStatus(st *electrum.ScripthashStatus) e
 	prev := append([]electrum.HistoryEntry(nil), entry.lastHistory...)
 	c.addrCacheMtx.Unlock()
 
-	hist, err := c.net.GetHistory(c.ctx, st.Scripthash)
-	if err != nil {
-		return fmt.Errorf("get history: %w", err)
+	// A discovery probe may have parked this scripthash's history; reuse it
+	// iff its derived status matches the server-reported one (i.e. nothing
+	// changed since the probe), else fetch fresh.
+	hist, ok := c.probedHistory(st.Scripthash, st.Status)
+	if ok {
+		log.Debugf("electrum: status handler using probed history for %s", st.Scripthash)
+	} else {
+		var err error
+		hist, err = c.net.GetHistory(c.ctx, st.Scripthash)
+		if err != nil {
+			return fmt.Errorf("get history: %w", err)
+		}
 	}
 	// Partition the new entries into "ready to emit" and "deferred until
 	// the header arrives". Already-seen entries are not re-emitted but
 	// stay in the carry-forward list.
+	floor := c.rescanFloor.Load()
 	emitted := make([]electrum.HistoryEntry, 0, len(hist))
 	var deferred, toEmit []electrum.HistoryEntry
 	for _, h := range hist {
 		if alreadySeen(prev, h.TxHash, h.Height) {
+			emitted = append(emitted, h)
+			continue
+		}
+		if h.Height > 0 && h.Height < floor {
+			// Confirmed below the rescan floor: contractually
+			// pre-birthday, not ours. Mark seen without emitting so
+			// the entry doesn't reappear on every future diff.
 			emitted = append(emitted, h)
 			continue
 		}
@@ -728,10 +777,32 @@ func (c *ElectrumClient) flushPending() {
 		entry.pending = remain
 		c.addrCacheMtx.Unlock()
 
-		c.emitRelevantTxs(ready)
+		// Only what was actually emitted joins the diff baseline; a
+		// transient per-entry failure (a merkle or raw-tx fetch error)
+		// returns to pending for the next flush. Committing an unemitted
+		// entry would suppress it forever — everything in lastHistory is
+		// treated as already seen, the wallet's synced height keeps
+		// advancing past it, and no future rescan walks below that — and
+		// pending now carries rescan-critical history (setup entries above
+		// the walk tip and the deferred tail of an early-finished walk),
+		// not just the rare live-path header race.
+		emitted := c.emitRelevantTxs(ready)
 
 		c.addrCacheMtx.Lock()
-		entry.lastHistory = append(entry.lastHistory, ready...)
+		entry.lastHistory = append(entry.lastHistory, emitted...)
+		if len(emitted) < len(ready) {
+			ok := make(map[string]struct{}, len(emitted))
+			for _, e := range emitted {
+				ok[fmt.Sprintf("%s|%d", e.TxHash, e.Height)] = struct{}{}
+			}
+			var failed []electrum.HistoryEntry
+			for _, e := range ready {
+				if _, did := ok[fmt.Sprintf("%s|%d", e.TxHash, e.Height)]; !did {
+					failed = append(failed, e)
+				}
+			}
+			entry.pending = mergePendingEntries(entry.pending, failed)
+		}
 		c.addrCacheMtx.Unlock()
 
 		entry.proc.Unlock()
@@ -760,9 +831,23 @@ func (c *ElectrumClient) buildRelevantTx(h electrum.HistoryEntry) (RelevantTx, e
 	if err != nil {
 		return RelevantTx{}, fmt.Errorf("decode raw tx: %w", err)
 	}
+	// A 64-byte "transaction" can be a merkle interior node; reject it so a
+	// proof cannot authenticate a fabricated node as a leaf (CVE-2017-12842
+	// class), independent of the binding check below.
+	if len(raw) == 64 {
+		return RelevantTx{}, fmt.Errorf("electrum: refusing 64-byte tx %s", h.TxHash)
+	}
 	rec, err := wtxmgr.NewTxRecord(string(c.chain), raw, time.Now())
 	if err != nil {
 		return RelevantTx{}, fmt.Errorf("new tx record: %w", err)
+	}
+	// Bind the fetched bytes to the txid the merkle proof authenticated:
+	// verifyInclusion proved h.TxHash is in the block, so a server serving
+	// different bytes for that txid would otherwise slip an unproven tx into
+	// the wallet as confirmed.
+	if rec.Hash.String() != h.TxHash {
+		return RelevantTx{}, fmt.Errorf("electrum: server returned tx %s for "+
+			"requested %s", rec.Hash, h.TxHash)
 	}
 	var blockMeta *wtxmgr.BlockMeta
 	if h.Height > 0 {
@@ -792,6 +877,50 @@ const maxRawTxFetches = 8
 // together would each wait behind the previous one's round-trip. Enqueue order
 // is preserved so any in-batch parent→child dependency stays intact for the
 // wallet.
+// verifyInclusion checks a confirmed transaction's merkle proof against the
+// LOCAL validated header at its height (multi-server rotation plan R7). The
+// header chain is anchored, retarget-checked, and PoW-bounded, so a proof
+// folding to its merkle root makes fabrication as hard as producing that
+// work; a server that cannot produce a valid proof is lying. Mempool
+// entries (height <= 0) have no proof and are not checked.
+func (c *ElectrumClient) verifyInclusion(txid string, height int32) error {
+	hdr := c.net.HeaderByHeight(height)
+	if hdr == nil {
+		return fmt.Errorf("electrum: no local header at %d for inclusion proof", height)
+	}
+	proof, err := c.net.GetMerkle(c.ctx, txid, height)
+	if err != nil {
+		return fmt.Errorf("electrum: get_merkle %s: %w", txid, err)
+	}
+	node, err := chainhash.NewHashFromStr(txid)
+	if err != nil {
+		return err
+	}
+	cur := *node
+	pos := proof.Pos
+	for _, sibHex := range proof.Merkle {
+		sib, err := chainhash.NewHashFromStr(sibHex)
+		if err != nil {
+			return fmt.Errorf("electrum: bad merkle sibling: %w", err)
+		}
+		var cat [64]byte
+		if pos&1 == 1 {
+			copy(cat[:32], sib[:])
+			copy(cat[32:], cur[:])
+		} else {
+			copy(cat[:32], cur[:])
+			copy(cat[32:], sib[:])
+		}
+		cur = chainhash.DoubleHashH(cat[:])
+		pos >>= 1
+	}
+	if cur != hdr.MerkleRoot {
+		return fmt.Errorf("electrum: merkle proof for %s does not fold to the "+
+			"validated root at %d", txid, height)
+	}
+	return nil
+}
+
 func (c *ElectrumClient) emitRelevantTxs(entries []electrum.HistoryEntry) []electrum.HistoryEntry {
 	if len(entries) == 0 {
 		return nil
@@ -805,6 +934,17 @@ func (c *ElectrumClient) emitRelevantTxs(entries []electrum.HistoryEntry) []elec
 		go func(i int) {
 			defer wg.Done()
 			defer func() { <-sem }()
+			// Confirmed entries must prove inclusion against our own
+			// validated header before they may enter the wallet; a
+			// failed proof is a lying server and the entry is refused
+			// (a future honest status diff re-delivers it).
+			if h := entries[i].Height; h > 0 {
+				if err := c.verifyInclusion(entries[i].TxHash, h); err != nil {
+					log.Errorf("electrum: refusing tx %s at %d: %v",
+						entries[i].TxHash, h, err)
+					return
+				}
+			}
 			rtx, err := c.buildRelevantTx(entries[i])
 			if err != nil {
 				log.Debugf("electrum: build relevant tx %s: %v", entries[i].TxHash, err)

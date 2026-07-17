@@ -1035,11 +1035,22 @@ func extractBlockMatches(chain ChainSource, ro *rescanOptions,
 			err)
 	}
 
+	// The watched addresses' scripts, derived once per matched block, for
+	// the input-side matching in spendsWatchedInput.
+	watchedScripts := make(map[string]struct{}, len(ro.watchAddrs))
+	for _, addr := range ro.watchAddrs {
+		script, err := txscript.PayToAddrScript(addr)
+		if err != nil {
+			return nil, err
+		}
+		watchedScripts[string(script)] = struct{}{}
+	}
+
 	relevantTxs := make([]*bisonwire.Tx, 0, len(block.Block.Transactions))
 	for _, tx := range block.Block.Transactions {
 		var relevant bool
 
-		if ro.spendsWatchedInput(tx) {
+		if ro.spendsWatchedInput(tx, watchedScripts) {
 			relevant = true
 		}
 
@@ -1227,6 +1238,46 @@ func (ro *rescanOptions) updateFilter(chain ChainSource, update *updateOptions,
 		ro.watchList = append(ro.watchList, txid[:])
 	}
 
+	// Drop any removed addresses and their scripts from the filter. This
+	// runs on the rescan goroutine, the only mutator of ro, so no extra
+	// locking is needed (symmetric with the add loops above).
+	if len(update.rmAddrs) > 0 {
+		rmScripts := make(map[string]struct{}, len(update.rmAddrs))
+		rmAddrs := make(map[string]struct{}, len(update.rmAddrs))
+		for _, addr := range update.rmAddrs {
+			rmAddrs[addr.EncodeAddress()] = struct{}{}
+			if script, err := txscript.PayToAddrScript(addr); err == nil {
+				rmScripts[string(script)] = struct{}{}
+			}
+		}
+		keptAddrs := ro.watchAddrs[:0]
+		for _, addr := range ro.watchAddrs {
+			if _, drop := rmAddrs[addr.EncodeAddress()]; !drop {
+				keptAddrs = append(keptAddrs, addr)
+			}
+		}
+		ro.watchAddrs = keptAddrs
+		keptList := ro.watchList[:0]
+		for _, script := range ro.watchList {
+			if _, drop := rmScripts[string(script)]; !drop {
+				keptList = append(keptList, script)
+			}
+		}
+		ro.watchList = keptList
+		// Drop the input watches whose prevout script belongs to a
+		// removed address, keeping the add/remove paths symmetric.
+		// Pruning here does not orphan the outpoints: if the address is
+		// later re-promoted, spends of its UTXOs are still extracted
+		// through the address-script match in spendsWatchedInput.
+		keptInputs := ro.watchInputs[:0]
+		for _, input := range ro.watchInputs {
+			if _, drop := rmScripts[string(input.PkScript)]; !drop {
+				keptInputs = append(keptInputs, input)
+			}
+		}
+		ro.watchInputs = keptInputs
+	}
+
 	// If we don't need to rewind, then we can exit early.
 	if update.rewind == 0 {
 		return false, nil
@@ -1278,22 +1329,44 @@ func (ro *rescanOptions) updateFilter(chain ChainSource, update *updateOptions,
 }
 
 // spendsWatchedInput returns whether the transaction matches the filter by
-// spending a watched input.
-func (ro *rescanOptions) spendsWatchedInput(tx *bisonwire.Tx) bool {
+// spending a watched input or by spending an output that pays a watched
+// address. watchedScripts holds the watched addresses' pkScripts, keyed by
+// raw script bytes.
+//
+// The address-script check is what keeps spends observable when no explicit
+// outpoint watch exists: outpoints ingested through a cold-address sweep
+// never pass through paysWatchedAddr, and a cold address's unspent outpoints
+// are dropped from the startup watch set, so after re-promotion only the
+// address itself is registered. The block filter already matches such spends
+// — BIP-158 filters commit the prevout scripts of inputs — this extends the
+// extraction to agree with it.
+func (ro *rescanOptions) spendsWatchedInput(tx *bisonwire.Tx,
+	watchedScripts map[string]struct{}) bool {
+
 	for _, in := range tx.TxIn {
+		// Reconstruct the prevout script from the input's signature data.
+		// This fails for input types that don't commit to the prevout
+		// script (e.g. a coinbase); those can still match an explicit
+		// outpoint watch below.
+		pkScript, scriptErr := txscript.ComputePkScript(
+			in.SignatureScript, in.Witness,
+		)
+		var script []byte
+		if scriptErr == nil {
+			script = pkScript.Script()
+			if _, ok := watchedScripts[string(script)]; ok {
+				return true
+			}
+		}
+
 		for _, input := range ro.watchInputs {
 			switch {
 			// If we're watching for a zero outpoint, then we should
 			// match on the output script being spent instead.
 			case input.OutPoint == zeroOutPoint:
-				pkScript, err := txscript.ComputePkScript(
-					in.SignatureScript, in.Witness,
-				)
-				if err != nil {
-					continue
-				}
+				if scriptErr == nil &&
+					bytes.Equal(script, input.PkScript) {
 
-				if bytes.Equal(pkScript.Script(), input.PkScript) {
 					return true
 				}
 
@@ -1429,6 +1502,7 @@ func (r *Rescan) Start() <-chan error {
 // updateOptions are a set of functional parameters for Update.
 type updateOptions struct {
 	addrs                    []btcutil.Address
+	rmAddrs                  []btcutil.Address
 	inputs                   []InputWithScript
 	txIDs                    []chainhash.Hash
 	rewind                   uint32
@@ -1446,6 +1520,17 @@ func defaultUpdateOptions() *updateOptions {
 func AddAddrs(addrs ...btcutil.Address) UpdateOption {
 	return func(uo *updateOptions) {
 		uo.addrs = append(uo.addrs, addrs...)
+	}
+}
+
+// RemoveAddrs drops addresses from the filter, so an aged wallet can shed its
+// cold addresses from the cfilter watch list instead of matching them on
+// every block forever. It is the inverse of AddAddrs and, like it, is applied
+// on the rescan goroutine (updateFilter), so the ongoing per-block match uses
+// the reduced set.
+func RemoveAddrs(addrs ...btcutil.Address) UpdateOption {
+	return func(uo *updateOptions) {
+		uo.rmAddrs = append(uo.rmAddrs, addrs...)
 	}
 }
 

@@ -47,6 +47,20 @@ const requestWriteTimeout = 7 * time.Second
 // would deadlock the listener if the consumer is slow.
 const notifyBufSize = 16
 
+// maxFrameSize bounds a single JSON-RPC frame read from the server. The
+// largest routine reply is a full 2016-header batch (2016 × 80 bytes,
+// hex-encoded ≈ 320 KiB), but legitimate outliers run far larger: a verbose
+// near-max-weight transaction duplicates its witness data across the hex and
+// decoded fields (~16 MiB), and permissive servers (Fulcrum's default
+// max_history is 125k entries) can serve address histories past 10 MiB.
+// Since exceeding the bound is treated as hostility — the connection is
+// dropped and the rotation machinery replaces it, which for a reply every
+// server serves identically becomes a rotation loop — the bound is sized
+// well past any reply a real wallet triggers, purely as a cap on what a
+// hostile server can force the line buffer to hold. The buffer grows on
+// demand; the cap is not allocated up front.
+const maxFrameSize = 1 << 25 // 32 MiB
+
 // Errors that may be returned by Server methods.
 var (
 	// ErrServerClosed is returned by request() when the underlying
@@ -241,9 +255,11 @@ func (s *Server) listen(ctx context.Context) {
 	defer s.closeNotifyChannels()
 	defer s.failPendingHandlers()
 
-	// Buffer big enough for an initial 2016-header sync chunk plus
-	// padding. 2016 * 80 bytes per header * 16x safety = ~2.5 MiB.
-	reader := bufio.NewReaderSize(s.conn, 2016*80*16)
+	// Frames are newline-delimited JSON. The scanner's buffer starts small
+	// and grows on demand up to maxFrameSize, at which point Scan stops
+	// with bufio.ErrTooLong instead of growing without bound.
+	scanner := bufio.NewScanner(s.conn)
+	scanner.Buffer(make([]byte, 0, 64*1024), maxFrameSize)
 
 	for {
 		if ctx.Err() != nil {
@@ -261,14 +277,18 @@ func (s *Server) listen(ctx context.Context) {
 			s.cancel()
 			return
 		}
-		line, err := reader.ReadBytes('\n')
-		if err != nil {
-			if ctx.Err() == nil {
+		if !scanner.Scan() {
+			err := scanner.Err() // nil on EOF
+			if errors.Is(err, bufio.ErrTooLong) {
+				log.Warnf("electrum %s: dropping connection: frame exceeds %d bytes",
+					s.addr, maxFrameSize)
+			} else if ctx.Err() == nil {
 				log.Tracef("electrum %s: read: %v", s.addr, err)
 			}
 			s.cancel()
 			return
 		}
+		line := scanner.Bytes()
 
 		var resp rpcResponse
 		if err := json.Unmarshal(line, &resp); err != nil {

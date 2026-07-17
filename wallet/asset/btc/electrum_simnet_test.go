@@ -682,11 +682,12 @@ func TestElectrumMultipleReceivesToSameAddress(t *testing.T) {
 }
 
 // connectElectrumWalletAt creates a seeded electrum wallet at dataDir from the
-// given seed and connects it. recoveryWindow > 0 enables the address-probe
-// recovery scan (a restore); 0 disables it. Taking an explicit dir + seed lets
-// a test stand up two wallets from the SAME seed in different directories (the
-// recovery test).
-func connectElectrumWalletAt(t *testing.T, dataDir string, seed []byte, recoveryWindow uint32) (asset.Wallet, *util.ConnectionMaster) {
+// given seed and connects it. The recoveryWindow is set explicitly via the
+// "recoverywindow" setting — including 0, which disables the address-probe
+// recovery scan that electrum wallets otherwise run by default
+// (ElectrumRecoveryWindow). Taking an explicit dir + seed lets a test stand up
+// two wallets from the SAME seed in different directories (the recovery test).
+func connectElectrumWalletAt(t *testing.T, dataDir string, seed []byte, recoveryWindow uint32, extraSettings ...map[string]string) (asset.Wallet, *util.ConnectionMaster) {
 	t.Helper()
 	walletDir := filepath.Join(dataDir, chaincfg.RegressionNetParams.Name)
 	// A recent birthday (the test's funds are seconds old) keeps SyncedTo from
@@ -696,9 +697,13 @@ func connectElectrumWalletAt(t *testing.T, dataDir string, seed []byte, recovery
 	if err := createElectrumWallet(walletPassword, seed, bday, walletDir, tLogger, 0, 0, &chaincfg.RegressionNetParams); err != nil {
 		t.Fatalf("connectElectrumWalletAt: createElectrumWallet: %v", err)
 	}
-	settings := map[string]string{}
-	if recoveryWindow > 0 {
-		settings["recoverywindow"] = strconv.Itoa(int(recoveryWindow))
+	settings := map[string]string{
+		"recoverywindow": strconv.Itoa(int(recoveryWindow)),
+	}
+	for _, extra := range extraSettings {
+		for k, v := range extra {
+			settings[k] = v
+		}
 	}
 
 	masterDB, err := txdb.New(filepath.Join(dataDir, "txdb"), tLogger.SubLogger("TXDB"))
@@ -838,4 +843,189 @@ func TestElectrumInfo(t *testing.T) {
 	if !auth.Locked() {
 		t.Fatal("wallet reports unlocked after Lock")
 	}
+}
+
+// TestElectrumChangeUnwatch verifies the internal-address watch lifecycle
+// (docs/address-watching-plan.md increment 1): a change address is watched
+// while its transaction is live, unwatched once the transaction is
+// watch-finality deep, and its UTXO remains spendable after the watch drops.
+func TestElectrumChangeUnwatch(t *testing.T) {
+	alpha, alphaCM := tBackend(t, "alpha", false, nil)
+	defer alphaCM.Disconnect()
+	if err := alpha.Unlock(walletPassword); err != nil {
+		t.Fatalf("unlock alpha: %v", err)
+	}
+
+	// Fresh random seed for isolation from the shared gamma history.
+	w, cm := connectElectrumWalletAt(t, t.TempDir(), randBytes(32), 20)
+	defer cm.Disconnect()
+	waitElectrumSynced(t, w)
+	if err := w.(asset.Authenticator).Unlock(walletPassword); err != nil {
+		t.Fatalf("unlock: %v", err)
+	}
+
+	subCount := func() int {
+		// The wallet wraps *chain.ElectrumClient in a walletBackend;
+		// SubscriptionCount is available via embedding.
+		ec := w.(*NativeWallet).btcw.ChainClient().(interface{ SubscriptionCount() int })
+		return ec.SubscriptionCount()
+	}
+
+	// Fund the wallet.
+	fundAddr, err := w.DepositAddress()
+	if err != nil {
+		t.Fatalf("DepositAddress: %v", err)
+	}
+	if _, err = alpha.Send(fundAddr, toSatoshi(20), 10); err != nil {
+		t.Fatalf("alpha.Send: %v", err)
+	}
+	if err = mineAlpha(); err != nil {
+		t.Fatalf("mineAlpha: %v", err)
+	}
+	waitElectrumBalanceAtLeast(t, w, toSatoshi(20))
+
+	// Self-send: creates a change output on the internal branch, whose
+	// address gets watched at tx-creation/broadcast time.
+	destAddr, err := w.DepositAddress()
+	if err != nil {
+		t.Fatalf("DepositAddress for dest: %v", err)
+	}
+	coin, err := w.Send(destAddr, toSatoshi(5), 10)
+	if err != nil {
+		t.Fatalf("Send self: %v", err)
+	}
+	if err = mineAlpha(); err != nil {
+		t.Fatalf("mineAlpha after self-send: %v", err)
+	}
+	waitElectrumTxConfirmed(t, w, coin.TxID())
+	before := subCount()
+	t.Logf("subscriptions with live change watch: %d", before)
+
+	// Mine past the finality window (wallet-layer watchFinalityDepth = 6);
+	// the block-connected reaper should drop the change-address watch.
+	for i := 0; i < 7; i++ {
+		if err = mineAlpha(); err != nil {
+			t.Fatalf("mineAlpha %d: %v", i, err)
+		}
+	}
+	// Generous deadline: header propagation to the wallet can lag well
+	// behind the instant mining above.
+	deadline := time.Now().Add(electrumSyncTimeout)
+	for subCount() >= before {
+		if time.Now().After(deadline) {
+			t.Fatalf("subscription count never dropped below %d (now %d)",
+				before, subCount())
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+	t.Logf("subscriptions after finality reap: %d", subCount())
+
+	// Spending must still work with the change UTXO unwatched: 16 BTC
+	// needs both the 5 BTC external output and the ~15 BTC change output.
+	coin2, err := w.Send(destAddr, toSatoshi(16), 10)
+	if err != nil {
+		t.Fatalf("Send spending unwatched change: %v", err)
+	}
+	if err = mineAlpha(); err != nil {
+		t.Fatalf("mineAlpha after change spend: %v", err)
+	}
+	waitElectrumTxConfirmed(t, w, coin2.TxID())
+	t.Logf("spend of unwatched change confirmed: %s", coin2.TxID())
+}
+
+// TestElectrumColdSweepLifecycle exercises the full cold-external arc
+// (docs/address-watching-plan.md increment 2) with the watch depths shrunk
+// via the test knobs: a used deposit address goes quiet, is demoted
+// (unwatched), receives a third-party payment while cold, and the metered
+// sweep detects it — re-promoting the address and crediting the funds.
+func TestElectrumColdSweepLifecycle(t *testing.T) {
+	alpha, alphaCM := tBackend(t, "alpha", false, nil)
+	defer alphaCM.Disconnect()
+	if err := alpha.Unlock(walletPassword); err != nil {
+		t.Fatalf("unlock alpha: %v", err)
+	}
+
+	// externalquietdepth must comfortably exceed sweepinterval: the sweep's
+	// promotion seeds the address with the tip captured at sweep LAUNCH, and
+	// the balance-wait loop below keeps mining while it polls, so a shallow
+	// quiet depth lets the reaper legitimately re-demote the re-promoted
+	// address before the loop observes the credit (each poll cycle ages the
+	// address by a block). Depth 8 vs interval 3 leaves ~5 blocks (~10s at
+	// the loop's cadence) between promotion and the earliest re-demotion.
+	w, cm := connectElectrumWalletAt(t, t.TempDir(), randBytes(32), 20,
+		map[string]string{"externalquietdepth": "8", "sweepinterval": "3"})
+	defer cm.Disconnect()
+	waitElectrumSynced(t, w)
+
+	subCount := func() int {
+		ec := w.(*NativeWallet).btcw.ChainClient().(interface{ SubscriptionCount() int })
+		return ec.SubscriptionCount()
+	}
+
+	// Fund the deposit address; it is now used, hot, and watched.
+	addr0, err := w.DepositAddress()
+	if err != nil {
+		t.Fatalf("DepositAddress: %v", err)
+	}
+	if _, err = alpha.Send(addr0, toSatoshi(5), 10); err != nil {
+		t.Fatalf("alpha.Send: %v", err)
+	}
+	if err = mineAlpha(); err != nil {
+		t.Fatalf("mineAlpha: %v", err)
+	}
+	waitElectrumBalanceAtLeast(t, w, toSatoshi(5))
+	hotCount := subCount()
+	t.Logf("subscriptions with hot deposit address: %d", hotCount)
+
+	// Quiet the address past externalquietdepth: mine until the reaper
+	// demotes it (subscription count drops).
+	deadline := time.Now().Add(electrumSyncTimeout)
+	for subCount() >= hotCount {
+		if time.Now().After(deadline) {
+			t.Fatalf("address never demoted (subs %d)", subCount())
+		}
+		if err = mineAlpha(); err != nil {
+			t.Fatalf("mineAlpha (quiet): %v", err)
+		}
+		time.Sleep(2 * time.Second)
+	}
+	t.Logf("subscriptions after demotion: %d", subCount())
+
+	// Pay the COLD address. No subscription exists, so only the sweep can
+	// find this.
+	if _, err = alpha.Send(addr0, toSatoshi(3), 10); err != nil {
+		t.Fatalf("alpha.Send to cold: %v", err)
+	}
+	if err = mineAlpha(); err != nil {
+		t.Fatalf("mineAlpha (cold pay): %v", err)
+	}
+
+	// Keep mining so a sweep comes due; the sweep must detect the payment,
+	// re-promote the address, and credit the funds.
+	deadline = time.Now().Add(electrumSyncTimeout)
+	for {
+		bal, err := w.Balance()
+		if err == nil && bal != nil && bal.Available >= toSatoshi(8) {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("sweep never credited the cold payment (bal %+v)", bal)
+		}
+		if err = mineAlpha(); err != nil {
+			t.Fatalf("mineAlpha (sweep): %v", err)
+		}
+		time.Sleep(2 * time.Second)
+	}
+	// Poll rather than assert instantly: the sweep emits the credit during
+	// its block walk but re-subscribes at completion, so the balance can be
+	// visible a beat before the subscription count ticks. No mining here —
+	// every block ages the re-promoted address back toward demotion.
+	deadline = time.Now().Add(electrumSyncTimeout)
+	for subCount() < hotCount {
+		if time.Now().After(deadline) {
+			t.Fatalf("address not re-promoted: subs %d < %d", subCount(), hotCount)
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	t.Logf("cold payment credited; subscriptions after re-promotion: %d", subCount())
 }

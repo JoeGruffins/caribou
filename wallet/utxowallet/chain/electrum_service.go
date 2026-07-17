@@ -24,6 +24,7 @@ type ElectrumNetwork interface {
 
 	// Header state served from the local store.
 	Tip() int32
+	StartHeight() int32
 	Synced() bool
 	// TargetTip returns the server's reported best height (from the initial
 	// SubscribeHeaders reply and updated on each tip-change notification). It
@@ -46,6 +47,7 @@ type ElectrumNetwork interface {
 	GetHistory(ctx context.Context, scripthash string) ([]electrum.HistoryEntry, error)
 	ListUnspent(ctx context.Context, scripthash string) ([]electrum.UnspentEntry, error)
 	GetRawTransaction(ctx context.Context, txid string) (string, error)
+	GetMerkle(ctx context.Context, txid string, height int32) (*electrum.MerkleProof, error)
 	GetTransactionVerbose(ctx context.Context, txid string) (*electrum.VerboseTx, error)
 	Broadcast(ctx context.Context, rawTxHex string) (string, error)
 	EstimateFee(ctx context.Context, confTarget int32) (int64, error)
