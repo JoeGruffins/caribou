@@ -4,7 +4,6 @@
 package btc
 
 import (
-	"context"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -14,7 +13,6 @@ import (
 
 	"github.com/bisoncraft/bosswallet/util"
 	"github.com/bisoncraft/bosswallet/util/config"
-	"github.com/bisoncraft/bosswallet/util/dexnet"
 	"github.com/bisoncraft/bosswallet/wallet/asset"
 	"github.com/bisoncraft/bosswallet/wallet/utxowallet/wallet"
 	"github.com/btcsuite/btcd/chaincfg"
@@ -59,6 +57,9 @@ var (
 			electrumWalletDefinition,
 		},
 		BlockchainClass: asset.BlockchainClassUTXO,
+		// Historical extremes are in the several-hundred sat/vB range, so
+		// 5,000 never binds on a real market but catches units mixups.
+		MaxFeeRate: 5_000,
 		Network: &asset.Network{
 			ID:            BipID,
 			NativeAssetID: BipID,
@@ -212,34 +213,6 @@ func NewWallet(cfg *asset.WalletConfig, logger util.Logger, net util.Network) (a
 	}
 }
 
-// externalFeeRate gets the fee rate from the external API and returns it
-// in sats/vByte.
-func externalFeeRate(ctx context.Context, net util.Network) (uint64, error) {
-	// https://mempool.space/docs/api
-	var uri string
-	if net == util.Testnet {
-		uri = "https://mempool.space/testnet/api/v1/fees/recommended"
-	} else {
-		uri = "https://mempool.space/api/v1/fees/recommended"
-	}
-	ctx, cancel := context.WithTimeout(ctx, 4*time.Second)
-	defer cancel()
-	var resp struct {
-		Fastest  uint64 `json:"fastestFee"`
-		HalfHour uint64 `json:"halfHourFee"`
-		Hour     uint64 `json:"hourFee"`
-		Economy  uint64 `json:"economyFee"`
-		Minimum  uint64 `json:"minimumFee"`
-	}
-	if err := dexnet.Get(ctx, uri, &resp, dexnet.WithSizeLimit(1<<14)); err != nil {
-		return 0, err
-	}
-	if resp.Fastest == 0 {
-		return 0, errors.New("no fee rate found")
-	}
-	return resp.Fastest, nil
-}
-
 // Convert the BTC value to satoshi.
 func toSatoshi(v float64) uint64 {
 	return uint64(math.Round(v * conventionalConversionFactor))
@@ -272,31 +245,4 @@ func decodeCoinID(coinID util.Bytes) (*chainhash.Hash, uint32, error) {
 	var txHash chainhash.Hash
 	copy(txHash[:], coinID[:32])
 	return &txHash, binary.BigEndian.Uint32(coinID[32:]), nil
-}
-
-// BitcoreRateFetcher generates a rate fetching function for the bitcore.io API.
-func BitcoreRateFetcher(ticker string) func(ctx context.Context, net util.Network) (uint64, error) {
-	const uriTemplate = "https://api.bitcore.io/api/%s/%s/fee/1"
-	mainnetURI, testnetURI := fmt.Sprintf(uriTemplate, ticker, "mainnet"), fmt.Sprintf(uriTemplate, ticker, "testnet")
-
-	return func(ctx context.Context, net util.Network) (uint64, error) {
-		var uri string
-		if net == util.Testnet {
-			uri = testnetURI
-		} else {
-			uri = mainnetURI
-		}
-		ctx, cancel := context.WithTimeout(ctx, 4*time.Second)
-		defer cancel()
-		var resp struct {
-			RatePerKB float64 `json:"feerate"`
-		}
-		if err := dexnet.Get(ctx, uri, &resp); err != nil {
-			return 0, err
-		}
-		if resp.RatePerKB <= 0 {
-			return 0, fmt.Errorf("zero or negative fee rate")
-		}
-		return uint64(math.Round(resp.RatePerKB * 1e5)), nil // 1/kB => 1/B
-	}
 }

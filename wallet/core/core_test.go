@@ -77,6 +77,7 @@ var (
 	tLogger     = util.StdOutLogger("TCORE", util.LevelInfo)
 	tWalletInfo = &asset.WalletInfo{
 		SupportedVersions: []uint32{0},
+		BlockchainClass:   asset.BlockchainClassUTXO,
 		UnitInfo: util.UnitInfo{
 			Conventional: util.Denomination{
 				ConversionFactor: 1e8,
@@ -232,6 +233,7 @@ func (c *tCoin) Value() uint64 {
 type TXCWallet struct {
 	swapSize           uint64
 	sendFeeSuggestion  uint64
+	feeRate            uint64
 	sendCoin           *tCoin
 	sendErr            error
 	addrErr            error
@@ -287,6 +289,7 @@ func newTWallet(assetID uint32) (*xcWallet, *TXCWallet) {
 		ownsAddress: true,
 		info: &asset.WalletInfo{
 			SupportedVersions: []uint32{0},
+			BlockchainClass:   asset.BlockchainClassUTXO,
 		},
 	}
 	var broadcasting uint32 = 1
@@ -486,12 +489,7 @@ func (w *TXCWallet) PendingTransactions(ctx context.Context) []*txdb.WalletTrans
 	return nil
 }
 
-type TFeeRater struct {
-	*TXCWallet
-	feeRate uint64
-}
-
-func (w *TFeeRater) FeeRate() uint64 {
+func (w *TXCWallet) FeeRate() uint64 {
 	return w.feeRate
 }
 
@@ -775,23 +773,56 @@ func TestSend(t *testing.T) {
 	tWallet.sendCoin = &tCoin{id: encode.RandomBytes(36)}
 	address := "addr"
 
+	// The caller-approved fee rate is passed through to the wallet unchanged.
+	const feeRate = 54321
+
 	// Successful
-	coin, err := tCore.Send(tPW, tUTXOAssetA.ID, 1e8, address, false)
+	coin, err := tCore.Send(tPW, tUTXOAssetA.ID, 1e8, address, false, feeRate)
 	if err != nil {
 		t.Fatalf("Send error: %v", err)
 	}
 	if coin.Value() != 1e8 {
 		t.Fatalf("Expected sent value to be %v, got %v", 1e8, coin.Value())
 	}
+	if tWallet.sendFeeSuggestion != feeRate {
+		t.Fatalf("expected caller fee rate %d passed to wallet, got %d", feeRate, tWallet.sendFeeSuggestion)
+	}
+
+	// A rate more than a factor of 2 from the wallet's live estimate is
+	// rejected, in both directions.
+	tWallet.feeRate = feeRate / 3
+	if _, err = tCore.Send(tPW, tUTXOAssetA.ID, 1e8, address, false, feeRate); err == nil {
+		t.Fatalf("no error for a fee rate more than 2x the live estimate")
+	}
+	tWallet.feeRate = feeRate * 3
+	if _, err = tCore.Send(tPW, tUTXOAssetA.ID, 1e8, address, false, feeRate); err == nil {
+		t.Fatalf("no error for a fee rate less than half the live estimate")
+	}
+	tWallet.feeRate = 0
+
+	// A rate beyond the asset's absolute ceiling is rejected even when no
+	// live estimate is available to band-check against.
+	tWallet.info.MaxFeeRate = feeRate - 1
+	if _, err = tCore.Send(tPW, tUTXOAssetA.ID, 1e8, address, false, feeRate); err == nil {
+		t.Fatalf("no error for a fee rate beyond the asset's sanity ceiling")
+	}
+	tWallet.info.MaxFeeRate = 0
+
+	// A failed fee pre-check estimate fails the send.
+	tWallet.estFeeErr = errTest
+	if _, err = tCore.Send(tPW, tUTXOAssetA.ID, 1e8, address, false, feeRate); err == nil {
+		t.Fatalf("no error when the fee pre-check estimator errors")
+	}
+	tWallet.estFeeErr = nil
 
 	// 0 value
-	_, err = tCore.Send(tPW, tUTXOAssetA.ID, 0, address, false)
+	_, err = tCore.Send(tPW, tUTXOAssetA.ID, 0, address, false, feeRate)
 	if err == nil {
 		t.Fatalf("no error for zero value send")
 	}
 
 	// no wallet
-	_, err = tCore.Send(tPW, 12345, 1e8, address, false)
+	_, err = tCore.Send(tPW, 12345, 1e8, address, false, feeRate)
 	if err == nil {
 		t.Fatalf("no error for unknown wallet")
 	}
@@ -799,7 +830,7 @@ func TestSend(t *testing.T) {
 	// connect error
 	wallet.hookedUp = false
 	tWallet.connectErr = errTest
-	_, err = tCore.Send(tPW, tUTXOAssetA.ID, 1e8, address, false)
+	_, err = tCore.Send(tPW, tUTXOAssetA.ID, 1e8, address, false, feeRate)
 	if err == nil {
 		t.Fatalf("no error for wallet connect error")
 	}
@@ -807,7 +838,7 @@ func TestSend(t *testing.T) {
 
 	// Send error
 	tWallet.sendErr = errTest
-	_, err = tCore.Send(tPW, tUTXOAssetA.ID, 1e8, address, false)
+	_, err = tCore.Send(tPW, tUTXOAssetA.ID, 1e8, address, false, feeRate)
 	if err == nil {
 		t.Fatalf("no error for wallet send error")
 	}
@@ -815,7 +846,7 @@ func TestSend(t *testing.T) {
 
 	// Check the coin.
 	tWallet.sendCoin = &tCoin{id: []byte{'a'}}
-	coin, err = tCore.Send(tPW, tUTXOAssetA.ID, 3e8, address, false)
+	coin, err = tCore.Send(tPW, tUTXOAssetA.ID, 3e8, address, false, feeRate)
 	if err != nil {
 		t.Fatalf("coin check error: %v", err)
 	}
@@ -827,35 +858,9 @@ func TestSend(t *testing.T) {
 		t.Fatalf("Expected sent value to be %v, got %v", 3e8, coin.Value())
 	}
 
-	// So far, the fee suggestion should have always been zero.
-	if tWallet.sendFeeSuggestion != 0 {
-		t.Fatalf("unexpected non-zero fee rate when no books or responses prepared")
-	}
-
-	const feeRate = 54321
-
-	feeRater := &TFeeRater{
-		TXCWallet: tWallet,
-		feeRate:   feeRate,
-	}
-
-	wallet.Wallet = feeRater
-
-	coin, err = tCore.Send(tPW, tUTXOAssetA.ID, 2e8, address, false)
-	if err != nil {
-		t.Fatalf("FeeRater Withdraw/send error: %v", err)
-	}
-	if coin.Value() != 2e8 {
-		t.Fatalf("Expected sent value to be %v, got %v", 2e8, coin.Value())
-	}
-
-	if tWallet.sendFeeSuggestion != feeRate {
-		t.Fatalf("unexpected fee rate from FeeRater. wanted %d, got %d", feeRate, tWallet.sendFeeSuggestion)
-	}
-
 	// wallet is not synced
 	wallet.syncStatus.Synced = false
-	_, err = tCore.Send(tPW, tUTXOAssetA.ID, 1e8, address, false)
+	_, err = tCore.Send(tPW, tUTXOAssetA.ID, 1e8, address, false, feeRate)
 	if err == nil {
 		t.Fatalf("Expected error for a non-synchronized wallet")
 	}
@@ -1441,27 +1446,40 @@ func TestEstimateSendTxFee(t *testing.T) {
 		name              string
 		asset             uint32
 		estFee            uint64
+		feeRate           uint64
 		value             uint64
 		subtract          bool
 		wantMissingWallet bool
+		estFeeErr         error
 		wantErr           bool
 	}{{
 		name:     "ok",
 		asset:    tUTXOAssetA.ID,
 		subtract: true,
 		estFee:   1e8,
+		feeRate:  100,
 		value:    1e8,
 	}, {
-		name:     "zero amount",
-		asset:    tACCTAsset.ID,
-		subtract: true,
-		wantErr:  true,
+		name:      "zero amount",
+		asset:     tACCTAsset.ID,
+		subtract:  true,
+		estFeeErr: errTest,
+		wantErr:   true,
 	}, {
-		name:     "subtract true and not withdrawer",
-		asset:    tACCTAsset.ID,
-		subtract: true,
-		wantErr:  true,
-		value:    1e8,
+		name:      "estimator error",
+		asset:     tACCTAsset.ID,
+		subtract:  true,
+		feeRate:   100,
+		estFeeErr: errTest,
+		wantErr:   true,
+		value:     1e8,
+	}, {
+		// A UTXO wallet prices at exactly the rate the estimate reports, so
+		// no live rate must be an error, not an estimate at some other rate.
+		name:    "no UTXO fee rate available",
+		asset:   tUTXOAssetA.ID,
+		value:   1e8,
+		wantErr: true,
 	}, {
 		name:              "wallet not found",
 		asset:             tUTXOAssetA.ID,
@@ -1478,12 +1496,10 @@ func TestEstimateSendTxFee(t *testing.T) {
 		}
 
 		tWallet.estFee = test.estFee
+		tWallet.feeRate = test.feeRate
+		tWallet.estFeeErr = test.estFeeErr
 
-		tWallet.estFeeErr = nil
-		if test.wantErr {
-			tWallet.estFeeErr = errTest
-		}
-		estimate, _, err := tCore.EstimateSendTxFee("addr", test.asset, test.value, test.subtract, false)
+		estimate, err := tCore.EstimateSendTxFee("addr", test.asset, test.value, test.subtract, false)
 		if test.wantErr {
 			if err != nil {
 				continue
@@ -1494,11 +1510,11 @@ func TestEstimateSendTxFee(t *testing.T) {
 			t.Fatalf("%s: unexpected error: %v", test.name, err)
 		}
 
-		if estimate != test.estFee {
-			t.Fatalf("%s: expected fee %v, got %v", test.name, test.estFee, estimate)
+		if estimate.Fee != test.estFee {
+			t.Fatalf("%s: expected fee %v, got %v", test.name, test.estFee, estimate.Fee)
 		}
-		if !test.wantErr && err != nil {
-			t.Fatalf("%s: unexpected error", test.name)
+		if estimate.FeeRate != test.feeRate {
+			t.Fatalf("%s: expected fee rate %v, got %v", test.name, test.feeRate, estimate.FeeRate)
 		}
 	}
 }

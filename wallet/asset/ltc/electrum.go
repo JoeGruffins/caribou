@@ -46,10 +46,11 @@ var ltcElectrumWalletDefinition = &asset.WalletDefinition{
 // ltcElectrumChainConfig is the LTC parameterization of the shared electrum wallet.
 func ltcElectrumChainConfig(chainParams *chaincfg.Params) btc.ChainConfig {
 	return btc.ChainConfig{
-		Chain:       bisonwire.ChainLTC,
-		ChainParams: chainParams,
-		NetParams:   ltcTableNetParams(chainParams),
-		Info:        WalletInfo,
+		Chain:          bisonwire.ChainLTC,
+		ChainParams:    chainParams,
+		NetParams:      ltcTableNetParams(chainParams),
+		Info:           WalletInfo,
+		FeeRateSources: feeRateSources(),
 	}
 }
 

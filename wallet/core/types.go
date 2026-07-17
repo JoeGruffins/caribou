@@ -59,16 +59,28 @@ type WalletState struct {
 	SyncStatus     *asset.SyncStatus                  `json:"syncStatus"`
 	Disabled       bool                               `json:"disabled"`
 	BridgeApproved map[string]asset.ApprovalStatus    `json:"bridgeApproved"`
-	FeeState       *FeeState                          `json:"feeState"`
 	PendingTxs     map[string]*txdb.WalletTransaction `json:"pendingTxs"`
 }
 
-// FeeState is information about the current network transaction fees and
-// estimates of standard operations.
+// FeeState is an on-demand estimate of the current network fee rate and the
+// fee for a standard send, returned by Core.WalletFeeState. It is computed when
+// requested rather than cached on the wallet.
 type FeeState struct {
 	Rate    uint64 `json:"rate"`
 	Send    uint64 `json:"send"`
 	StampMS int64  `json:"stampMS"`
+}
+
+// SendFeeEstimate is the result of estimating the network fee for a send,
+// returned by Core.EstimateSendTxFee. Fee is the total fee at FeeRate, computed
+// against the wallet's actual funds where possible. The front end submits
+// FeeRate to Send so the rate the user approved is the rate that is charged. For
+// account/EVM assets the wallet computes its own rate or fee cap, so FeeRate is
+// informational and ignored by the send.
+type SendFeeEstimate struct {
+	Fee          uint64 `json:"fee"`
+	FeeRate      uint64 `json:"feeRate"`
+	ValidAddress bool   `json:"validAddress"`
 }
 
 // BridgeFeesAndLimits contains the fees and limits for a bridge operation.

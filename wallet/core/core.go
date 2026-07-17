@@ -396,25 +396,6 @@ fetchers:
 	}
 	c.fetchFiatExchangeRates(ctx)
 
-	// Start a goroutine to keep the FeeState updated.
-	c.wg.Add(1)
-	go func() {
-		defer c.wg.Done()
-		for {
-			tick := time.NewTicker(time.Minute * 5)
-			select {
-			case <-tick.C:
-				for _, w := range c.xcWallets() {
-					if w.connected() {
-						w.feeRate() // updates the fee state internally.
-					}
-				}
-			case <-ctx.Done():
-				return
-			}
-		}
-	}()
-
 	// Handle wallet notifications.
 	c.wg.Add(1)
 	go func() {
@@ -2823,10 +2804,76 @@ func (c *Core) removeWaiter(id string) {
 	c.waiterMtx.Unlock()
 }
 
+// maxSendFeeUSD caps the estimated network fee of a mainnet send when a fiat
+// exchange rate is available. A caller-approved fee rate that prices the
+// transaction beyond this is more likely a client bug or a units mixup than
+// intent. Sweeps that consume the whole balance are exempt: spending a large
+// UTXO set is legitimately expensive, and the alternative is a balance that
+// cannot be fully withdrawn during a fee spike.
+const maxSendFeeUSD = 100.0
+
+// validateSendFeeRate sanity-checks the caller-approved fee rate for a
+// UTXO-wallet send, where the submitted rate is used exactly as given. Three
+// checks apply, each guarding a different failure with the reference data it
+// has: an absolute per-asset rate ceiling (WalletInfo.MaxFeeRate) that needs no
+// live data at all; a factor-of-two band around the wallet's own current
+// estimate, when one is available (fee markets move between estimate and
+// approval, but not that much); and the maxSendFeeUSD cap on the priced fee,
+// when a fiat exchange rate is available.
+func (c *Core) validateSendFeeRate(w *xcWallet, address string, value, feeRate uint64, subtract bool) error {
+	// The ceiling is the only check that doesn't depend on live reference
+	// data, so it is what stands between a units mixup and a burned balance
+	// when the fee and fiat oracles are all unavailable. It also can't be
+	// satisfied trivially the way the band check can when a poisoned fee
+	// source is feeding both the estimate and the validation.
+	if maxRate := w.Info().MaxFeeRate; maxRate > 0 && feeRate > maxRate {
+		return fmt.Errorf("submitted fee rate %d exceeds the %s sanity ceiling of %d",
+			feeRate, unbip(w.AssetID), maxRate)
+	}
+
+	if liveRate := w.usableFeeRate(); liveRate > 0 && (feeRate > liveRate*2 || feeRate*2 < liveRate) {
+		return fmt.Errorf("submitted fee rate %d is not within a factor of 2 of the current estimate %d",
+			feeRate, liveRate)
+	}
+
+	estimator, ok := w.Wallet.(asset.TxFeeEstimator)
+	if !ok {
+		return nil
+	}
+	fee, _, err := estimator.EstimateSendTxFee(address, value, feeRate, subtract, false)
+	if err != nil {
+		return fmt.Errorf("fee pre-check failed: %w", err)
+	}
+
+	// The USD cap only means anything where the coins have fiat value.
+	if c.net != util.Mainnet {
+		return nil
+	}
+	fiatRate := c.fiatConversions()[w.AssetID]
+	if fiatRate == 0 {
+		return nil
+	}
+	// value plus fee spanning the entire available balance is the max-withdraw
+	// shape — a sweep, exempt from the cap.
+	w.mtx.RLock()
+	bal := w.balance
+	w.mtx.RUnlock()
+	if bal != nil && value <= bal.Available && bal.Available-value <= fee {
+		return nil
+	}
+	ui := w.Info().UnitInfo
+	feeUSD := float64(fee) / float64(ui.Conventional.ConversionFactor) * fiatRate
+	if feeUSD > maxSendFeeUSD {
+		return fmt.Errorf("estimated fee %s %s (%.2f USD) exceeds the sanity limit of %.0f USD",
+			ui.ConventionalString(fee), ui.Conventional.Unit, feeUSD, maxSendFeeUSD)
+	}
+	return nil
+}
+
 // Send initiates either send or withdraw from an exchange wallet. if subtract
 // is true, fees are subtracted from the value else fees are taken from the
 // exchange wallet.
-func (c *Core) Send(pw []byte, assetID uint32, value uint64, address string, subtract bool) (asset.Coin, error) {
+func (c *Core) Send(pw []byte, assetID uint32, value uint64, address string, subtract bool, feeRate uint64) (asset.Coin, error) {
 	var crypter encrypt.Crypter
 	// Empty password can be provided if wallet is already unlocked. Webserver
 	// and RPCServer should not allow empty password, but this is used for
@@ -2856,16 +2903,25 @@ func (c *Core) Send(pw []byte, assetID uint32, value uint64, address string, sub
 		return nil, err
 	}
 
-	var feeSuggestion uint64
-	if fr, is := wallet.Wallet.(asset.FeeRater); is {
-		feeSuggestion = fr.FeeRate()
+	// feeRate is the caller-approved rate. Only UTXO wallets price a
+	// transaction to a specific rate, and they treat it as authoritative, so
+	// the fee the user saw is the fee that is paid — sanity-check it first.
+	// Account and EVM wallets compute their own fees; the rate is zeroed
+	// rather than forwarded so a stray value can't be misinterpreted.
+	if wallet.Info().BlockchainClass == asset.BlockchainClassUTXO {
+		if err := c.validateSendFeeRate(wallet, address, value, feeRate, subtract); err != nil {
+			return nil, err
+		}
+	} else {
+		feeRate = 0
 	}
+
 	var coin asset.Coin
 	if !subtract {
-		coin, err = wallet.Wallet.Send(address, value, feeSuggestion)
+		coin, err = wallet.Wallet.Send(address, value, feeRate)
 	} else {
 		if withdrawer, isWithdrawer := wallet.Wallet.(asset.Withdrawer); isWithdrawer {
-			coin, err = withdrawer.Withdraw(address, value, feeSuggestion)
+			coin, err = withdrawer.Withdraw(address, value, feeRate)
 		} else {
 			return nil, fmt.Errorf("wallet does not support subtracting network fee from withdraw amount")
 		}
@@ -3129,31 +3185,53 @@ func (c *Core) AllBridgePaths() (map[uint32]map[uint32][]string, error) {
 	return paths, nil
 }
 
-// EstimateSendTxFee returns an estimate of the tx fee needed to send or
-// withdraw the specified amount.
-func (c *Core) EstimateSendTxFee(address string, assetID uint32, amount uint64, subtract, maxWithdraw bool) (fee uint64, isValidAddress bool, err error) {
+// EstimateSendTxFee estimates the network fee for sending or withdrawing the
+// specified amount, and reports the fee rate used. The front end submits the
+// returned FeeRate to Send so that the fee the user approved is the fee that is
+// charged.
+func (c *Core) EstimateSendTxFee(address string, assetID uint32, amount uint64, subtract, maxWithdraw bool) (*SendFeeEstimate, error) {
 	if amount == 0 {
-		return 0, false, fmt.Errorf("cannot check fee for zero %s", unbip(assetID))
+		return nil, fmt.Errorf("cannot check fee for zero %s", unbip(assetID))
 	}
 
 	wallet, found := c.wallet(assetID)
 	if !found {
-		return 0, false, newError(missingWalletErr, "no wallet found for %s", unbip(assetID))
+		return nil, newError(missingWalletErr, "no wallet found for %s", unbip(assetID))
+	}
+	if !wallet.connected() {
+		return nil, fmt.Errorf("%s wallet is not connected", unbip(assetID))
 	}
 
 	if !wallet.traits.IsTxFeeEstimator() {
-		return 0, false, fmt.Errorf("wallet does not support fee estimation")
+		return nil, fmt.Errorf("wallet does not support fee estimation")
 	}
 
 	if subtract && !wallet.traits.IsWithdrawer() {
-		return 0, false, fmt.Errorf("wallet does not support checking network fee for withdrawal")
+		return nil, fmt.Errorf("wallet does not support checking network fee for withdrawal")
 	}
 	estimator, is := wallet.Wallet.(asset.TxFeeEstimator)
 	if !is {
-		return 0, false, fmt.Errorf("wallet does not support fee estimation")
+		return nil, fmt.Errorf("wallet does not support fee estimation")
 	}
 
-	return estimator.EstimateSendTxFee(address, amount, 0, subtract, maxWithdraw)
+	// Determine the rate here and compute the fee against it, so the estimate
+	// and the rate the front end submits to Send are consistent. UTXO wallets
+	// price at exactly this rate, so a zero rate must error here rather than
+	// let the wallet quietly price at a rate other than the one reported.
+	// Account and EVM wallets ignore the rate and compute their own.
+	feeRate := wallet.usableFeeRate()
+	if feeRate == 0 && wallet.Info().BlockchainClass == asset.BlockchainClassUTXO {
+		return nil, fmt.Errorf("no %s fee rate is currently available", unbip(assetID))
+	}
+	fee, isValidAddress, err := estimator.EstimateSendTxFee(address, amount, feeRate, subtract, maxWithdraw)
+	if err != nil {
+		return nil, err
+	}
+	return &SendFeeEstimate{
+		Fee:          fee,
+		FeeRate:      feeRate,
+		ValidAddress: isValidAddress,
+	}, nil
 }
 
 // assetTickerGroup returns the ticker group an asset belongs to: its
@@ -4036,17 +4114,30 @@ func (c *Core) ConfigureFundsMixer(pw []byte, assetID uint32, isMixerEnabled boo
 	return mw.ConfigureFundsMixer(isMixerEnabled)
 }
 
-// NetworkFeeRate returns the network fee rate for the specified asset.
-// Falls back to the wallet's fee rate estimate if available, otherwise 0.
-func (c *Core) NetworkFeeRate(assetID uint32) uint64 {
+// WalletFeeState returns an on-demand fee-rate estimate for the asset, computed
+// when called rather than cached or pushed. Front ends should call this only
+// when a fee figure is needed for display. The returned Rate may be zero when
+// no estimate is currently available, in which case callers should present it
+// as unavailable rather than as a zero rate.
+func (c *Core) WalletFeeState(assetID uint32) (*FeeState, error) {
 	w, found := c.wallet(assetID)
 	if !found {
-		return 0
+		return nil, newError(missingWalletErr, "no wallet for %s", unbip(assetID))
 	}
-	if fr, is := w.Wallet.(asset.FeeRater); is {
-		return fr.FeeRate()
+	// FeeRate implementations assume Connect-time state (contexts, cached
+	// tips), so don't call into a wallet that isn't connected — and a display
+	// poll is no reason to connect one.
+	if !w.connected() {
+		return nil, fmt.Errorf("%s wallet is not connected", unbip(assetID))
 	}
-	return 0
+	// Return the rate the wallet would actually use, so the number the user
+	// approves is the number that is charged.
+	rate := w.usableFeeRate()
+	return &FeeState{
+		Rate:    rate,
+		Send:    w.StandardSendFee(rate),
+		StampMS: time.Now().UnixMilli(),
+	}, nil
 }
 
 func (c *Core) deleteRequestedAction(uniqueID string) {

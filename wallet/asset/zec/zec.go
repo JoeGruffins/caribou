@@ -133,6 +133,9 @@ var (
 		UnitInfo:          UnitInfo,
 		AvailableWallets:  []*asset.WalletDefinition{rpcWalletDefinition},
 		BlockchainClass:   asset.BlockchainClassUTXO,
+		// ZEC fee markets run orders of magnitude below this; the ceiling
+		// exists to catch units mixups, not to track the market.
+		MaxFeeRate: 5_000,
 		Network: &asset.Network{
 			ID:            BipID,
 			NativeAssetID: BipID,
@@ -332,7 +335,6 @@ type zecWallet struct {
 	netTxDB txdb.NetworkTxDB
 }
 
-var _ asset.FeeRater = (*zecWallet)(nil)
 var _ asset.Wallet = (*zecWallet)(nil)
 var _ asset.NewAddresser = (*zecWallet)(nil)
 

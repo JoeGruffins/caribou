@@ -281,6 +281,9 @@ var (
 			},
 		},
 		BlockchainClass: asset.BlockchainClassUTXO,
+		// DCR fee rates sit near the 10 atoms/B relay floor; 1,000 never
+		// binds on a real market but catches units mixups.
+		MaxFeeRate: 1_000,
 		Network: &asset.Network{
 			ID:            BipID,
 			NativeAssetID: BipID,
@@ -569,7 +572,6 @@ func (dcr *ExchangeWallet) config() *exchangeWalletConfig {
 
 // Check that ExchangeWallet satisfies the Wallet interface.
 var _ asset.Wallet = (*ExchangeWallet)(nil)
-var _ asset.FeeRater = (*ExchangeWallet)(nil)
 var _ asset.Withdrawer = (*ExchangeWallet)(nil)
 var _ asset.LiveReconfigurer = (*ExchangeWallet)(nil)
 var _ asset.TxFeeEstimator = (*ExchangeWallet)(nil)
@@ -1032,7 +1034,7 @@ func (dcr *ExchangeWallet) Balance() (*asset.Balance, error) {
 	return dcr.balance()
 }
 
-// FeeRate satisfies asset.FeeRater.
+// FeeRate satisfies asset.Wallet.
 func (dcr *ExchangeWallet) FeeRate() uint64 {
 	const confTarget = 2 // 1 historically gives crazy rates
 	rate, err := dcr.feeRate(confTarget)

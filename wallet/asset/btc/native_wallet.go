@@ -23,12 +23,14 @@ import (
 	"time"
 
 	"github.com/bisoncraft/bosswallet/util"
+	"github.com/bisoncraft/bosswallet/util/feeratefetcher"
 	"github.com/bisoncraft/bosswallet/wallet/asset"
 	"github.com/bisoncraft/bosswallet/wallet/txdb"
 	"github.com/bisoncraft/bosswallet/wallet/utxowallet/assets"
 	"github.com/bisoncraft/bosswallet/wallet/utxowallet/bisonwire"
 	"github.com/bisoncraft/bosswallet/wallet/utxowallet/netparams"
 	"github.com/bisoncraft/bosswallet/wallet/utxowallet/wallet"
+	"github.com/bisoncraft/bosswallet/wallet/utxowallet/wallet/txauthor"
 	"github.com/bisoncraft/bosswallet/wallet/utxowallet/walletdb"
 	_ "github.com/bisoncraft/bosswallet/wallet/utxowallet/walletdb/bdb" // bdb init() registers the walletdb driver
 	"github.com/btcsuite/btcd/btcjson"
@@ -93,16 +95,22 @@ type ChainConfig struct {
 	// neutrino sets it >0 so btcwallet's recovery drives the compact-filter scan.
 	// The "recoverywindow" wallet setting, when present, overrides this.
 	RecoveryWindow uint32
+	// FeeRateSources are the external fee-rate APIs the wallet composites into
+	// its FeeRate estimate, consulted before the electrum-server fallback. The
+	// lean native wallet has no local fee-estimation RPC, so with an empty
+	// list FeeRate depends on the electrum fallback alone.
+	FeeRateSources []*feeratefetcher.SourceConfig
 }
 
 // btcElectrumChainConfig returns the ChainConfig for the BTC electrum wallet.
 func btcElectrumChainConfig(chainParams *chaincfg.Params) ChainConfig {
 	return ChainConfig{
-		Chain:       bisonwire.ChainBTC,
-		ChainParams: chainParams,
-		NetParams:   btcTableNetParams(chainParams),
-		Info:        WalletInfo,
-		BackendKind: wallet.BackendElectrum,
+		Chain:          bisonwire.ChainBTC,
+		ChainParams:    chainParams,
+		NetParams:      btcTableNetParams(chainParams),
+		Info:           WalletInfo,
+		BackendKind:    wallet.BackendElectrum,
+		FeeRateSources: BitcoinFeeSources(),
 	}
 }
 
@@ -183,6 +191,17 @@ type NativeWallet struct {
 	netParams   *netparams.ChainParams
 	emit        *asset.WalletEmitter
 	peersChange func(uint32, error)
+
+	// ctx is the wallet's lifetime context, set in Connect. It is used for
+	// on-demand fee-rate fetches so they cancel with the wallet. It is
+	// atomic because FeeRate is reachable from request goroutines that have
+	// no happens-before edge to an in-flight Connect.
+	ctx atomic.Value // context.Context
+
+	// feeFetcher composites external fee-rate sources for FeeRate. The
+	// mainnet sources are configured on every network for BTC and LTC; it is
+	// nil only for a chain configured without sources.
+	feeFetcher *feeratefetcher.Fetcher
 
 	// recoveryWindow is the address-probe gap limit. 0 (the default) disables
 	// recovery; a restore sets it >0 (via the "recoverywindow" setting) to scan
@@ -346,6 +365,10 @@ func NewNativeWallet(cc ChainConfig, cfg *asset.WalletConfig, log util.Logger) *
 			log.Errorf("native: ignoring invalid recoverywindow setting %q: %v", s, err)
 		}
 	}
+	var feeFetcher *feeratefetcher.Fetcher
+	if len(cc.FeeRateSources) > 0 {
+		feeFetcher = feeratefetcher.New(cc.FeeRateSources, log.SubLogger("FEE"))
+	}
 	return &NativeWallet{
 		cfg:            cc,
 		log:            log,
@@ -354,6 +377,7 @@ func NewNativeWallet(cc ChainConfig, cfg *asset.WalletConfig, log util.Logger) *
 		netParams:      cc.NetParams,
 		emit:           cfg.Emit,
 		peersChange:    cfg.PeersChange,
+		feeFetcher:     feeFetcher,
 		recoveryWindow: recoveryWindow,
 		txdb:           cfg.NetworkTxDB,
 		pendingTxs:     make(map[chainhash.Hash]txdb.WalletTransaction),
@@ -405,6 +429,7 @@ func (w *NativeWallet) Locked() bool {
 // and started inside wallet.Wallet via Synchronize), and launches background
 // goroutines for tx-history sync and peer monitoring. Satisfies util.Connector.
 func (w *NativeWallet) Connect(ctx context.Context) (*sync.WaitGroup, error) {
+	w.ctx.Store(ctx)
 
 	// recoveryWindow drives on-open address recovery, and the two backends use it
 	// differently. Recovery only runs when the window is > 0 (syncWithChain). For
@@ -600,6 +625,11 @@ func (w *NativeWallet) Send(address string, value, feeRate uint64) (asset.Coin, 
 	if w.btcw == nil {
 		return nil, errors.New("native: wallet not connected")
 	}
+	// The caller-approved rate is used exactly as given (no fallback), so a
+	// zero rate is a hard error rather than a zero-fee transaction.
+	if feeRate == 0 {
+		return nil, errors.New("native: no fee rate specified")
+	}
 
 	addr, err := btcutil.DecodeAddress(address, w.chainParams)
 	if err != nil {
@@ -674,6 +704,117 @@ func (w *NativeWallet) StandardSendFee(feeRate uint64) uint64 {
 		sz = uint64(MinimumTxOverhead) + inputSize + P2WPKHOutputSize*2
 	}
 	return feeRate * sz
+}
+
+// FeeRate satisfies asset.Wallet, returning a fee-rate estimate in sats/vByte.
+// The lean native wallet has no local estimatesmartfee RPC, so it composites the
+// configured external sources first, then falls back to an electrum server
+// estimate via the underlying wallet. It returns zero only when neither can
+// provide a rate, in which case fee-dependent operations like sends error
+// rather than proceed at a made-up rate.
+func (w *NativeWallet) FeeRate() uint64 {
+	ctx, _ := w.ctx.Load().(context.Context)
+	if ctx == nil {
+		return 0 // not connected
+	}
+	if w.feeFetcher != nil {
+		if r := w.feeFetcher.Rate(ctx); r != 0 {
+			return r
+		}
+	}
+	// Fall back to an electrum fee estimate from the wallet's configured servers,
+	// available regardless of the chain backend (including neutrino). It is an
+	// estimatesmartfee-derived value of variable quality, so it is used only when
+	// the external sources above yield nothing.
+	if w.btcw != nil {
+		if r, err := w.btcw.FeeRate(ctx); err == nil {
+			return r
+		}
+	}
+	return 0
+}
+
+var _ asset.TxFeeEstimator = (*NativeWallet)(nil)
+
+// EstimateSendTxFee estimates the network fee, in atoms, for sending value to
+// address at feeRate (atoms/byte). It satisfies asset.TxFeeEstimator. The
+// estimate runs the same coin-selection and tx-construction path Send uses, but
+// without signing or broadcasting, so it matches what a subsequent Send at this
+// rate would pay. The caller supplies the rate (core sources it from FeeRate),
+// and the estimate prices at exactly that rate — a zero rate is an error, never
+// a cue to substitute a different rate than the one the caller will report and
+// validate against. With subtract or maxWithdraw the fee comes out of value
+// rather than on top of it; maxWithdraw additionally means value is the whole
+// balance, so the estimate is for the changeless transaction that spends every
+// eligible output.
+func (w *NativeWallet) EstimateSendTxFee(address string, value, feeRate uint64, subtract, maxWithdraw bool) (fee uint64, isValidAddress bool, err error) {
+	if w.btcw == nil {
+		return 0, false, errors.New("native: wallet not connected")
+	}
+	if value == 0 {
+		return 0, false, errors.New("native: cannot estimate fee for zero value")
+	}
+	if feeRate == 0 {
+		return 0, false, errors.New("native: no fee rate specified")
+	}
+
+	// A dummy P2WPKH script keeps the size estimate realistic while the user is
+	// still typing an incomplete address.
+	pkScript := append([]byte{txscript.OP_0, txscript.OP_DATA_20}, make([]byte, 20)...)
+	if addr, decErr := btcutil.DecodeAddress(address, w.chainParams); decErr == nil {
+		if s, scriptErr := txscript.PayToAddrScript(addr); scriptErr == nil {
+			pkScript = s
+			isValidAddress = true
+		}
+	}
+
+	txOut := wire.NewTxOut(int64(value), pkScript)
+	scope := w.btcw.ScopeForPurpose(84)
+	satPerKB := btcutil.Amount(feeRate * 1000)
+
+	sendAllFee := func() (uint64, error) {
+		f, err := w.btcw.EstimateSendAllFee(&scope, 0, 0, satPerKB, []*wire.TxOut{txOut})
+		if err != nil {
+			return 0, fmt.Errorf("native: fee estimation: %w", err)
+		}
+		if uint64(f) >= value {
+			return 0, fmt.Errorf("native: fee %d consumes the send value %d", f, value)
+		}
+		return uint64(f), nil
+	}
+
+	// A max withdraw sends the whole balance minus the fee: every eligible
+	// output is consumed and there is no change.
+	if maxWithdraw {
+		fee, err = sendAllFee()
+		return fee, isValidAddress, err
+	}
+
+	// CreateSimpleTx's final argument builds the transaction without signing it
+	// and rolls back the wallet db, so this is safe to call on a locked wallet
+	// (e.g. while the send form is being filled in).
+	authoredTx, err := w.btcw.CreateSimpleTx(&scope, 0, []*wire.TxOut{txOut}, 0, satPerKB, wallet.CoinSelectionLargest, true)
+	if err != nil {
+		// A subtract send takes the fee out of value, so it needs inputs
+		// covering only value, not value + fee. When value is at or near the
+		// whole balance, the regular funding attempt above comes up one fee
+		// short — that send is the changeless spend-all shape, so estimate it
+		// as such. For any other subtract value the regular estimate below is
+		// the right one: the transaction differs only in the output being
+		// reduced by the fee, which doesn't change its size.
+		var insufficient txauthor.InputSourceError
+		if subtract && errors.As(err, &insufficient) {
+			fee, err = sendAllFee()
+			return fee, isValidAddress, err
+		}
+		return 0, isValidAddress, fmt.Errorf("native: fee estimation: %w", err)
+	}
+
+	var out uint64
+	for _, o := range authoredTx.Tx.TxOut {
+		out += uint64(o.Value)
+	}
+	return uint64(authoredTx.TotalInput) - out, isValidAddress, nil
 }
 
 // SyncStatus returns the current chain-sync state.

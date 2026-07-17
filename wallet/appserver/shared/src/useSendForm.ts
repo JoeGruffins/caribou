@@ -57,10 +57,21 @@ export function useSendForm ({ ticker, onSent }: UseSendFormOptions) {
   const [sending, setSending] = useState(false)
   const [err, setErr] = useState('')
   const [netErr, setNetErr] = useState<Record<number, string>>({})
+  // estimateNonce forces the fee-estimate effect to re-run without any form
+  // input changing. Bumped when a send is rejected: core validates the
+  // submitted rate against its own current estimate, so a rejection can mean
+  // the market moved since our estimate, and retrying with the same stale rate
+  // would fail identically. A fresh estimate re-arms the form with a current
+  // rate.
+  const [estimateNonce, setEstimateNonce] = useState(0)
 
   // Monotonic guards so stale validate/txfee responses can't clobber newer ones.
   const validateRef = useRef(0)
   const feeRef = useRef(0)
+  // feeRateRef holds the fee rate from the latest estimate. It is submitted with
+  // the send so the rate the user approved is the rate that is charged (UTXO);
+  // account/EVM wallets ignore it and compute their own.
+  const feeRateRef = useRef(0)
 
   const requirePW = app.appSettings.sendRequiresPassword
 
@@ -101,7 +112,7 @@ export function useSendForm ({ ticker, onSent }: UseSendFormOptions) {
   // would otherwise fail anyway.
   useEffect(() => {
     if (!variant) return
-    setFeeKnown(false); setTxFee(0); setFeeErr('')
+    setFeeKnown(false); setTxFee(0); setFeeErr(''); feeRateRef.current = 0
     if (!addrValid || value <= 0) { setEstimating(false); return }
     const id = ++feeRef.current
     setEstimating(true)
@@ -109,7 +120,7 @@ export function useSendForm ({ ticker, onSent }: UseSendFormOptions) {
       const r = await postJSON('/api/txfee', { addr: address.trim(), assetID: variant.assetID, value, subtract })
       if (id !== feeRef.current) return
       setEstimating(false)
-      if (r.ok && r.validaddress) { setTxFee(r.txfee); setFeeKnown(true); return }
+      if (r.ok && r.validaddress) { setTxFee(r.txfee); feeRateRef.current = r.feeRate ?? 0; setFeeKnown(true); return }
       // For a token the fee is paid in the parent gas asset, and the amount is
       // already bounded by the balance check, so an estimate failure here means
       // there isn't enough gas — say so plainly. Natives surface the raw error.
@@ -119,7 +130,7 @@ export function useSendForm ({ ticker, onSent }: UseSendFormOptions) {
         : (r.msg || r.errMsg || tvar('Could not estimate the network fee. You may need {{ ticker }} for gas.', { ticker: feeTicker })))
     }, 350)
     return () => clearTimeout(h)
-  }, [address, value, subtract, addrValid, variant])
+  }, [address, value, subtract, addrValid, variant, estimateNonce])
 
   // selectVariant advances to the send form for the chosen variant, resetting
   // the form state. No balance guard — that belongs to the explicit picker
@@ -180,6 +191,12 @@ export function useSendForm ({ ticker, onSent }: UseSendFormOptions) {
     setErr('')
     if (!addrValid) { setErr(t('Enter a valid address.')); return }
     if (value <= 0) { setErr(t('Enter an amount greater than zero.')); return }
+    // The submitted fee rate is the one behind the fee just estimated and shown,
+    // so wait for a pending estimate rather than send at a stale/zero rate.
+    if (estimating) { setErr(t('Waiting for the fee estimate.')); return }
+    // The submit buttons are disabled without a confirmed estimate, but guard
+    // here too so no path can send at a zero rate after a failed estimate.
+    if (!feeKnown) { setErr(t('A fee estimate is required.')); return }
     if (requirePW && pw === '') { setErr(t('Password required.')); return }
     setSending(true)
     const r = await postJSON('/api/send', {
@@ -187,11 +204,16 @@ export function useSendForm ({ ticker, onSent }: UseSendFormOptions) {
       address: address.trim(),
       value,
       subtract,
+      feeRate: feeRateRef.current,
       pw: requirePW ? pw : undefined
     })
     setSending(false)
     setPW('')
-    if (!r.ok) { setErr(r.errMsg || r.msg || t('Send failed.')); return }
+    if (!r.ok) {
+      setErr(r.errMsg || r.msg || t('Send failed.'))
+      setEstimateNonce(n => n + 1)
+      return
+    }
     onSent()
   }
 

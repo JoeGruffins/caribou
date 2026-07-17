@@ -103,6 +103,7 @@ type clientCore interface {
 	ConnectWallet(assetID uint32) error
 	Wallets() []*core.WalletState
 	WalletState(assetID uint32) *core.WalletState
+	WalletFeeState(assetID uint32) (*core.FeeState, error)
 	WalletSettings(uint32) (map[string]string, error)
 	ReconfigureWallet([]byte, []byte, *core.WalletForm) error
 	ToggleWalletStatus(assetID uint32, disable bool) error
@@ -113,7 +114,7 @@ type clientCore interface {
 	AutoWalletConfig(assetID uint32, walletType string) (map[string]string, error)
 	User() *core.User
 	SupportedAssets() map[uint32]*core.SupportedAsset
-	Send(pw []byte, assetID uint32, value uint64, address string, subtract bool) (asset.Coin, error)
+	Send(pw []byte, assetID uint32, value uint64, address string, subtract bool, feeRate uint64) (asset.Coin, error)
 	NotificationFeed() *core.NoteFeed
 	Logout() error
 	IsInitialized() bool
@@ -122,7 +123,7 @@ type clientCore interface {
 	WalletRestorationInfo(pw []byte, assetID uint32) ([]*asset.WalletRestoration, error)
 	ToggleRateSourceStatus(src string, disable bool) error
 	FiatRateSources() map[string]bool
-	EstimateSendTxFee(address string, assetID uint32, value uint64, subtract, maxWithdraw bool) (fee uint64, isValidAddress bool, err error)
+	EstimateSendTxFee(address string, assetID uint32, value uint64, subtract, maxWithdraw bool) (*core.SendFeeEstimate, error)
 	ValidateAddress(address string, assetID uint32) (bool, error)
 	WalletPeers(assetID uint32) ([]*asset.WalletPeer, error)
 	AddWalletPeer(assetID uint32, addr string) error
@@ -523,6 +524,7 @@ func New(cfg *Config) (*AppServer, error) {
 			apiAuth.Post("/recoverwallet", s.apiRecoverWallet)
 			apiAuth.Post("/logout", s.apiLogout)
 			apiAuth.Post("/balance", s.apiGetBalance)
+			apiAuth.Post("/feestate", s.apiWalletFeeState)
 			apiAuth.Post("/parseconfig", s.apiParseConfig)
 			apiAuth.Post("/reconfigurewallet", s.apiReconfig)
 			apiAuth.Post("/changeapppass", s.apiChangeAppPass)
