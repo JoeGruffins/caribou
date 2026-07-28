@@ -96,25 +96,32 @@ type TDB struct {
 	setWalletPwErr  error
 	creds           *db.PrimaryCredentials
 	setCredsErr     error
-	recryptErr      error
 }
 
-func (tdb *TDB) Run(context.Context) {}
+func (tdb *TDB) Connect(context.Context) (*sync.WaitGroup, error) {
+	return &sync.WaitGroup{}, nil
+}
+
+func (tdb *TDB) Close() error { return nil }
 
 func (tdb *TDB) UpdateWallet(wallet *db.Wallet) error {
 	tdb.wallet = wallet
 	return tdb.updateWalletErr
 }
 
-func (tdb *TDB) SetWalletPassword(wid []byte, newPW []byte) error {
+func (tdb *TDB) SetWalletPassword(assetID uint32, newPW []byte) error {
 	return tdb.setWalletPwErr
 }
 
-func (tdb *TDB) UpdateBalance(wid []byte, balance *db.Balance) error {
+func (tdb *TDB) SetWalletAddress(assetID uint32, addr string) error {
 	return nil
 }
 
-func (tdb *TDB) UpdateWalletStatus(wid []byte, disable bool) error {
+func (tdb *TDB) UpdateBalance(assetID uint32, balance *db.Balance) error {
+	return nil
+}
+
+func (tdb *TDB) UpdateWalletStatus(assetID uint32, disable bool) error {
 	return nil
 }
 
@@ -122,15 +129,14 @@ func (tdb *TDB) Wallets() ([]*db.Wallet, error) {
 	return nil, nil
 }
 
-func (tdb *TDB) Wallet([]byte) (*db.Wallet, error) {
+func (tdb *TDB) Wallet(uint32) (*db.Wallet, error) {
 	return tdb.wallet, tdb.walletErr
 }
 
-func (tdb *TDB) SaveNotification(*db.Notification) error            { return nil }
-func (tdb *TDB) BackupTo(dst string, overwrite, compact bool) error { return nil }
-func (tdb *TDB) NotificationsN(int) ([]*db.Notification, error)     { return nil, nil }
-func (tdb *TDB) SavePokes([]*db.Notification) error                 { return nil }
-func (tdb *TDB) LoadPokes() ([]*db.Notification, error)             { return nil, nil }
+func (tdb *TDB) SaveNotification(*db.Notification) error        { return nil }
+func (tdb *TDB) NotificationsN(int) ([]*db.Notification, error) { return nil, nil }
+func (tdb *TDB) SavePokes([]*db.Notification) error             { return nil }
+func (tdb *TDB) LoadPokes() ([]*db.Notification, error)         { return nil, nil }
 
 func (tdb *TDB) SetPrimaryCredentials(creds *db.PrimaryCredentials) error {
 	if tdb.setCredsErr != nil {
@@ -143,32 +149,12 @@ func (tdb *TDB) SetPrimaryCredentials(creds *db.PrimaryCredentials) error {
 func (tdb *TDB) PrimaryCredentials() (*db.PrimaryCredentials, error) {
 	return tdb.creds, nil
 }
-func (tdb *TDB) SetSeedGenerationTime(time uint64) error {
-	return nil
-}
-func (tdb *TDB) SeedGenerationTime() (uint64, error) {
-	return 0, nil
-}
 func (tdb *TDB) DisabledRateSources() ([]string, error) {
 	return nil, nil
 }
 func (tdb *TDB) SaveDisabledRateSources(disableSources []string) error {
 	return nil
 }
-func (tdb *TDB) Recrypt(creds *db.PrimaryCredentials, oldCrypter, newCrypter encrypt.Crypter) (
-	walletUpdates map[uint32][]byte, err error) {
-
-	if tdb.recryptErr != nil {
-		return nil, tdb.recryptErr
-	}
-
-	return nil, nil
-}
-
-func (tdb *TDB) Backup() error {
-	return nil
-}
-
 func (tdb *TDB) AckNotification(id []byte) error { return nil }
 
 func (tdb *TDB) SetLanguage(lang string) error {
@@ -300,8 +286,8 @@ func newTWallet(assetID uint32) (*xcWallet, *TXCWallet) {
 		Symbol:            util.BipIDSymbol(assetID),
 		connector:         util.NewConnectionMaster(w),
 		AssetID:           assetID,
+		walletType:        "type",
 		hookedUp:          true,
-		dbID:              encode.Uint32Bytes(assetID),
 		encPass:           []byte{0x01},
 		peerCount:         1,
 		syncStatus:        &asset.SyncStatus{Synced: true},
@@ -1078,16 +1064,15 @@ func TestResetAppPass(t *testing.T) {
 	// Invalid seed error
 	invalidSeed := seed[:24]
 	err = tCore.ResetAppPass(tPW, invalidSeed)
-	if !strings.Contains(err.Error(), "unabled to decode provided seed") {
+	if !strings.Contains(err.Error(), "error decoding seed") {
 		t.Fatalf("wrong error for invalid seed length: %v", err)
 	}
 
-	// Want incorrect seed error.
+	// Want incorrect seed error. Appending to the final word makes it one the
+	// mnemonic word list does not contain.
 	rig.crypter.(*tCrypterSmart).recryptErr = errTest
-	// tCrypter is used to encode the orginal seed but we don't need it here, so
-	// we need to add 8 bytes to commplete the expected seed lenght(64).
 	err = tCore.ResetAppPass(tPW, seed+"blah")
-	if !strings.Contains(err.Error(), "unabled to decode provided seed") {
+	if !strings.Contains(err.Error(), "error decoding seed") {
 		t.Fatalf("wrong error for incorrect seed: %v", err)
 	}
 

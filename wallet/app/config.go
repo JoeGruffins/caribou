@@ -33,7 +33,7 @@ var (
 
 // CoreConfig encapsulates the settings specific to core.Core.
 type CoreConfig struct {
-	DBPath       string `long:"db" description:"Database filepath. Database will be created if it does not exist."`
+	DBPath       string `long:"db" description:"Database path. The database will be created if it does not exist."`
 	Onion        string `long:"onion" description:"Proxy for .onion addresses, if torproxy not set (eg. 127.0.0.1:9050)."`
 	TorProxy     string `long:"torproxy" description:"Connect via TOR (eg. 127.0.0.1:9050)."`
 	TorIsolation bool   `long:"torisolation" description:"Enable TOR circuit isolation."`
@@ -41,7 +41,6 @@ type CoreConfig struct {
 	Net util.Network
 
 	NoAutoWalletLock  bool   `long:"no-wallet-lock" description:"Disable locking of wallets on shutdown or logout. Use this if you want your external wallets to stay unlocked after closing the app."`
-	NoAutoDBBackup    bool   `long:"no-db-backup" description:"Disable creation of a database backup on shutdown."`
 	ExtensionModeFile string `long:"extension-mode-file" description:"path to a file that specifies options for running core as an extension."`
 }
 
@@ -52,9 +51,7 @@ type WebConfig struct {
 	SiteDir     string `long:"sitedir" description:"Path to the 'site' directory with packaged web files. Unspecified = default is good in most cases."`
 	NoEmbedSite bool   `long:"no-embed-site" description:"Use on-disk UI files instead of embedded resources. This also reloads the html template with every request. For development purposes."`
 	HTTPProfile bool   `long:"httpprof" description:"Start HTTP profiler on /pprof."`
-	// Deprecated
-	Experimental bool `long:"experimental" description:"DEPRECATED: Enable experimental features"`
-	Tor          bool `long:"tor" description:"Enable tor hidden service"`
+	Tor         bool   `long:"tor" description:"Enable tor hidden service"`
 }
 
 // LogConfig encapsulates the logging-related settings.
@@ -137,7 +134,6 @@ func (cfg *Config) Core(log util.Logger) *core.Config {
 		TorIsolation:      cfg.TorIsolation,
 		Language:          cfg.Language,
 		NoAutoWalletLock:  cfg.NoAutoWalletLock,
-		NoAutoDBBackup:    cfg.NoAutoDBBackup,
 		ExtensionModeFile: cfg.ExtensionModeFile,
 	}
 }
@@ -270,7 +266,7 @@ func setNet(applicationDirectory, net string) (dbPath, logPath string) {
 		fmt.Fprintf(os.Stderr, "failed to create log directory: %v\n", err)
 		os.Exit(1)
 	}
-	return filepath.Join(netDirectory, "caribou.db"), logFilename
+	return filepath.Join(netDirectory, "coredb"), logFilename
 }
 
 // DefaultHostByNetwork accepts configured network and returns the network

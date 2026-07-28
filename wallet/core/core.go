@@ -6,7 +6,6 @@ package core
 import (
 	"context"
 	"encoding/binary"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -28,7 +27,6 @@ import (
 	"github.com/bisoncraft/caribou/util/encrypt"
 	"github.com/bisoncraft/caribou/wallet/asset"
 	"github.com/bisoncraft/caribou/wallet/db"
-	"github.com/bisoncraft/caribou/wallet/db/bolt"
 	"github.com/bisoncraft/caribou/wallet/mnemonic"
 	"github.com/bisoncraft/caribou/wallet/txdb"
 	"github.com/decred/dcrd/crypto/blake256"
@@ -38,9 +36,6 @@ import (
 )
 
 const (
-	// legacySeedLength is the length of the generated app seed used for app protection.
-	legacySeedLength = 64
-
 	// walletLockTimeout is the default timeout used when locking wallets.
 	walletLockTimeout = 5 * time.Second
 )
@@ -91,10 +86,6 @@ type Config struct {
 	// start Core again and wish to avoid the time to unlock a locked wallet on
 	// startup.
 	NoAutoWalletLock bool // zero value is legacy behavior
-	// NoAutoDBBackup instructs the DB to skip the creation of a backup DB file
-	// on shutdown. This is useful if the consumer is using the BackupDB method,
-	// or simply creating manual backups of the DB file after shutdown.
-	NoAutoDBBackup bool // zero value is legacy behavior
 	// ExtensionModeFile is the path to a file that specifies configuration
 	// for running core in extension mode, which gives the caller options for
 	// e.g. limiting the ability to configure wallets.
@@ -169,20 +160,36 @@ func New(cfg *Config) (*Core, error) {
 	if cfg.Logger == nil {
 		return nil, fmt.Errorf("Core.Config must specify a Logger")
 	}
-	dbOpts := bolt.Opts{
-		BackupOnShutdown: !cfg.NoAutoDBBackup,
-	}
-	boltDB, err := bolt.NewDB(cfg.DBPath, cfg.Logger.SubLogger("DB"), dbOpts)
+	coreDB, err := db.New(cfg.DBPath, cfg.Logger.SubLogger("DB"))
 	if err != nil {
 		return nil, fmt.Errorf("database initialization error: %w", err)
 	}
+
+	// Both stores hold an exclusive engine lock from the moment they open, so
+	// every error return below must close whatever has opened by that point.
+	var masterTxDB *txdb.TxDB
+	constructed := false
+	defer func() {
+		if constructed {
+			return
+		}
+		if cerr := coreDB.Close(); cerr != nil {
+			cfg.Logger.Errorf("Error closing database after failed construction: %v", cerr)
+		}
+		if masterTxDB == nil {
+			return
+		}
+		if cerr := masterTxDB.Close(); cerr != nil {
+			cfg.Logger.Errorf("Error closing transaction database after failed construction: %v", cerr)
+		}
+	}()
 
 	// The master transaction database lives beside the main database. It is
 	// shared by all wallets, each of which manages its own transactions through
 	// a network-scoped NetworkTxDB handle.
 	txDBPath := filepath.Join(filepath.Dir(cfg.DBPath), "tx.db")
 	txDBLog := cfg.Logger.SubLogger("TXDB")
-	masterTxDB, err := txdb.New(txDBPath, txDBLog)
+	masterTxDB, err = txdb.New(txDBPath, txDBLog)
 	if err != nil {
 		return nil, fmt.Errorf("transaction database initialization error: %w", err)
 	}
@@ -237,7 +244,7 @@ func New(cfg *Config) (*Core, error) {
 	lang := language.Und
 
 	// Check if the user has set a language with SetLanguage.
-	if langStr, err := boltDB.Language(); err != nil {
+	if langStr, err := coreDB.Language(); err != nil {
 		cfg.Logger.Errorf("Error loading language from database: %v", err)
 	} else if len(langStr) > 0 {
 		if lang, err = parseLanguage(langStr); err != nil {
@@ -269,14 +276,16 @@ func New(cfg *Config) (*Core, error) {
 
 	// Try to get the primary credentials, but ignore no-credentials error here
 	// because the client may not be initialized.
-	creds, err := boltDB.PrimaryCredentials()
+	creds, err := coreDB.PrimaryCredentials()
 	if err != nil && !errors.Is(err, db.ErrNoCredentials) {
 		return nil, err
 	}
 
-	seedGenerationTime, err := boltDB.SeedGenerationTime()
-	if err != nil && !errors.Is(err, db.ErrNoSeedGenTime) {
-		return nil, err
+	// The seed generation time is the credentials' Birthday; there is no
+	// separate database record.
+	var seedGenerationTime uint64
+	if creds != nil && !creds.Birthday.IsZero() {
+		seedGenerationTime = uint64(creds.Birthday.Unix())
 	}
 
 	var xCfg *ExtensionModeConfig
@@ -295,7 +304,7 @@ func New(cfg *Config) (*Core, error) {
 		credentials:  creds,
 		ready:        make(chan struct{}),
 		log:          cfg.Logger,
-		db:           boltDB,
+		db:           coreDB,
 		txDB:         masterTxDB,
 		wallets:      make(map[uint32]*xcWallet),
 		net:          cfg.Net,
@@ -326,6 +335,7 @@ func New(cfg *Config) (*Core, error) {
 
 	// Populate the initial user data.
 	c.log.Debugf("new client core created")
+	constructed = true
 	return c, nil
 }
 
@@ -339,24 +349,41 @@ func (c *Core) Run(ctx context.Context) {
 	if err != nil {
 		c.log.Critical(err)
 		close(c.ready) // unblock <-Ready()
+		// Connect was never called on either database, so close the stores
+		// opened by New here; nothing else will.
+		if closeErr := c.db.Close(); closeErr != nil {
+			c.log.Errorf("Error closing database: %v", closeErr)
+		}
+		if closeErr := c.txDB.Close(); closeErr != nil {
+			c.log.Errorf("Error closing transaction database: %v", closeErr)
+		}
 		return
 	}
 	close(c.ready)
 
-	// The DB starts first and stops last.
+	// The DB starts first and stops last. Both databases are bound to their
+	// own contexts rather than the application ctx so their shutdown
+	// (storage-engine close, GC drain, etc.) can be deferred until after the
+	// wallets are locked and disconnected below. This prevents an in-flight
+	// write during wind-down — a wallet transaction or a shutdown
+	// notification — from hitting a closed DB.
 	ctxDB, stopDB := context.WithCancel(context.Background())
-	var dbWG sync.WaitGroup
-	dbWG.Add(1)
-	go func() {
-		defer dbWG.Done()
-		c.db.Run(ctxDB)
-	}()
+	dbWG, err := c.db.Connect(ctxDB)
+	if err != nil {
+		c.log.Critical(fmt.Errorf("error connecting database: %w", err))
+		// Connect did not take ownership of the DBs opened by New(), so close
+		// them here; nothing else will. dbWG is nil on this path, and the tx
+		// DB is not yet connected.
+		if closeErr := c.db.Close(); closeErr != nil {
+			c.log.Errorf("Error closing database: %v", closeErr)
+		}
+		if closeErr := c.txDB.Close(); closeErr != nil {
+			c.log.Errorf("Error closing transaction database: %v", closeErr)
+		}
+		stopDB()
+		return
+	}
 
-	// The master transaction DB is bound to its own context rather than the
-	// application ctx so its shutdown (storage-engine close, GC drain, etc.)
-	// can be deferred until after the wallets are disconnected below. This
-	// prevents an in-flight wallet write during wind-down from hitting a
-	// closed DB.
 	ctxTxDB, stopTxDB := context.WithCancel(context.Background())
 	txDBWG, err := c.txDB.Connect(ctxTxDB)
 	if err != nil {
@@ -370,8 +397,7 @@ func (c *Core) Run(ctx context.Context) {
 		if closeErr := c.txDB.Close(); closeErr != nil {
 			c.log.Errorf("Error closing transaction database: %v", closeErr)
 		}
-		// Tear down the DB goroutine started above before returning so it does
-		// not leak. stopTxDB releases the (unused) tx DB context.
+		// Release the main DB context, which closes the connected main DB.
 		stopTxDB()
 		stopDB()
 		dbWG.Wait()
@@ -416,10 +442,6 @@ fetchers:
 		c.log.Errorf("Error saving pokes: %v", err)
 	}
 
-	// Stop the DB after dexConnections and other goroutines are done.
-	stopDB()
-	dbWG.Wait()
-
 	// Lock and disconnect the wallets.
 	c.walletMtx.Lock()
 	defer c.walletMtx.Unlock()
@@ -445,9 +467,12 @@ fetchers:
 		wallet.Disconnect()
 	}
 
-	// Now that the wallets are disconnected, stop the master transaction DB
-	// and wait for it to finish shutting down. Closing it only here ensures no
-	// in-flight wallet write can race the engine close.
+	// Now that the wallets are disconnected, stop the databases and wait for
+	// them to finish shutting down. Closing them only here ensures no
+	// in-flight write — a wallet transaction, or a notification fired from
+	// the lock/disconnect path above — can race the engine close.
+	stopDB()
+	dbWG.Wait()
 	stopTxDB()
 	if txDBWG != nil {
 		txDBWG.Wait()
@@ -539,12 +564,6 @@ func (c *Core) SendRequiresPassword() (bool, error) {
 	return c.db.SendRequiresPassword()
 }
 
-// BackupDB makes a backup of the database at the specified location, optionally
-// overwriting any existing file and compacting the database.
-func (c *Core) BackupDB(dst string, overwrite, compact bool) error {
-	return c.db.BackupTo(dst, overwrite, compact)
-}
-
 const defaultPort = "7232"
 
 // addrHost returns the host or url:port pair for an address.
@@ -594,13 +613,6 @@ func addrHost(addr string) (string, error) {
 func (c *Core) creds() *db.PrimaryCredentials {
 	c.credMtx.RLock()
 	defer c.credMtx.RUnlock()
-	if c.credentials == nil {
-		return nil
-	}
-	if len(c.credentials.EncInnerKey) == 0 {
-		// database upgraded, but Core hasn't updated the PrimaryCredentials.
-		return nil
-	}
 	return c.credentials
 }
 
@@ -697,14 +709,8 @@ func (c *Core) VerifyPassword(pw []byte) error {
 	return nil
 }
 
-func (c *Core) storeDepositAddress(wdbID []byte, addr string) error {
-	// Store the new address in the DB.
-	dbWallet, err := c.db.Wallet(wdbID)
-	if err != nil {
-		return fmt.Errorf("error retrieving DB wallet: %w", err)
-	}
-	dbWallet.Address = addr
-	return c.db.UpdateWallet(dbWallet)
+func (c *Core) storeDepositAddress(assetID uint32, addr string) error {
+	return c.db.SetWalletAddress(assetID, addr)
 }
 
 // connectAndUpdateWallet creates a connection to a wallet and updates the
@@ -734,7 +740,7 @@ func (c *Core) connectAndUpdateWallet(w *xcWallet) error {
 	}
 	if newAddr != addr {
 		c.log.Infof("New deposit address for %v wallet: %v", unbip(assetID), newAddr)
-		if err = c.storeDepositAddress(w.dbID, newAddr); err != nil {
+		if err = c.storeDepositAddress(w.AssetID, newAddr); err != nil {
 			return fmt.Errorf("storeDepositAddress: %w", err)
 		}
 	}
@@ -863,7 +869,7 @@ func (c *Core) storeAndSendWalletBalance(wallet *xcWallet, walletBal *WalletBala
 	wallet.setBalance(walletBal)
 
 	// Store the db.Balance.
-	err := c.db.UpdateBalance(wallet.dbID, walletBal.Balance)
+	err := c.db.UpdateBalance(wallet.AssetID, walletBal.Balance)
 	if err != nil {
 		return fmt.Errorf("error updating %s balance in database: %w", unbip(wallet.AssetID), err)
 	}
@@ -996,7 +1002,7 @@ func (c *Core) ToggleWalletStatus(assetID uint32, disable bool) error {
 
 	for _, wallet := range affectedWallets {
 		// Update db with wallet status.
-		err := c.db.UpdateWalletStatus(wallet.dbID, disable)
+		err := c.db.UpdateWalletStatus(wallet.AssetID, disable)
 		if err != nil {
 			return fmt.Errorf("db.UpdateWalletStatus error: %w", err)
 		}
@@ -1303,7 +1309,7 @@ func (c *Core) createSeededWallet(assetID uint32, crypter encrypt.Crypter, form 
 func (c *Core) assetSeedAndPass(assetID uint32, crypter encrypt.Crypter) (seed, pass []byte, err error) {
 	creds := c.creds()
 	if creds == nil {
-		return nil, nil, errors.New("no v2 credentials stored")
+		return nil, nil, errors.New("no credentials stored")
 	}
 
 	if tkn := asset.TokenInfo(assetID); tkn != nil {
@@ -1378,7 +1384,6 @@ func (c *Core) loadXCWallet(dbWallet *db.Wallet) (*xcWallet, error) {
 		encPass:      dbWallet.EncryptedPW,
 		address:      dbWallet.Address,
 		peerCount:    -1, // no count yet
-		dbID:         dbWallet.ID(),
 		walletType:   dbWallet.Type,
 		broadcasting: new(uint32),
 		disabled:     dbWallet.Disabled,
@@ -1663,7 +1668,7 @@ func (c *Core) RecoverWallet(assetID uint32, appPW []byte, force bool) error {
 		return fmt.Errorf("can only recover a seeded wallet")
 	}
 
-	dbWallet, err := c.db.Wallet(oldWallet.dbID)
+	dbWallet, err := c.db.Wallet(oldWallet.AssetID)
 	if err != nil {
 		return fmt.Errorf("error retrieving DB wallet: %w", err)
 	}
@@ -1806,7 +1811,7 @@ func (c *Core) WalletSettings(assetID uint32) (map[string]string, error) {
 		return nil, newError(missingWalletErr, "%d -> %s wallet not found", assetID, unbip(assetID))
 	}
 	// Get the settings from the database.
-	dbWallet, err := c.db.Wallet(wallet.dbID)
+	dbWallet, err := c.db.Wallet(wallet.AssetID)
 	if err != nil {
 		return nil, codedError(dbErr, err)
 	}
@@ -1853,7 +1858,6 @@ func (c *Core) changeAppPass(newAppPW, innerKey []byte, creds *db.PrimaryCredent
 		InnerKeyParams: creds.InnerKeyParams,
 		Birthday:       creds.Birthday,
 		OuterKeyParams: newOuterCrypter.Serialize(),
-		Version:        creds.Version,
 	}
 
 	err = c.db.SetPrimaryCredentials(newCreds)
@@ -2130,7 +2134,7 @@ func (c *Core) ReconfigureWallet(appPW, newWalletPW []byte, form *WalletForm) er
 	for tokenID := range asset.Asset(assetID).Tokens {
 		tokenWallet, found := c.wallet(tokenID)
 		if found {
-			tokenDBWallet, err := c.db.Wallet((&db.Wallet{AssetID: tokenID}).ID())
+			tokenDBWallet, err := c.db.Wallet(tokenID)
 			if err != nil {
 				c.log.Errorf("Error getting db wallet for token %s: %w", unbip(tokenID), err)
 				continue
@@ -2247,7 +2251,7 @@ func (c *Core) setWalletPassword(wallet *xcWallet, newPW []byte, crypter encrypt
 		wallet.setEncPW(nil)
 	}
 
-	err = c.db.SetWalletPassword(wallet.dbID, wallet.encPW())
+	err = c.db.SetWalletPassword(wallet.AssetID, wallet.encPW())
 	if err != nil {
 		return codedError(dbErr, err)
 	}
@@ -2285,7 +2289,7 @@ func (c *Core) NewDepositAddress(assetID uint32) (string, error) {
 		if err != nil {
 			return "", err
 		}
-		if err = c.storeDepositAddress(w.dbID, addr); err != nil {
+		if err = c.storeDepositAddress(w.AssetID, addr); err != nil {
 			return "", err
 		}
 		// Update wallet state in the User data struct and emit a WalletStateNote.
@@ -2358,12 +2362,9 @@ func (c *Core) InitializeClient(pw []byte, restorationSeed *string) (string, err
 		return "", fmt.Errorf("SetPrimaryCredentials error: %w", err)
 	}
 
-	seedGenTime := uint64(creds.Birthday.Unix())
-	err = c.db.SetSeedGenerationTime(seedGenTime)
-	if err != nil {
-		return "", fmt.Errorf("SetSeedGenerationTime error: %w", err)
-	}
-	c.seedGenerationTime = seedGenTime
+	// The seed generation time is the credentials' Birthday, already stored
+	// with the credentials.
+	c.seedGenerationTime = uint64(creds.Birthday.Unix())
 
 	freshSeed := restorationSeed == nil
 	if freshSeed {
@@ -2385,7 +2386,7 @@ func (c *Core) ExportSeed(pw []byte) (seedStr string, err error) {
 
 	creds := c.creds()
 	if creds == nil {
-		return "", fmt.Errorf("no v2 credentials stored")
+		return "", fmt.Errorf("no credentials stored")
 	}
 
 	seed, err := crypter.Decrypt(creds.EncSeed)
@@ -2393,33 +2394,16 @@ func (c *Core) ExportSeed(pw []byte) (seedStr string, err error) {
 		return "", fmt.Errorf("app seed decryption error: %w", err)
 	}
 
-	if len(seed) == legacySeedLength {
-		seedStr = hex.EncodeToString(seed)
-	} else {
-		seedStr, err = mnemonic.GenerateMnemonic(seed, creds.Birthday)
-		if err != nil {
-			return "", fmt.Errorf("error generating mnemonic: %w", err)
-		}
+	seedStr, err = mnemonic.GenerateMnemonic(seed, creds.Birthday)
+	if err != nil {
+		return "", fmt.Errorf("error generating mnemonic: %w", err)
 	}
 
 	return seedStr, nil
 }
 
 func decodeSeedString(seedStr string) (seed []byte, bday time.Time, err error) {
-	// See if it decodes as a mnemonic seed first.
-	seed, bday, err = mnemonic.DecodeMnemonic(seedStr)
-	if err != nil {
-		// Is it an old-school hex seed?
-		bday = time.Time{}
-		seed, err = hex.DecodeString(strings.Join(strings.Fields(seedStr), ""))
-		if err != nil {
-			return nil, time.Time{}, errors.New("unabled to decode provided seed")
-		}
-		if len(seed) != legacySeedLength {
-			return nil, time.Time{}, errors.New("decoded seed is wrong length")
-		}
-	}
-	return
+	return mnemonic.DecodeMnemonic(seedStr)
 }
 
 // generateCredentials generates a new set of *PrimaryCredentials. The
@@ -2467,7 +2451,6 @@ func (c *Core) generateCredentials(pw []byte, optionalSeed *string) (encrypt.Cry
 		InnerKeyParams: innerCrypter.Serialize(),
 		OuterKeyParams: outerCrypter.Serialize(),
 		Birthday:       bday,
-		Version:        1,
 	}
 
 	return innerCrypter, creds, mnemonicSeed, nil
@@ -2479,13 +2462,12 @@ func seedInnerKey(seed []byte) []byte {
 	// seed. Any other uses of derivation from the seed should similarly create
 	// their own domain-specific value to ensure uniqueness.
 	//
-	// It is equal to BLAKE-256([]byte("DCRDEX-InnerKey-v0")) and kept unchanged
-	// for backwards compatibility with existing encrypted databases.
+	// It is equal to BLAKE-256([]byte("Caribou-InnerKey-v0")).
 	keyParam := [32]byte{
-		0x75, 0x25, 0xb1, 0xb6, 0x53, 0x33, 0x9e, 0x33,
-		0xbe, 0x11, 0x61, 0x45, 0x1a, 0x88, 0x6f, 0x37,
-		0xe7, 0x74, 0xdf, 0xca, 0xb4, 0x8a, 0xee, 0x0e,
-		0x7c, 0x84, 0x60, 0x01, 0xed, 0xe5, 0xf6, 0x97,
+		0x26, 0x85, 0x02, 0x2d, 0x65, 0x70, 0x98, 0x43,
+		0x24, 0x6f, 0x99, 0xbc, 0xa2, 0x36, 0x07, 0xfe,
+		0xb9, 0x98, 0x73, 0x46, 0x91, 0x25, 0xe2, 0xab,
+		0xa9, 0xa1, 0xce, 0xbf, 0x50, 0x8c, 0xfb, 0x41,
 	}
 	key := make([]byte, len(seed)+len(keyParam))
 	copy(key, seed)
@@ -2510,28 +2492,12 @@ func (c *Core) Login(pw []byte) error {
 	}
 
 	c.notify(newLoginNote("Verifying credentials..."))
-	if len(creds.EncInnerKey) == 0 {
-		err := c.initializePrimaryCredentials(pw, creds.OuterKeyParams)
-		if err != nil {
-			// It's tempting to panic here, since Core and the db are probably
-			// out of sync and the client shouldn't be doing anything else.
-			c.log.Criticalf("v1 upgrade failed: %v", err)
-			return err
-		}
-	}
 
 	crypter, err := c.encryptionKey(pw)
 	if err != nil {
 		return err
 	}
 	defer crypter.Close()
-
-	switch creds.Version {
-	case 0:
-		if crypter, creds, err = c.upgradeV0CredsToV1(pw, *creds); err != nil {
-			return fmt.Errorf("error upgrading primary credentials from version 0 to 1: %w", err)
-		}
-	}
 
 	login := func() (needInit bool, err error) {
 		c.loginMtx.Lock()
@@ -2561,45 +2527,6 @@ func (c *Core) Login(pw []byte) error {
 	}
 
 	return nil
-}
-
-// upgradeV0CredsToV1 upgrades version 0 credentials to version 1. This update
-// changes the inner key to be derived from the seed.
-func (c *Core) upgradeV0CredsToV1(appPW []byte, creds db.PrimaryCredentials) (encrypt.Crypter, *db.PrimaryCredentials, error) {
-	outerCrypter, err := c.reCrypter(appPW, creds.OuterKeyParams)
-	if err != nil {
-		return nil, nil, fmt.Errorf("app password error: %w", err)
-	}
-	innerKey, err := outerCrypter.Decrypt(creds.EncInnerKey)
-	if err != nil {
-		return nil, nil, fmt.Errorf("inner key decryption error: %w", err)
-	}
-	innerCrypter, err := c.reCrypter(innerKey, creds.InnerKeyParams)
-	if err != nil {
-		return nil, nil, fmt.Errorf("inner key deserialization error: %w", err)
-	}
-	seed, err := innerCrypter.Decrypt(creds.EncSeed)
-	if err != nil {
-		return nil, nil, fmt.Errorf("app seed decryption error: %w", err)
-	}
-
-	// Update all the fields.
-	newInnerKey := seedInnerKey(seed)
-	newInnerCrypter := c.newCrypter(newInnerKey[:])
-	creds.Version = 1
-	creds.InnerKeyParams = newInnerCrypter.Serialize()
-	if creds.EncSeed, err = newInnerCrypter.Encrypt(seed); err != nil {
-		return nil, nil, fmt.Errorf("error encrypting version 1 seed: %w", err)
-	}
-	if creds.EncInnerKey, err = outerCrypter.Encrypt(newInnerKey[:]); err != nil {
-		return nil, nil, fmt.Errorf("error encrypting version 1 inner key: %w", err)
-	}
-	if err := c.recrypt(&creds, innerCrypter, newInnerCrypter); err != nil {
-		return nil, nil, fmt.Errorf("recrypt error during v0 -> v1 credentials upgrade: %w", err)
-	}
-
-	c.log.Infof("Upgraded to version 1 credentials")
-	return newInnerCrypter, &creds, nil
 }
 
 // connectWallets attempts to connect to and retrieve balance from all known
@@ -2705,48 +2632,6 @@ func (c *Core) Notifications(n int) (notes, pokes []*db.Notification, _ error) {
 
 // pokes returns an empty slice.
 func (c *Core) pokes() []*db.Notification {
-	return nil
-}
-
-func (c *Core) recrypt(creds *db.PrimaryCredentials, oldCrypter, newCrypter encrypt.Crypter) error {
-	walletUpdates, err := c.db.Recrypt(creds, oldCrypter, newCrypter)
-	if err != nil {
-		return err
-	}
-
-	c.setCredentials(creds)
-
-	for assetID, newEncPW := range walletUpdates {
-		w, found := c.wallet(assetID)
-		if !found {
-			c.log.Errorf("no wallet found for v1 upgrade asset ID %d", assetID)
-			continue
-		}
-		w.setEncPW(newEncPW)
-	}
-
-	return nil
-}
-
-// initializePrimaryCredentials sets the PrimaryCredential fields after the DB
-// upgrade.
-func (c *Core) initializePrimaryCredentials(pw []byte, oldKeyParams []byte) error {
-	oldCrypter, err := c.reCrypter(pw, oldKeyParams)
-	if err != nil {
-		return fmt.Errorf("legacy encryption key deserialization error: %w", err)
-	}
-
-	newCrypter, creds, _, err := c.generateCredentials(pw, nil)
-	if err != nil {
-		return err
-	}
-
-	if err := c.recrypt(creds, oldCrypter, newCrypter); err != nil {
-		return err
-	}
-
-	subject, details := c.formatDetails(TopicUpgradedToSeed)
-	c.notify(newSecurityNote(TopicUpgradedToSeed, subject, details, db.WarningLevel))
 	return nil
 }
 
