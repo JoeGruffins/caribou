@@ -78,9 +78,12 @@ wallet/android/app/src/main/jniLibs/*/libc++_shared.so
 # The directories are anchored to the repo root; CLAUDE.md is deliberately not,
 # since per-package guides live at any depth.
 CLAUDE.md
-/reviews/
-/scripts/
-/notes/
+reviews/
+scripts/
+# Exception to the local-scripts pattern above: newui's committed helper
+# scripts (contrast validation).
+!wallet/appserver/newui/scripts/
+notes/
 /design/
 
 # harness test wallet directories
