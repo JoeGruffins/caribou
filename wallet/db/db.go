@@ -59,6 +59,13 @@ const (
 // uint32 asset ID.
 const widLen = 4
 
+// maxNotePrealloc bounds the head start NotificationsN reserves for a page of
+// n notifications. n is a count the caller asks for, not a count the database
+// holds, so reserving its full width lets a caller-supplied number size the
+// allocation directly. n still bounds the page through the iteration, so this
+// only caps how much is reserved before the first record is read.
+const maxNotePrealloc = 256
+
 // kvDB implements DB over a kvstore.Store: Badger (util/lexi) on desktop,
 // bbolt (util/glossi) on mobile, selected at build time by util/kvstore.
 type kvDB struct {
@@ -471,10 +478,16 @@ func (d *kvDB) AckNotification(id []byte) error {
 
 // NotificationsN reads out the N most recent notifications, newest first.
 func (d *kvDB) NotificationsN(n int) ([]*Notification, error) {
-	notes := make([]*Notification, 0, n)
+	// The guard precedes the allocation: a negative n reaching make panics in
+	// makeslice rather than returning the empty page the contract promises.
 	if n <= 0 {
-		return notes, nil
+		return []*Notification{}, nil
 	}
+	prealloc := n
+	if prealloc > maxNotePrealloc {
+		prealloc = maxNotePrealloc
+	}
+	notes := make([]*Notification, 0, prealloc)
 	err := d.noteStampIdx.Iterate(nil, func(it kvstore.StoreIter) error {
 		err := it.V(func(v []byte) error {
 			noteB, ack, err := decodeNoteRecord(v)

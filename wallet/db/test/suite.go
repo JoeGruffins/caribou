@@ -420,6 +420,35 @@ func testNotifications(t *testing.T, d db.DB) {
 	if len(fetched) != numToDo {
 		t.Fatalf("overask fetched %d notifications, wanted all %d", len(fetched), numToDo)
 	}
+
+	// A non-positive count is an empty page, not a panic. The guard has to
+	// precede the allocation: a negative n handed to make panics in makeslice
+	// and takes the process with it.
+	for _, n := range []int{0, -1} {
+		fetched, err = d.NotificationsN(n)
+		if err != nil {
+			t.Fatalf("fetch error for n=%d: %v", n, err)
+		}
+		if len(fetched) != 0 {
+			t.Fatalf("n=%d fetched %d notifications, wanted none", n, len(fetched))
+		}
+	}
+
+	// A huge count is served without reserving its width. n is what the caller
+	// asks for, not what the database holds, so it must not size the
+	// allocation. It must still bound the page, so everything stored is
+	// returned rather than truncated to the prealloc ceiling.
+	const hugeN = 10_000_000
+	fetched, err = d.NotificationsN(hugeN)
+	if err != nil {
+		t.Fatalf("huge-n fetch error: %v", err)
+	}
+	if len(fetched) != numToDo {
+		t.Fatalf("huge-n fetched %d notifications, wanted all %d", len(fetched), numToDo)
+	}
+	if cap(fetched) >= hugeN {
+		t.Fatalf("huge-n preallocated cap %d for %d stored notifications", cap(fetched), numToDo)
+	}
 }
 
 func testPokes(t *testing.T, d db.DB) {
