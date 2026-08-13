@@ -48,6 +48,16 @@ func TestParseHYPE(t *testing.T) {
 		{"", 0, false},
 		{"abc", 0, true},
 		{"1.abc", 0, true},
+		// The API is untrusted input. Scaling by 1e8 overflows uint64 well
+		// below ParseUint's own limit, and a wrapped value feeds
+		// Balance().Available and ledger amounts as a plausible small number.
+		{"184467440737.09551617", 0, true}, // wrapped to 1
+		{"184467440738", 0, true},          // whole part alone overflows
+		{"18446744073709551615", 0, true},  // MaxUint64 whole part
+		// Largest representable value, and one atom below the whole-part
+		// boundary: these must still parse.
+		{"184467440737.09551615", 18_446_744_073_709_551_615, false},
+		{"184467440737", 18_446_744_073_700_000_000, false},
 	}
 
 	for _, tt := range tests {
@@ -1381,7 +1391,17 @@ func TestSendKeepsPendingOnNetworkError(t *testing.T) {
 		t.Fatalf("GetPendingTxs: %v", err)
 	}
 	if len(pending) != 1 {
-		t.Errorf("expected 1 pending tx retained after network error, got %d", len(pending))
+		t.Fatalf("expected 1 pending tx retained after network error, got %d", len(pending))
+	}
+	// The retained record must carry when its outcome stopped being observable.
+	// Without it confirmPendingSend cannot tell this record from an identical
+	// retry, and the orphan takes the retry's echo on nonce age alone.
+	d := hyperData(pending[0])
+	if d.OutcomeUnknownMS == 0 {
+		t.Error("retained pending send was not stamped with OutcomeUnknownMS")
+	}
+	if d.SubmissionTime == 0 {
+		t.Error("stamping the unknown outcome dropped SubmissionTime; the record can never expire")
 	}
 }
 
@@ -1634,16 +1654,20 @@ func TestConfirmPendingSendMatchesRecipient(t *testing.T) {
 	}
 }
 
-// TestConfirmPendingSendPicksClosestNonce verifies that when two pending sends
-// share the same recipient and amount and both fall within the 5-second
-// proximity window, the one whose nonce is numerically closest to the ledger
-// update time is confirmed — not just the first one found.
-func TestConfirmPendingSendPicksClosestNonce(t *testing.T) {
+// TestConfirmPendingSendPairsFIFO covers two identical sends — same recipient,
+// same amount, a second apart — being resolved against the wrong hashes. The
+// previous heuristic picked the nonce numerically closest to the ledger update
+// time, so the first echo confirmed the *second* send; the first send then had
+// no echo left to claim, aged out at pendingTTL and was removed, losing a
+// transfer that had landed. Hyperliquid processes transfers in nonce order and
+// echoes them in time order, so the two must pair oldest-first.
+func TestConfirmPendingSendPairsFIFO(t *testing.T) {
 	w := newTestWalletWithDB(t)
 
 	recipient := "0x3333333333333333333333333333333333333333"
 	baseTime := uint64(1700000010000)
-	// nonceA is 2000ms before the ledger update; nonceB is 500ms before — B is closer.
+	// Two sends a second apart. The first echo arrives at baseTime, closer to
+	// nonceB than to nonceA — which is what misled the old heuristic.
 	nonceA := baseTime - 2000
 	nonceB := baseTime - 500
 	pendingIDA := fmt.Sprintf("0x%016x", nonceA)
@@ -1671,9 +1695,88 @@ func TestConfirmPendingSendPicksClosestNonce(t *testing.T) {
 		}
 	}
 
-	realHash := "0x" + fmt.Sprintf("%064x", 55)
+	echo := func(at uint64, hash string) {
+		w.confirmPendingSend(ledgerUpdate{
+			Time: at,
+			Hash: hash,
+			Delta: ledgerDelta{
+				Type:        "spotTransfer",
+				Token:       "HYPE",
+				Amount:      "5",
+				User:        w.address,
+				Destination: recipient,
+			},
+		}, 5e8)
+	}
+
+	hashA := "0x" + fmt.Sprintf("%064x", 55)
+	hashB := "0x" + fmt.Sprintf("%064x", 56)
+
+	// First echo pairs with the older send, not the nearer one.
+	echo(baseTime, hashA)
+	confirmed, err := w.txDB.GetTx(hashA)
+	if err != nil {
+		t.Fatalf("GetTx %s: %v", hashA, err)
+	}
+	if confirmed == nil {
+		t.Fatal("first echo stored no confirmed tx")
+	}
+	if got := confirmed.AdditionalData[pendingIDKey]; got != pendingIDA {
+		t.Errorf("first echo confirmed %q, want %q (oldest nonce)", got, pendingIDA)
+	}
+	if tx, _ := w.txDB.GetTx(pendingIDA); tx != nil {
+		t.Error("pendingIDA should have been deleted after confirmation")
+	}
+	if tx, _ := w.txDB.GetTx(pendingIDB); tx == nil {
+		t.Fatal("pendingIDB should still be pending after the first echo")
+	}
+
+	// Second echo pairs with the remaining send, so neither is lost.
+	echo(baseTime+1000, hashB)
+	confirmed, err = w.txDB.GetTx(hashB)
+	if err != nil {
+		t.Fatalf("GetTx %s: %v", hashB, err)
+	}
+	if confirmed == nil {
+		t.Fatal("second echo stored no confirmed tx")
+	}
+	if got := confirmed.AdditionalData[pendingIDKey]; got != pendingIDB {
+		t.Errorf("second echo confirmed %q, want %q", got, pendingIDB)
+	}
+	if tx, _ := w.txDB.GetTx(pendingIDB); tx != nil {
+		t.Error("pendingIDB should have been deleted after the second echo")
+	}
+}
+
+// TestConfirmPendingSendNonceAfterEcho covers clock skew: the only candidate's
+// nonce is newer than the ledger update time. It cannot literally be this echo,
+// but with nothing else outstanding it is the only sensible match — dropping it
+// would leave a landed transfer to age out at pendingTTL.
+func TestConfirmPendingSendNonceAfterEcho(t *testing.T) {
+	w := newTestWalletWithDB(t)
+
+	recipient := "0x5555555555555555555555555555555555555555"
+	echoTime := uint64(1700000010000)
+	nonce := echoTime + 3000 // minted "after" the echo per the local clock
+	pendingID := fmt.Sprintf("0x%016x", nonce)
+
+	wtx := &txdb.WalletTransaction{
+		ID:        pendingID,
+		Type:      txdb.Send,
+		Amount:    5e8,
+		Recipient: &recipient,
+		AdditionalData: map[string]string{
+			"nonce": strconv.FormatUint(nonce, 10),
+		},
+	}
+	setSubmissionTime(wtx, uint64(time.Now().Unix()))
+	if err := w.txDB.StoreTx(wtx); err != nil {
+		t.Fatalf("StoreTx: %v", err)
+	}
+
+	realHash := "0x" + fmt.Sprintf("%064x", 57)
 	w.confirmPendingSend(ledgerUpdate{
-		Time: baseTime,
+		Time: echoTime,
 		Hash: realHash,
 		Delta: ledgerDelta{
 			Type:        "spotTransfer",
@@ -1684,24 +1787,15 @@ func TestConfirmPendingSendPicksClosestNonce(t *testing.T) {
 		},
 	}, 5e8)
 
-	// The confirmed entry must alias pendingIDB (closest nonce, 500ms diff).
 	confirmed, err := w.txDB.GetTx(realHash)
 	if err != nil {
 		t.Fatalf("GetTx confirmed: %v", err)
 	}
 	if confirmed == nil {
-		t.Fatal("confirmed tx not stored")
+		t.Fatal("the only candidate was not confirmed")
 	}
-	if confirmed.AdditionalData[pendingIDKey] != pendingIDB {
-		t.Errorf("pendingIDKey = %q, want %q (closest nonce)", confirmed.AdditionalData[pendingIDKey], pendingIDB)
-	}
-
-	// pendingIDB must be deleted; pendingIDA must remain.
-	if tx, _ := w.txDB.GetTx(pendingIDB); tx != nil {
-		t.Error("pendingIDB should have been deleted after confirmation")
-	}
-	if tx, _ := w.txDB.GetTx(pendingIDA); tx == nil {
-		t.Error("pendingIDA should still be pending")
+	if got := confirmed.AdditionalData[pendingIDKey]; got != pendingID {
+		t.Errorf("pendingIDKey = %q, want %q", got, pendingID)
 	}
 }
 
@@ -1750,6 +1844,170 @@ func TestConfirmPendingSendSlowServer(t *testing.T) {
 	}
 	if confirmed.AdditionalData[pendingIDKey] != pendingID {
 		t.Errorf("pendingIDKey = %q, want %q", confirmed.AdditionalData[pendingIDKey], pendingID)
+	}
+}
+
+// storePendingSend stores a pending send of amount atoms to recipient, minted
+// at nonce. unknownAtMS, when non-zero, marks the send as one whose transport
+// failed after dispatch.
+func storePendingSend(t *testing.T, w *HyperWallet, nonce, amount uint64, recipient string, unknownAtMS uint64) string {
+	t.Helper()
+	id := fmt.Sprintf("0x%016x", nonce)
+	wtx := &txdb.WalletTransaction{
+		ID:             id,
+		Type:           txdb.Send,
+		Amount:         amount,
+		Recipient:      &recipient,
+		AdditionalData: map[string]string{"nonce": strconv.FormatUint(nonce, 10)},
+	}
+	if err := setSubmissionTime(wtx, uint64(time.Now().Unix())); err != nil {
+		t.Fatalf("setSubmissionTime: %v", err)
+	}
+	if unknownAtMS > 0 {
+		if err := setOutcomeUnknown(wtx, unknownAtMS); err != nil {
+			t.Fatalf("setOutcomeUnknown: %v", err)
+		}
+	}
+	if err := w.txDB.StoreTx(wtx); err != nil {
+		t.Fatalf("StoreTx: %v", err)
+	}
+	return id
+}
+
+func spotTransferEcho(w *HyperWallet, at uint64, hash, recipient, amount string) ledgerUpdate {
+	return ledgerUpdate{
+		Time: at,
+		Hash: hash,
+		Delta: ledgerDelta{
+			Type:        "spotTransfer",
+			Token:       "HYPE",
+			Amount:      amount,
+			User:        w.address,
+			Destination: recipient,
+		},
+	}
+}
+
+// TestSetOutcomeUnknownPreservesSubmissionTime guards the two fields sharing
+// one RawTx payload. Stamping the unknown outcome happens after the submission
+// time is already encoded, and dropping it would make the record immortal:
+// confirmPendingSend only expires a pending send whose SubmissionTime is
+// non-zero, so an orphan would sit in the pending set forever.
+func TestSetOutcomeUnknownPreservesSubmissionTime(t *testing.T) {
+	wtx := &txdb.WalletTransaction{ID: "0x01"}
+	if err := setSubmissionTime(wtx, 1_700_000_000); err != nil {
+		t.Fatalf("setSubmissionTime: %v", err)
+	}
+	if err := setOutcomeUnknown(wtx, 1_700_000_030_000); err != nil {
+		t.Fatalf("setOutcomeUnknown: %v", err)
+	}
+	d := hyperData(wtx)
+	if d.SubmissionTime != 1_700_000_000 {
+		t.Errorf("SubmissionTime = %d, want 1700000000", d.SubmissionTime)
+	}
+	if d.OutcomeUnknownMS != 1_700_000_030_000 {
+		t.Errorf("OutcomeUnknownMS = %d, want 1700000030000", d.OutcomeUnknownMS)
+	}
+}
+
+// TestConfirmPendingSendOrphanDoesNotStealRetry covers the send that never
+// landed. Its transport failed after dispatch, so the record is kept — but FIFO
+// pairs on nonce age, so without a bound the orphan wins the retry's echo, the
+// confirmed record is filed under the orphan's coin ID, and the send that
+// actually settled expires at pendingTTL with WalletTransaction reporting
+// not-found for it.
+func TestConfirmPendingSendOrphanDoesNotStealRetry(t *testing.T) {
+	w := newTestWalletWithDB(t)
+	recipient := "0x6666666666666666666666666666666666666666"
+
+	// Orphan: minted, dispatched, transport gave up 30s later (httpTimeout).
+	orphanNonce := uint64(1700000010000)
+	unknownAt := orphanNonce + 30_000
+	orphanID := storePendingSend(t, w, orphanNonce, 5e8, recipient, unknownAt)
+
+	// Retry: same amount, same recipient, minted just after the failure.
+	retryNonce := unknownAt + 2_000
+	retryID := storePendingSend(t, w, retryNonce, 5e8, recipient, 0)
+
+	// Only the retry lands.
+	hash := "0x" + fmt.Sprintf("%064x", 301)
+	w.confirmPendingSend(spotTransferEcho(w, retryNonce+1_000, hash, recipient, "5"), 5e8)
+
+	confirmed, err := w.txDB.GetTx(hash)
+	if err != nil {
+		t.Fatalf("GetTx: %v", err)
+	}
+	if confirmed == nil {
+		t.Fatal("the landed send was not confirmed")
+	}
+	if got := confirmed.AdditionalData[pendingIDKey]; got != retryID {
+		t.Fatalf("echo paired with %q, want the retry %q", got, retryID)
+	}
+	// The orphan must be left alone to expire, not consumed.
+	if orphan, err := w.txDB.GetTx(orphanID); err != nil {
+		t.Fatalf("GetTx orphan: %v", err)
+	} else if orphan == nil {
+		t.Fatal("orphan was removed by the retry's echo")
+	}
+}
+
+// TestConfirmPendingSendUnknownOutcomeThatLanded is the mirror case: the
+// transport failed after dispatch but the send did land. Its echo carries a
+// ledger time from before we gave up, so the record must still be confirmed —
+// the bound must not cost us a transfer that settled.
+func TestConfirmPendingSendUnknownOutcomeThatLanded(t *testing.T) {
+	w := newTestWalletWithDB(t)
+	recipient := "0x8888888888888888888888888888888888888888"
+
+	nonce := uint64(1700000010000)
+	unknownAt := nonce + 30_000
+	pendingID := storePendingSend(t, w, nonce, 5e8, recipient, unknownAt)
+
+	// Processed 1s after mint — well before the client gave up.
+	hash := "0x" + fmt.Sprintf("%064x", 302)
+	w.confirmPendingSend(spotTransferEcho(w, nonce+1_000, hash, recipient, "5"), 5e8)
+
+	confirmed, err := w.txDB.GetTx(hash)
+	if err != nil {
+		t.Fatalf("GetTx: %v", err)
+	}
+	if confirmed == nil {
+		t.Fatal("a send that landed before the transport failed was not confirmed")
+	}
+	if got := confirmed.AdditionalData[pendingIDKey]; got != pendingID {
+		t.Fatalf("pendingIDKey = %q, want %q", got, pendingID)
+	}
+}
+
+// TestConfirmPendingSendIgnoresAncientEcho covers Rescan, which replays the
+// whole ledger history oldest-first. Every historical echo predates an
+// in-flight send's nonce, so the newer-than-echo fallback used to hand the
+// oldest one the pending record: the send was re-stored under a months-old
+// hash and timestamp, and the real echo later in the replay found no candidate.
+func TestConfirmPendingSendIgnoresAncientEcho(t *testing.T) {
+	w := newTestWalletWithDB(t)
+	recipient := "0x9999999999999999999999999999999999999999"
+
+	nonce := uint64(1700000010000)
+	storePendingSend(t, w, nonce, 5e8, recipient, 0)
+
+	// An echo from ~3 months earlier, for an identical past transfer.
+	ancientHash := "0x" + fmt.Sprintf("%064x", 303)
+	w.confirmPendingSend(spotTransferEcho(w, nonce-90*24*3600*1000, ancientHash, recipient, "5"), 5e8)
+
+	if confirmed, err := w.txDB.GetTx(ancientHash); err != nil {
+		t.Fatalf("GetTx: %v", err)
+	} else if confirmed != nil {
+		t.Fatal("in-flight send was confirmed against a months-old echo")
+	}
+
+	// The real echo still finds its candidate.
+	hash := "0x" + fmt.Sprintf("%064x", 304)
+	w.confirmPendingSend(spotTransferEcho(w, nonce+1_000, hash, recipient, "5"), 5e8)
+	if confirmed, err := w.txDB.GetTx(hash); err != nil {
+		t.Fatalf("GetTx: %v", err)
+	} else if confirmed == nil {
+		t.Fatal("the real echo did not confirm the send")
 	}
 }
 
@@ -2570,5 +2828,149 @@ func TestTxHistoryPageSizeIsNotTrusted(t *testing.T) {
 	}
 	if len(resp.Txs) != 3 {
 		t.Fatalf("N=-1 returned %d txs, want 3: %v", len(resp.Txs), confirmedIDs(resp.Txs))
+	}
+}
+
+// TestWSClientWaitsForInFlightHandler covers the read goroutine outliving the
+// connection it belongs to. It was untracked, so run could return — completing
+// Connect's WaitGroup and letting Core close the master tx DB — while
+// handleMessage was still inside processLedgerUpdate writing a transaction.
+func TestWSClientWaitsForInFlightHandler(t *testing.T) {
+	inHandler := make(chan struct{})
+	release := make(chan struct{})
+
+	srv := newWSTestServer(t, func(conn *websocket.Conn) {
+		// Consume the subscribe frame, then push one ledger event.
+		if _, _, err := conn.ReadMessage(); err != nil {
+			return
+		}
+		sendLedgerEvent(t, conn, []ledgerUpdate{{
+			Time: 1700000000000,
+			Hash: "0x" + strings.Repeat("a", 64),
+			Delta: ledgerDelta{
+				Type:        "spotTransfer",
+				Token:       "HYPE",
+				Amount:      "1",
+				User:        "0xother",
+				Destination: "0xtest",
+			},
+		}}, false)
+		time.Sleep(10 * time.Second)
+	})
+	defer srv.Close()
+
+	var once sync.Once
+	wsc := &wsClient{
+		url:  wsURL(srv),
+		user: "0xtest",
+		log:  util.StdOutLogger("WSTEST", util.LevelTrace),
+		onEvent: func(_ ledgerUpdate) {
+			once.Do(func() { close(inHandler) })
+			<-release
+		},
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan struct{})
+	go func() {
+		wsc.run(ctx)
+		close(done)
+	}()
+
+	select {
+	case <-inHandler:
+	case <-time.After(5 * time.Second):
+		t.Fatal("handler was never entered")
+	}
+
+	// Cancel while the handler is still running. run must not report done
+	// until the handler returns, or a tx DB write can outlive the wallet.
+	cancel()
+	select {
+	case <-done:
+		t.Fatal("run returned while a message handler was still in flight")
+	case <-time.After(250 * time.Millisecond):
+	}
+
+	close(release)
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("run did not exit after the handler returned")
+	}
+}
+
+// TestScanLedgerPairsIdenticalSendsFromUnorderedAPI covers the FIFO pairing's
+// dependency on echo order. confirmPendingSend takes the oldest nonce not newer
+// than the update time, which is only right if echoes are replayed oldest-first.
+// The REST catch-up returns them in whatever order the API chose — and
+// maxLedgerUpdateTime already declines to assume that order — so scanLedger
+// sorts. Without the sort, two identical sends are confirmed against each
+// other's hashes and both records carry the wrong transaction ID.
+func TestScanLedgerPairsIdenticalSendsFromUnorderedAPI(t *testing.T) {
+	base := uint64(1700000010000)
+	nonceA, nonceB := base, base+1000
+	idA := fmt.Sprintf("0x%016x", nonceA)
+	idB := fmt.Sprintf("0x%016x", nonceB)
+	hashA := "0x" + fmt.Sprintf("%064x", 201) // echo for the first send
+	hashB := "0x" + fmt.Sprintf("%064x", 202) // echo for the second
+	recipient := "0x7777777777777777777777777777777777777777"
+
+	// The API answers newest-first.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		mk := func(at uint64, hash string) ledgerUpdate {
+			return ledgerUpdate{
+				Time: at,
+				Hash: hash,
+				Delta: ledgerDelta{
+					Type:        "spotTransfer",
+					Token:       "HYPE",
+					Amount:      "5",
+					User:        "0xabcdef1234567890abcdef1234567890abcdef12",
+					Destination: recipient,
+				},
+			}
+		}
+		json.NewEncoder(w).Encode([]ledgerUpdate{
+			mk(base+1500, hashB),
+			mk(base+500, hashA),
+		})
+	}))
+	defer srv.Close()
+
+	wallet := newTestWalletWithRPC(t, srv)
+	for _, e := range []struct {
+		id    string
+		nonce uint64
+	}{{idA, nonceA}, {idB, nonceB}} {
+		wtx := &txdb.WalletTransaction{
+			ID: e.id, Type: txdb.Send, Amount: 5e8, Recipient: &recipient,
+			AdditionalData: map[string]string{"nonce": strconv.FormatUint(e.nonce, 10)},
+		}
+		setSubmissionTime(wtx, uint64(time.Now().Unix()))
+		if err := wallet.txDB.StoreTx(wtx); err != nil {
+			t.Fatalf("StoreTx %s: %v", e.id, err)
+		}
+	}
+
+	if err := wallet.scanLedger(context.Background()); err != nil {
+		t.Fatalf("scanLedger: %v", err)
+	}
+
+	for _, c := range []struct{ hash, wantPendingID string }{
+		{hashA, idA},
+		{hashB, idB},
+	} {
+		got, err := wallet.txDB.GetTx(c.hash)
+		if err != nil {
+			t.Fatalf("GetTx %s: %v", c.hash, err)
+		}
+		if got == nil {
+			t.Fatalf("no confirmed record stored for %s", c.hash)
+		}
+		if id := got.AdditionalData[pendingIDKey]; id != c.wantPendingID {
+			t.Errorf("%s confirmed pending %q, want %q", c.hash, id, c.wantPendingID)
+		}
 	}
 }

@@ -14,6 +14,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -435,17 +436,34 @@ func (w *HyperWallet) send(address string, value uint64) (asset.Coin, error) {
 	}
 
 	if err := w.rpc.sendAsset(w.ctx, action, sig, nonce); err != nil {
-		// Only remove the pending record on an explicit server rejection. For
-		// transport errors (network drop, timeout) the tx may have landed, so
-		// we leave the record for scanLedger to resolve.
+		// Remove the pending record when the outcome is known to be failure:
+		// an explicit server rejection, or a transport error that proves the
+		// request never left. Otherwise (network drop mid-flight, timeout) the
+		// tx may have landed, so leave the record for scanLedger to resolve.
+		//
+		// requestUnsent matters beyond the tidiness: a record kept here is one
+		// confirmPendingSend may have to tell apart from a later identical
+		// send, and it can only do that because keeping one costs a full
+		// httpTimeout. These errors return immediately, so resolving them here
+		// keeps that invariant true.
 		var rejection *exchangeRejection
-		if errors.As(err, &rejection) {
+		if errors.As(err, &rejection) || requestUnsent(err) {
 			if w.txDB != nil {
 				if delErr := w.txDB.RemoveTx(txID); delErr != nil {
-					w.log.Errorf("Cleaning up pending tx %s after rejection: %v", txID, delErr)
+					w.log.Errorf("Cleaning up pending tx %s after failed send: %v", txID, delErr)
 				}
 			}
 			return nil, fmt.Errorf("spot send: %w", err)
+		}
+		// Stamp when the outcome stopped being observable. If this send did
+		// land, the server processed it before now, which is what lets
+		// confirmPendingSend tell this record apart from an identical retry.
+		if w.txDB != nil {
+			if stampErr := setOutcomeUnknown(wtx, uint64(time.Now().UnixMilli())); stampErr != nil {
+				w.log.Errorf("Encoding unknown outcome for %s: %v", txID, stampErr)
+			} else if stampErr := w.txDB.StoreTx(wtx); stampErr != nil {
+				w.log.Errorf("Recording unknown outcome for %s: %v", txID, stampErr)
+			}
 		}
 		return nil, fmt.Errorf("%w: spot send: %w", ErrSendOutcomeUnknown, err)
 	}
@@ -610,13 +628,14 @@ func (w *HyperWallet) Rescan(ctx context.Context, _ uint64) error {
 	if err != nil {
 		return fmt.Errorf("fetching ledger updates: %w", err)
 	}
+	sortLedgerUpdates(updates)
 	for _, u := range updates {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
 		w.processLedgerUpdate(u)
 	}
-	if err := w.advanceLastScannedMS(maxLedgerUpdateTime(updates) + 1); err != nil {
+	if err := w.advanceLastScannedMS(lastLedgerUpdateTime(updates) + 1); err != nil {
 		return fmt.Errorf("persisting rescan watermark: %w", err)
 	}
 	return nil
@@ -694,24 +713,33 @@ func (w *HyperWallet) scanLedger(ctx context.Context) error {
 		return err
 	}
 
+	sortLedgerUpdates(updates)
 	for _, u := range updates {
 		w.processLedgerUpdate(u)
 	}
 
-	if err := w.advanceLastScannedMS(maxLedgerUpdateTime(updates) + 1); err != nil {
+	if err := w.advanceLastScannedMS(lastLedgerUpdateTime(updates) + 1); err != nil {
 		return fmt.Errorf("persisting scan watermark: %w", err)
 	}
 	return nil
 }
 
-func maxLedgerUpdateTime(updates []ledgerUpdate) int64 {
-	var maxTime int64 = -1
-	for _, u := range updates {
-		if int64(u.Time) > maxTime {
-			maxTime = int64(u.Time)
-		}
+// sortLedgerUpdates orders updates oldest-first. confirmPendingSend pairs
+// identical sends FIFO, which is only correct if echoes arrive in time order,
+// and the REST catch-up returns them in whatever order the API chose. It is
+// also what makes the last element the newest, which lastLedgerUpdateTime
+// relies on — this sort is the single authority on ledger update ordering.
+func sortLedgerUpdates(updates []ledgerUpdate) {
+	sort.SliceStable(updates, func(i, j int) bool { return updates[i].Time < updates[j].Time })
+}
+
+// lastLedgerUpdateTime returns the newest update's timestamp, or -1 when there
+// are none. updates must have been through sortLedgerUpdates.
+func lastLedgerUpdateTime(updates []ledgerUpdate) int64 {
+	if len(updates) == 0 {
+		return -1
 	}
-	return maxTime
+	return int64(updates[len(updates)-1].Time)
 }
 
 func (w *HyperWallet) advanceLastScannedMS(next int64) error {
@@ -773,7 +801,7 @@ func (w *HyperWallet) handleTransferUpdate(u ledgerUpdate) {
 	isIncoming := strings.EqualFold(u.Delta.Destination, w.address)
 
 	if isOutgoing {
-		// Try to match and confirm a pending send tx by nonce proximity.
+		// Try to match and confirm a pending send tx, pairing FIFO.
 		w.confirmPendingSend(u, amount)
 		return
 	}
@@ -823,10 +851,45 @@ func (w *HyperWallet) handleTransferUpdate(u ledgerUpdate) {
 
 // confirmPendingSend finds the pending send matching ledger update u and
 // updates it with the confirmed state. Candidates are filtered by amount and
-// recipient; when multiple sends share both, the one whose nonce is numerically
-// closest to u.Time is chosen. Nonce proximity is a tiebreaker only — a single
-// candidate always matches regardless of how much time elapsed between nonce
-// mint and ledger echo.
+// recipient; when multiple sends share both, they are paired FIFO — the oldest
+// nonce not newer than u.Time wins.
+//
+// Hyperliquid processes transfers in nonce order and echoes ledger updates in
+// time order, so the oldest outstanding send is the one this echo belongs to.
+// Matching on the nonce as an identity is not possible: ledgerUpdate carries
+// only Time and Hash, no nonce. The previous heuristic picked the nonce
+// numerically closest to u.Time, which resolved the second of two identical
+// sends against the first send's hash; the loser then aged out at pendingTTL
+// and was removed, losing a transfer that had actually landed.
+//
+// A candidate whose nonce is newer than u.Time cannot be this echo, so those
+// are considered only when nothing else matches, absorbing clock skew between
+// nonce mint and ledger echo.
+//
+// FIFO alone is only sound if every pending send eventually echoes, and one
+// left pending by ErrSendOutcomeUnknown may never do so. Nothing Hyperliquid
+// exposes settles whether it landed — a ledger update carries a time and a
+// hash, never the originating nonce, and the exchange endpoint returns no hash
+// for us to match on. Unbounded, such a record wins every later identical
+// send's echo on age alone, and the send that really landed is left to expire
+// with its coin ID unresolvable.
+//
+// Two bounds close that without needing to know the answer:
+//
+//   - A record whose outcome went unknown at OutcomeUnknownMS cannot own an
+//     echo newer than that, because a send that landed was processed while we
+//     were still waiting on the response. This is what separates the orphan
+//     from the retry; the two are otherwise indistinguishable.
+//   - echoMatchWindowMS bounds every candidate in both directions, which stops
+//     an ancient echo from claiming an in-flight send when Rescan replays whole
+//     history.
+//
+// Transport failures that prove the request never left do not produce a record
+// to disambiguate at all; see requestUnsent.
+//
+// Callers must deliver echoes oldest-first; sortLedgerUpdates enforces that on
+// every path that batches them. Feeding two identical sends' echoes in reverse
+// pairs each with the other's hash.
 // Pending entries older than pendingTTL are expired opportunistically.
 func (w *HyperWallet) confirmPendingSend(u ledgerUpdate, amount uint64) {
 	pending, err := w.txDB.GetPendingTxs()
@@ -836,10 +899,11 @@ func (w *HyperWallet) confirmPendingSend(u ledgerUpdate, amount uint64) {
 	}
 
 	cutoff := uint64(time.Now().Unix()) - pendingTTL
-	var best *txdb.WalletTransaction
-	var bestAbsDiff int64
+	var best, bestNewer *txdb.WalletTransaction
+	var bestNonce, bestNewerNonce uint64
 	for _, p := range pending {
-		subTime := hyperData(p).SubmissionTime
+		d := hyperData(p)
+		subTime := d.SubmissionTime
 		if subTime > 0 && subTime < cutoff {
 			w.log.Infof("Expiring stale pending send %s (submitted %ds ago)",
 				p.ID, uint64(time.Now().Unix())-subTime)
@@ -863,15 +927,33 @@ func (w *HyperWallet) confirmPendingSend(u ledgerUpdate, amount uint64) {
 		if p.Recipient == nil || !strings.EqualFold(*p.Recipient, u.Delta.Destination) {
 			continue
 		}
-		absDiff := int64(u.Time) - int64(nonce)
-		if absDiff < 0 {
-			absDiff = -absDiff
+		// This send's outcome stopped being observable at OutcomeUnknownMS. Had
+		// it landed, the server would have processed it before then, so a newer
+		// echo belongs to some other send — most likely the user's retry, which
+		// is identical by construction.
+		if d.OutcomeUnknownMS > 0 && u.Time > d.OutcomeUnknownMS+echoSkewAllowanceMS {
+			continue
 		}
-		if best == nil || absDiff < bestAbsDiff {
-			best, bestAbsDiff = p, absDiff
+		if nonce > u.Time {
+			if nonce-u.Time > echoMatchWindowMS {
+				continue
+			}
+			if bestNewer == nil || nonce < bestNewerNonce {
+				bestNewer, bestNewerNonce = p, nonce
+			}
+			continue
+		}
+		if u.Time-nonce > echoMatchWindowMS {
+			continue
+		}
+		if best == nil || nonce < bestNonce {
+			best, bestNonce = p, nonce
 		}
 	}
 
+	if best == nil {
+		best = bestNewer
+	}
 	if best == nil {
 		return
 	}

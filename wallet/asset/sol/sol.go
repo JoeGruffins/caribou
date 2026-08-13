@@ -564,6 +564,7 @@ func (w *Wallet) syncHistory(ctx context.Context) error {
 		cursorSig = sigs[i].Signature
 	}
 	if len(wts) > 0 {
+		preservePendingData(w.txDB, wts, w.log)
 		if err := w.txDB.StoreTxs(wts); err != nil {
 			return err
 		}
@@ -626,6 +627,7 @@ func (w *Wallet) backfillHistory(ctx context.Context) error {
 		}
 	}
 	if len(wts) > 0 {
+		preservePendingData(w.txDB, wts, w.log)
 		if err := w.txDB.StoreTxs(wts); err != nil {
 			return err
 		}
@@ -706,7 +708,34 @@ func (w *Wallet) checkPendingTxs(ctx context.Context) error {
 						continue // transient error — retry next poll, do not reject
 					}
 					if onChain != nil {
-						continue // tx landed, not expired
+						// The tx landed but this node reports no status for it,
+						// so nothing else will ever move it out of pending —
+						// getSignatureStatuses is the only other confirmation
+						// path and it is the thing that came back nil. Settle it
+						// here off a finalized-commitment read, which is the same
+						// evidence the "finalized" status branch below acts on.
+						final, err := w.rpc.getTransactionAtCommitment(ctx, tx.ID, "finalized")
+						if err != nil {
+							w.log.Debugf("expiry confirm finalized getTransaction: %v", err)
+							continue
+						}
+						if final == nil {
+							continue // landed but not yet rooted — check again next poll
+						}
+						tx.Confirmed = true
+						tx.Confirms = nil
+						if final.Meta != nil && final.Meta.Err != nil {
+							tx.Rejected = true
+						}
+						if final.Slot > 0 {
+							tx.BlockNumber = final.Slot
+						}
+						if err := w.txDB.StoreTx(tx); err != nil {
+							w.log.Errorf("StoreTx (nil-status finalized): %v", err)
+						} else if w.emit != nil {
+							w.emit.TransactionNote(tx, false)
+						}
+						continue
 					}
 					tx.Confirmed = true
 					tx.Rejected = true
@@ -739,10 +768,7 @@ func (w *Wallet) checkPendingTxs(ctx context.Context) error {
 		}
 		if onChain, err := w.rpc.getTransaction(ctx, tx.ID); err == nil && onChain != nil {
 			if parsed := walletTransactionFromRPC(onChain, w.address); parsed != nil {
-				parsed.RawTx = tx.RawTx
-				parsed.Confirmed = tx.Confirmed
-				parsed.Confirms = tx.Confirms
-				parsed.Rejected = tx.Rejected
+				mergePendingInto(parsed, tx)
 				tx = parsed
 			}
 		}
@@ -767,6 +793,37 @@ func walletTransactionFromRPC(tx *rpcTransaction, walletAddr string) *txdb.Walle
 		}
 	}
 	if ownIdx == -1 || ownIdx >= len(tx.Meta.PreBalances) || ownIdx >= len(tx.Meta.PostBalances) {
+		return nil
+	}
+	// Leave a pure spl-token transfer to the token wallet's parser. It moves no
+	// lamports of its own, so it would reach the balance-delta fallback below
+	// and yield a native record (TokenID nil) under the same signature the
+	// token wallet stores its record under. txdb keys on the signature and
+	// replaces wholesale, so the two would overwrite each other on every poll.
+	// checkPendingTxs guards the same hazard.
+	//
+	// The test is a transfer instruction specifically, not any spl-token
+	// instruction, because that is exactly the set walletTransactionFromSPLRPC
+	// claims. Every other spl-token instruction leaves the token parser
+	// returning nil, so yielding here would drop the transaction from history
+	// altogether: closeAccount refunds the ATA's rent to the wallet, and keyed
+	// off the program alone that lamport credit was never recorded anywhere.
+	//
+	// A lamport credit is likewise kept even alongside a transfer. A token send
+	// of ours only ever debits SOL — fee, plus rent when it creates the
+	// destination ATA — so an increase is native movement the token record
+	// cannot represent.
+	hasTokenTransfer := false
+	for _, inst := range tx.Transaction.Message.Instructions {
+		if inst.Program != "spl-token" || inst.Parsed == nil {
+			continue
+		}
+		if inst.Parsed.Type == "transfer" || inst.Parsed.Type == "transferChecked" {
+			hasTokenTransfer = true
+			break
+		}
+	}
+	if hasTokenTransfer && tx.Meta.PostBalances[ownIdx] <= tx.Meta.PreBalances[ownIdx] {
 		return nil
 	}
 	var (
@@ -836,6 +893,62 @@ func walletTransactionFromRPC(tx *rpcTransaction, walletAddr string) *txdb.Walle
 		Recipient:   recipient,
 		Rejected:    tx.Meta.Err != nil,
 		Confirmed:   confirmed,
+	}
+}
+
+// mergePendingInto carries the locally tracked state of pending record src onto
+// dst, the same transaction reparsed from chain data.
+//
+// walletTransactionFromRPC and walletTransactionFromSPLRPC both report
+// Confirmed unconditionally from a "confirmed"-commitment getTransaction and
+// carry no RawTx, so storing their output verbatim over a Send's record drops
+// the solTxData (kept in RawTx) that expiry detection needs and calls a
+// confirmed-but-not-finalized transaction final. checkPendingTxs owns the
+// finalized transition and distinguishes the two commitments deliberately.
+//
+// Rejected is OR'd rather than copied. It is monotonic — a transaction that
+// failed does not later succeed — and both sides can be the one that knows:
+// checkPendingTxs has just read it from the signature status, while a history
+// scan has just parsed it from the transaction's own metadata and its pending
+// record still says false. Copying either direction discards a rejection the
+// other side had already established.
+//
+// Every caller merges the same field set, so adding a field to solTxData or to
+// the tracked state only has to be handled here.
+func mergePendingInto(dst, src *txdb.WalletTransaction) {
+	dst.RawTx = src.RawTx
+	dst.Confirmed = src.Confirmed
+	dst.Confirms = src.Confirms
+	dst.Rejected = dst.Rejected || src.Rejected
+}
+
+// preservePendingData applies mergePendingInto to every record in wts that is
+// still pending, for a history scan that reparsed signatures it may already be
+// tracking. Records from GetPendingTxs are unconfirmed by construction — the
+// pending index is keyed on !Confirmed — so this leaves them pending.
+//
+// It reads the pending set once rather than probing each record: a backfill
+// page can carry a thousand transactions, and all but the handful still in
+// flight would be a miss.
+func preservePendingData(txDB txdb.NetworkTxDB, wts []*txdb.WalletTransaction, log util.Logger) {
+	pending, err := txDB.GetPendingTxs()
+	if err != nil {
+		log.Errorf("GetPendingTxs: %v", err)
+		return
+	}
+	if len(pending) == 0 {
+		return
+	}
+	byID := make(map[string]*txdb.WalletTransaction, len(pending))
+	for _, p := range pending {
+		byID[p.ID] = p
+	}
+	for _, wt := range wts {
+		existing, ok := byID[wt.ID]
+		if !ok {
+			continue
+		}
+		mergePendingInto(wt, existing)
 	}
 }
 

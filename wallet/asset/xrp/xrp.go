@@ -226,6 +226,19 @@ type xrpWallet struct {
 	baseReserve  uint64 // drops; from server_state, falls back to BaseReserveDrops
 	ownerReserve uint64 // drops per owned object; from server_state
 
+	// tokenSpecs are the issued currencies registered for this network. IOU
+	// payments arrive at the same account the native scanner walks, so the
+	// scanner records them itself; write-once in newWallet.
+	tokenSpecs []tokenSpec
+
+	// tokenEmitters holds the emitter of every connected TokenWallet, keyed by
+	// asset ID. This wallet parses and stores token records but cannot announce
+	// them itself: WalletEmitter stamps each note with the asset ID it was
+	// built for, and both Core and the UI route on that rather than on the
+	// record's TokenID, so a note sent through w.emit is filed against XRP.
+	tokenEmitterMtx sync.RWMutex
+	tokenEmitters   map[uint32]*asset.WalletEmitter
+
 	lastScannedLedger atomic.Uint64
 	scanMtx           sync.Mutex // prevents re-entrant scanAccountTxs
 
@@ -266,7 +279,50 @@ func newWallet(cfg *asset.WalletConfig, logger util.Logger, network util.Network
 		baseReserve:  BaseReserveDrops,
 		ownerReserve: OwnerReserveDrops,
 		txDB:         cfg.NetworkTxDB,
+		tokenSpecs:   networkTokenSpecs(network),
 	}, nil
+}
+
+// registerTokenEmitter records a connected TokenWallet's emitter so this
+// wallet can announce the token records it stores. Called from
+// TokenWallet.Connect; unregisterTokenEmitter undoes it when that wallet's
+// context is done. The map is built on first use, since a wallet with no token
+// wallet open never needs one.
+func (w *xrpWallet) registerTokenEmitter(assetID uint32, emit *asset.WalletEmitter) {
+	if emit == nil {
+		return
+	}
+	w.tokenEmitterMtx.Lock()
+	defer w.tokenEmitterMtx.Unlock()
+	if w.tokenEmitters == nil {
+		w.tokenEmitters = make(map[uint32]*asset.WalletEmitter)
+	}
+	w.tokenEmitters[assetID] = emit
+}
+
+func (w *xrpWallet) unregisterTokenEmitter(assetID uint32) {
+	w.tokenEmitterMtx.Lock()
+	defer w.tokenEmitterMtx.Unlock()
+	delete(w.tokenEmitters, assetID)
+}
+
+// emitTxNote announces wtx through the emitter that owns its asset: this
+// wallet's own for a native record, and the registered TokenWallet's for a
+// token record. A token whose wallet is not open has no emitter and is stored
+// without a note, which is correct — nothing is listening for it.
+func (w *xrpWallet) emitTxNote(wtx *txdb.WalletTransaction, isNew bool) {
+	if wtx.TokenID == nil {
+		if w.emit != nil {
+			w.emit.TransactionNote(wtx, isNew)
+		}
+		return
+	}
+	w.tokenEmitterMtx.RLock()
+	emit := w.tokenEmitters[*wtx.TokenID]
+	w.tokenEmitterMtx.RUnlock()
+	if emit != nil {
+		emit.TransactionNote(wtx, isNew)
+	}
 }
 
 // Unlock decrypts the private key using the wallet password.
@@ -533,14 +589,21 @@ func (w *xrpWallet) Balance() (*asset.Balance, error) {
 
 	reserve := baseReserve + ownerReservePerItem*uint64(validated.AccountData.OwnerCount)
 
-	var available uint64
+	// Clamp Locked to the balance. An account below its reserve — which
+	// happens as soon as it owns an object it can no longer cover — would
+	// otherwise report Available+Locked above what it actually holds. Mirrors
+	// sol's rent-exempt reserve handling.
+	var available, locked uint64
 	if currentBalance > reserve {
+		locked = reserve
 		available = currentBalance - reserve
+	} else {
+		locked = currentBalance
 	}
 
 	return &asset.Balance{
 		Available: available,
-		Locked:    reserve,
+		Locked:    locked,
 	}, nil
 }
 
@@ -922,6 +985,9 @@ func (w *xrpWallet) PendingTransactions(_ context.Context) []*txdb.WalletTransac
 // tx's type/amount from the wallet's own address — it only updates
 // BlockNumber/Timestamp/Confirmed/Rejected via meta looked up by the tx's
 // own ID.
+//
+// It announces token records through the owning TokenWallet's emitter rather
+// than its own; see emitTxNote.
 func (w *xrpWallet) checkPendingTxs(ctx context.Context) (balanceChanged bool) {
 	if w.txDB == nil {
 		return
@@ -967,9 +1033,7 @@ func (w *xrpWallet) checkPendingTxs(ctx context.Context) (balanceChanged bool) {
 				} else {
 					balanceChanged = true
 					w.log.Warnf("Transaction %s expired: LLS %d < tip %d", tx.ID, lls, tip)
-					if w.emit != nil {
-						w.emit.TransactionNote(tx, false)
-					}
+					w.emitTxNote(tx, false)
 				}
 			} else {
 				w.log.Tracef("Pending tx %s not yet confirmed: %v", tx.ID, err)
@@ -993,9 +1057,7 @@ func (w *xrpWallet) checkPendingTxs(ctx context.Context) (balanceChanged bool) {
 		}
 		balanceChanged = true
 		w.log.Infof("Transaction %s confirmed at ledger %d (result: %s)", tx.ID, tr.LedgerIndex, tr.Meta.TransactionResult)
-		if w.emit != nil {
-			w.emit.TransactionNote(tx, false)
-		}
+		w.emitTxNote(tx, false)
 	}
 	return
 }
@@ -1153,6 +1215,9 @@ func (w *xrpWallet) scanAccountTxs(ctx context.Context, newTip uint64) (balanceC
 
 			wtx := walletTransactionFromTx(tr, w.address, entry.Meta, entry.Validated, ledgerIdx)
 			if wtx == nil {
+				wtx = w.tokenTransaction(tr, entry.Meta, entry.Validated, ledgerIdx)
+			}
+			if wtx == nil {
 				// Non-payment tx: not stored but still marks progress.
 				if ledgerIdx > pageHigh {
 					pageHigh = ledgerIdx
@@ -1171,18 +1236,20 @@ func (w *xrpWallet) scanAccountTxs(ctx context.Context, newTip uint64) (balanceC
 				pageHigh = ledgerIdx
 			}
 
+			unit := "drops"
+			if wtx.TokenID != nil {
+				unit = "atoms"
+			}
 			if wtx.Type == txdb.Receive {
-				w.log.Infof("Detected incoming transfer %s: %d drops from %s", txID, wtx.Amount, tr.Account)
+				w.log.Infof("Detected incoming transfer %s: %d %s from %s", txID, wtx.Amount, unit, tr.Account)
 			} else {
 				recipient := ""
 				if wtx.Recipient != nil {
 					recipient = *wtx.Recipient
 				}
-				w.log.Infof("Detected historical send %s: %d drops to %s", txID, wtx.Amount, recipient)
+				w.log.Infof("Detected historical send %s: %d %s to %s", txID, wtx.Amount, unit, recipient)
 			}
-			if w.emit != nil {
-				w.emit.TransactionNote(wtx, true)
-			}
+			w.emitTxNote(wtx, true)
 		}
 
 		// H3: advance the persisted checkpoint after each page where all
@@ -1278,6 +1345,40 @@ func (w *xrpWallet) advanceLastScanned(seq uint64) {
 		return
 	}
 	w.lastScannedLedger.Store(seq)
+}
+
+// tokenTransaction tries to parse tr as a transfer of one of this network's
+// registered issued currencies, for the scanner to record. IOU payments land on
+// the same account the native scanner already walks, but walletTransactionFromTx
+// returns nil for non-drops amounts — so without this a received token never
+// reaches the tx DB and TxHistory stays empty while Balance() moves.
+//
+// Failed inbound payments are dropped here rather than in the parser, so that
+// TokenWallet.WalletTransaction can still answer for one by hash.
+func (w *xrpWallet) tokenTransaction(tr *txResult, meta txMeta, validated bool, ledgerIndex uint64) *txdb.WalletTransaction {
+	if failedInbound(tr, w.address, meta) {
+		return nil
+	}
+	for _, spec := range w.tokenSpecs {
+		if wtx := tokenTransactionFromTx(tr, w.address, meta, validated, ledgerIndex, spec); wtx != nil {
+			return wtx
+		}
+	}
+	return nil
+}
+
+// failedInbound reports whether tr is a payment to us, from someone else, that
+// did not succeed. Such a payment credited nothing and its Amount is whatever
+// the sender put there, so writing it to history would let anyone add an
+// arbitrary entry by sending a payment that cannot succeed (tecNO_LINE without
+// a trustline, tecPATH_DRY with one). Our own failed sends are unaffected:
+// Send pre-stores them and checkPendingTxs reconciles the result.
+func failedInbound(tr *txResult, walletAddr string, meta txMeta) bool {
+	if tr == nil {
+		return false
+	}
+	return tr.Destination == walletAddr && tr.Account != walletAddr &&
+		meta.TransactionResult != "tesSUCCESS"
 }
 
 func walletTransactionFromTx(tr *txResult, walletAddr string, meta txMeta, validated bool, ledgerIndex uint64) *txdb.WalletTransaction {

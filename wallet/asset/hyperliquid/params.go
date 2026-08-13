@@ -5,6 +5,7 @@ package hyperliquid
 
 import (
 	"fmt"
+	"math"
 	"strconv"
 	"strings"
 
@@ -17,10 +18,40 @@ const (
 	MaxBlockInterval = 45 // seconds before considered unsynced; must exceed wsPingInterval+wsWriteDeadline
 	keyFileName      = "hl-keyfile.json"
 
+	// atomsPerHYPE is UnitInfo's ConversionFactor as an integer constant, for
+	// the overflow bounds in parseHYPE.
+	atomsPerHYPE = 100_000_000
+
 	// pendingTTL is how long a pending send may wait for confirmation before
 	// it is considered permanently unconfirmed and removed from the DB.
 	// Hyperliquid finalizes in ~1 s; 120 s allows for WS reconnect lag.
 	pendingTTL = 120
+
+	// echoMatchWindowMS bounds how far a pending send's nonce may sit from a
+	// ledger echo's timestamp for confirmPendingSend to pair the two. Both are
+	// absolute times — the nonce is minted from our clock, u.Time comes from
+	// the ledger — so the gap is however long the server took to process the
+	// send, plus clock skew. It does not grow with delivery lag: an echo the
+	// REST catch-up replays hours later still carries its original ledger
+	// timestamp.
+	//
+	// A send cannot take longer than httpTimeout to be accepted, and a record
+	// that has waited pendingTTL is expired anyway, so this only has to exclude
+	// the wildly implausible — an echo from months back claiming an in-flight
+	// send, which Rescan replays whole history through.
+	echoMatchWindowMS = pendingTTL * 1000
+
+	// echoSkewAllowanceMS is how far past a record's OutcomeUnknownMS a ledger
+	// echo may still be attributed to it. That timestamp is an upper bound on
+	// when the send could have been processed, so in principle the allowance is
+	// zero; it exists only to absorb skew between our clock and ledger time.
+	//
+	// It has to stay below the gap between a failed send and the user's retry,
+	// which is what it is being used to distinguish, so it is kept small. Skew
+	// worse than this is already self-limiting: Hyperliquid rejects a nonce
+	// more than a day out, so a clock wrong enough to matter cannot send at
+	// all. Past that the pairing just degrades to plain FIFO.
+	echoSkewAllowanceMS = 1_000
 )
 
 var (
@@ -84,6 +115,13 @@ func parseHYPE(s string) (uint64, error) {
 	if err != nil {
 		return 0, fmt.Errorf("invalid HYPE amount %q: %w", s, err)
 	}
+	// The API is untrusted input, so reject values that do not fit rather
+	// than wrapping: scaling by 1e8 overflows uint64 far below ParseUint's
+	// own limit, and a wrapped value reads as a plausible small amount in
+	// Balance().Available and in ledger amounts.
+	if whole > math.MaxUint64/atomsPerHYPE {
+		return 0, fmt.Errorf("HYPE amount %q overflows uint64 atoms", s)
+	}
 	atoms := whole * 1e8
 	if len(parts) == 2 {
 		frac := parts[1]
@@ -96,6 +134,9 @@ func parseHYPE(s string) (uint64, error) {
 		fracVal, err := strconv.ParseUint(frac, 10, 64)
 		if err != nil {
 			return 0, fmt.Errorf("invalid HYPE decimal in %q: %w", s, err)
+		}
+		if fracVal > math.MaxUint64-atoms {
+			return 0, fmt.Errorf("HYPE amount %q overflows uint64 atoms", s)
 		}
 		atoms += fracVal
 	}
