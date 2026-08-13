@@ -5,9 +5,8 @@ package near
 
 import (
 	"context"
-	"crypto/ed25519"
-	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math/big"
 	"slices"
@@ -135,8 +134,8 @@ type TokenWallet struct {
 var _ asset.Wallet = (*TokenWallet)(nil)
 
 func (w *TokenWallet) Connect(ctx context.Context) (*sync.WaitGroup, error) {
-	if w.parent.rpc == nil {
-		return nil, fmt.Errorf("parent wallet not connected")
+	if _, err := w.parent.client(); err != nil {
+		return nil, fmt.Errorf("parent wallet not connected: %w", err)
 	}
 	var wg sync.WaitGroup
 	return &wg, nil
@@ -159,7 +158,11 @@ func (w *TokenWallet) Balance() (*asset.Balance, error) {
 }
 
 func (w *TokenWallet) ftBalanceOf(accountID string) (uint64, error) {
-	raw, err := w.parent.rpc.callFunction(w.parent.ctx, w.contractID, "ft_balance_of", map[string]string{"account_id": accountID})
+	rpc, err := w.parent.client()
+	if err != nil {
+		return 0, err
+	}
+	raw, err := rpc.callFunction(w.parent.ctx, w.contractID, "ft_balance_of", map[string]string{"account_id": accountID})
 	if err != nil {
 		return 0, fmt.Errorf("ft_balance_of: %w", err)
 	}
@@ -177,7 +180,11 @@ func (w *TokenWallet) ftBalanceOf(accountID string) (uint64, error) {
 // storageRegistered reports whether accountID is registered to hold this
 // token, per storage_balance_of.
 func (w *TokenWallet) storageRegistered(accountID string) (bool, error) {
-	raw, err := w.parent.rpc.callFunction(w.parent.ctx, w.contractID, "storage_balance_of", map[string]string{"account_id": accountID})
+	rpc, err := w.parent.client()
+	if err != nil {
+		return false, err
+	}
+	raw, err := rpc.callFunction(w.parent.ctx, w.contractID, "storage_balance_of", map[string]string{"account_id": accountID})
 	if err != nil {
 		return false, fmt.Errorf("storage_balance_of: %w", err)
 	}
@@ -257,37 +264,55 @@ func (w *TokenWallet) Send(address string, value, _ uint64) (asset.Coin, error) 
 	}
 	actions = append(actions, functionCallAction("ft_transfer", amountArgs, ftTransferGas, big.NewInt(ftTransferDepositYocto)))
 
-	w.parent.nonceMtx.Lock()
-	defer w.parent.nonceMtx.Unlock()
-
-	nonce, err := w.parent.reserveNonce()
+	rpc, err := w.parent.client()
 	if err != nil {
 		return nil, err
 	}
 
-	w.parent.tipMtx.RLock()
-	blockHash := w.parent.tipHash
-	w.parent.tipMtx.RUnlock()
-
-	tx := &nearTransaction{
-		signerID:   w.parent.accountID,
-		publicKey:  [32]byte(w.parent.pubKey),
-		nonce:      nonce,
-		receiverID: w.contractID,
-		blockHash:  blockHash,
-		actions:    actions,
-	}
-
-	txBytes := serializeTransaction(tx)
-	hash := sha256.Sum256(txBytes)
-	sig := ed25519.Sign(privKey, hash[:])
-	signedTx := serializeSignedTransaction(txBytes, sig)
-	encoded := encodeSignedTx(signedTx)
+	// Shared with the native send path: nonce reservation plus a single
+	// fresh-nonce retry on an authoritative InvalidNonce rejection.
+	result, hash, refHeight, err := w.parent.sendActions(w.parent.ctx, rpc, privKey, w.contractID, actions)
 
 	txID := base58.Encode(hash[:])
 
-	if _, err := w.parent.rpc.broadcastTxAsync(w.parent.ctx, encoded); err != nil {
+	var rejected bool
+	var failureMsg string
+	switch {
+	case err == nil:
+		if result.Status.Failure != nil {
+			// Executed but the actions failed: terminal, nonce consumed.
+			// Record it as confirmed-and-rejected so the burnt gas is
+			// visible in history, then report the failure.
+			rejected = true
+			failureMsg = string(result.Status.Failure)
+		}
+	case errors.Is(err, errBroadcastAmbiguous):
+		// The broadcast may or may not have been accepted. Record the
+		// transaction as pending; the tip poller resolves the final status.
+		// Returning an error here would invite a retry that could
+		// double-send. The nonce was already reserved, so it is not reused.
+		w.parent.log.Warnf("Token transfer %s broadcast outcome unknown; recording as pending: %v", txID, err)
+	default:
 		return nil, fmt.Errorf("error broadcasting transaction: %w", err)
+	}
+
+	// The transaction fee is paid in NEAR gas, so it is recorded in the
+	// parent asset's units — which is how token transaction fees are
+	// displayed. Prefer the actual burnt gas; fall back to an estimate only
+	// when the execution outcome is not yet known (ambiguous broadcast),
+	// priced at this transaction's attached gas budget — not a bare
+	// transfer's, which is orders of magnitude lower — until the pending
+	// poller replaces it with the actual burn.
+	var fees uint64
+	if err == nil {
+		fees = result.feeDrops()
+	}
+	if fees == 0 {
+		gasBudget := int64(ftTransferGas)
+		if !registered {
+			gasBudget += storageDepositGas
+		}
+		fees = w.parent.estimateFeeAtGas(gasBudget)
 	}
 
 	recipient := address
@@ -295,9 +320,17 @@ func (w *TokenWallet) Send(address string, value, _ uint64) (asset.Coin, error) 
 		Type:      txdb.Send,
 		ID:        txID,
 		Amount:    value,
-		Fees:      0, // fee is paid in NEAR gas, not the token itself
+		Fees:      fees,
 		Recipient: &recipient,
 		TokenID:   &w.assetID,
+		Confirmed: rejected,
+		Rejected:  rejected,
+		// The reference height lets the pending poller prove the
+		// transaction dead if the network never sees it.
+		AdditionalData: map[string]string{refHeightKey: strconv.FormatUint(refHeight, 10)},
+	}
+	if rejected {
+		wtx.BlockNumber, wtx.Timestamp = w.parent.resolveBlock(w.parent.ctx, rpc, result.TransactionOutcome.BlockHash)
 	}
 	if w.txDB != nil {
 		if err := w.txDB.StoreTx(wtx); err != nil {
@@ -308,6 +341,9 @@ func (w *TokenWallet) Send(address string, value, _ uint64) (asset.Coin, error) 
 		w.emit.TransactionNote(wtx, true)
 	}
 
+	if rejected {
+		return nil, fmt.Errorf("token transfer failed on-chain: %s", failureMsg)
+	}
 	return &coin{txHash: hash, value: value}, nil
 }
 

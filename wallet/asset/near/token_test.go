@@ -81,7 +81,7 @@ func (m *mockNearRPC) serve(w http.ResponseWriter, r *http.Request) {
 }
 
 func (m *mockNearRPC) client() *rpcClient {
-	c, err := newRPCClient(m.srv.URL, "", util.Disabled)
+	c, err := newRPCClient([]string{m.srv.URL}, "", util.Disabled)
 	if err != nil {
 		m.t.Fatalf("newRPCClient: %v", err)
 	}
@@ -110,9 +110,9 @@ func makeTokenTestWallet(t *testing.T, m *mockNearRPC) *TokenWallet {
 		pubKey:    pub,
 		privKey:   priv,
 		accountID: "sender.near",
-		rpc:       m.client(),
 		log:       util.Disabled,
 	}
+	parent.rpc.Store(m.client())
 	return &TokenWallet{
 		parent:     parent,
 		assetID:    usdcTokenID,
@@ -189,8 +189,8 @@ func TestTokenWalletSendHappyPathRegistersStorage(t *testing.T) {
 		}
 		return nil, &rpcError{Message: "unexpected query", Code: -1}
 	})
-	m.handle("broadcast_tx_async", func(_ json.RawMessage) (any, *rpcError) {
-		return "somehash", nil
+	m.handle("send_tx", func(_ json.RawMessage) (any, *rpcError) {
+		return successOutcome("22770000000000000000"), nil
 	})
 
 	_, err := tw.Send(dest, 1_000_000, 0)
@@ -199,9 +199,63 @@ func TestTokenWalletSendHappyPathRegistersStorage(t *testing.T) {
 	}
 }
 
+// TestTokenWalletSendInvalidNonceRetry covers the fresh-nonce retry on the
+// token path, shared with the native send path through sendActions: an
+// authoritative InvalidNonce rejection means the transaction did not
+// execute, so a single retry with a refreshed nonce is a new send, not a
+// potential duplicate.
+func TestTokenWalletSendInvalidNonceRetry(t *testing.T) {
+	m := newMockNearRPC(t)
+	tw := makeTokenTestWallet(t, m)
+
+	m.handle("query", func(params json.RawMessage) (any, *rpcError) {
+		var p map[string]any
+		_ = json.Unmarshal(params, &p)
+		switch p["request_type"] {
+		case "call_function":
+			switch p["method_name"] {
+			case "ft_balance_of":
+				return callFunctionResult("10000000"), nil
+			case "storage_balance_of":
+				return callFunctionResult(map[string]string{"total": "1"}), nil // registered
+			}
+		case "view_access_key":
+			if p["finality"] == "optimistic" {
+				return map[string]any{"nonce": uint64(15)}, nil
+			}
+			return map[string]any{"nonce": uint64(10)}, nil
+		}
+		return nil, &rpcError{Message: "unexpected query", Code: -1}
+	})
+	var sends int
+	m.handle("send_tx", func(_ json.RawMessage) (any, *rpcError) {
+		sends++
+		if sends == 1 {
+			return nil, &rpcError{
+				Name:    "HANDLER_ERROR",
+				Cause:   &rpcErrorCause{Name: "INVALID_TRANSACTION"},
+				Code:    -32000,
+				Message: "Server error",
+				Data:    json.RawMessage(`{"TxExecutionError":{"InvalidTxError":{"InvalidNonce":{"tx_nonce":11,"ak_nonce":15}}}}`),
+			}
+		}
+		return successOutcome("22770000000000000000"), nil
+	})
+
+	if _, err := tw.Send("receiver.near", 1_000_000, 0); err != nil {
+		t.Fatalf("Send error: %v", err)
+	}
+	if sends != 2 {
+		t.Fatalf("send_tx called %d times, want 2 (one retry)", sends)
+	}
+	if tw.parent.nonce != 16 {
+		t.Fatalf("nonce watermark %d, want 16", tw.parent.nonce)
+	}
+}
+
 // TestReserveNonceAdvancesPastPending guards against a nonce collision: NEAR
 // only advances an account's on-chain nonce once a transaction is included
-// in a block, but broadcastTxAsync returns before that happens. Two sends
+// in a block, and the final access-key view lags further still. Two sends
 // issued back-to-back (native or token, sharing nonceMtx) must not both
 // compute the same nonce from a still-stale access-key view.
 func TestReserveNonceAdvancesPastPending(t *testing.T) {
@@ -211,9 +265,10 @@ func TestReserveNonceAdvancesPastPending(t *testing.T) {
 		// test, simulating a transaction still pending inclusion.
 		return map[string]any{"nonce": uint64(5)}, nil
 	})
-	w := &NearWallet{ctx: context.Background(), rpc: m.client()}
+	w := &NearWallet{}
+	rpc := m.client()
 
-	n1, err := w.reserveNonce()
+	n1, err := w.reserveNonce(context.Background(), rpc)
 	if err != nil {
 		t.Fatalf("reserveNonce (1st) error: %v", err)
 	}
@@ -221,7 +276,7 @@ func TestReserveNonceAdvancesPastPending(t *testing.T) {
 		t.Fatalf("n1 = %d, want 6", n1)
 	}
 
-	n2, err := w.reserveNonce()
+	n2, err := w.reserveNonce(context.Background(), rpc)
 	if err != nil {
 		t.Fatalf("reserveNonce (2nd) error: %v", err)
 	}

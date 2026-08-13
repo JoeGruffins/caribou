@@ -69,7 +69,7 @@ func manualMasterKey(t *testing.T) (ed25519.PrivateKey, ed25519.PublicKey) {
 
 func manualTestRPC(t *testing.T) *rpcClient {
 	t.Helper()
-	c, err := newRPCClient(manualHarnessRPC, "", util.Disabled)
+	c, err := newRPCClient([]string{manualHarnessRPC}, "", util.Disabled)
 	if err != nil {
 		t.Fatalf("newRPCClient: %v", err)
 	}
@@ -290,10 +290,10 @@ func TestManualNEP141TokenRoundTrip(t *testing.T) {
 		pubKey:    senderPub,
 		privKey:   senderPriv,
 		accountID: senderAccountID,
-		rpc:       rpc,
 		log:       util.Disabled,
 		net:       util.Simnet,
 	}
+	parent.rpc.Store(rpc)
 	// Send() reads a cached tipHash normally kept fresh by the background
 	// tip poller started in Connect(), which this harness never runs.
 	// Without this, tipHash is the zero value, and NEAR silently rejects
