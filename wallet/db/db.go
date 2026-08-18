@@ -14,6 +14,7 @@ import (
 	"github.com/bisoncraft/caribou/util"
 	"github.com/bisoncraft/caribou/util/encode"
 	"github.com/bisoncraft/caribou/util/kvstore"
+	"github.com/bisoncraft/caribou/util/kvstore/engine"
 )
 
 // Table names. Neither engine supports nested namespaces, so the layout is
@@ -67,7 +68,7 @@ const widLen = 4
 const maxNotePrealloc = 256
 
 // kvDB implements DB over a kvstore.Store: Badger (util/lexi) on desktop,
-// bbolt (util/glossi) on mobile, selected at build time by util/kvstore.
+// bbolt (util/glossi) on mobile, selected at build time by util/kvstore/engine.
 type kvDB struct {
 	store kvstore.Store
 	log   util.Logger
@@ -100,7 +101,7 @@ var _ DB = (*kvDB)(nil)
 // New opens the database at path — a directory on desktop, a file on mobile —
 // creating it if it does not exist.
 func New(path string, log util.Logger) (DB, error) {
-	store, err := kvstore.New(path, log)
+	store, err := engine.New(path, log)
 	if err != nil {
 		return nil, err
 	}
@@ -195,7 +196,7 @@ func (d *kvDB) SetPrimaryCredentials(creds *PrimaryCredentials) error {
 	if err := validateCreds(creds); err != nil {
 		return err
 	}
-	return d.app.Set(credsKey, creds.Encode(), true)
+	return d.app.Set(credsKey, creds.Encode(), kvstore.WithReplace())
 }
 
 // PrimaryCredentials retrieves the *PrimaryCredentials. It is
@@ -247,7 +248,7 @@ func (d *kvDB) UpdateWallet(wallet *Wallet) error {
 		{K: fieldKey(assetID, balanceTag), V: wallet.Balance.Encode()},
 		{K: fieldKey(assetID, addressTag), V: []byte(wallet.Address)},
 		{K: fieldKey(assetID, encPWTag), V: wallet.EncryptedPW},
-	}, true)
+	}, kvstore.WithReplace())
 }
 
 // SetWalletPassword sets the encrypted password for the wallet. It is
@@ -256,7 +257,7 @@ func (d *kvDB) SetWalletPassword(assetID uint32, newEncPW []byte) error {
 	if err := d.walletExists(assetID); err != nil {
 		return err
 	}
-	return d.wallets.Set(fieldKey(assetID, encPWTag), newEncPW, true)
+	return d.wallets.Set(fieldKey(assetID, encPWTag), newEncPW, kvstore.WithReplace())
 }
 
 // SetWalletAddress sets the last known deposit address for the wallet. It is
@@ -265,7 +266,7 @@ func (d *kvDB) SetWalletAddress(assetID uint32, addr string) error {
 	if err := d.walletExists(assetID); err != nil {
 		return err
 	}
-	return d.wallets.Set(fieldKey(assetID, addressTag), []byte(addr), true)
+	return d.wallets.Set(fieldKey(assetID, addressTag), []byte(addr), kvstore.WithReplace())
 }
 
 // UpdateBalance updates a wallet's balance. It is ErrWalletNotFound if the
@@ -274,7 +275,7 @@ func (d *kvDB) UpdateBalance(assetID uint32, bal *Balance) error {
 	if err := d.walletExists(assetID); err != nil {
 		return err
 	}
-	return d.wallets.Set(fieldKey(assetID, balanceTag), bal.Encode(), true)
+	return d.wallets.Set(fieldKey(assetID, balanceTag), bal.Encode(), kvstore.WithReplace())
 }
 
 // UpdateWalletStatus updates a wallet's disabled status. It is
@@ -287,7 +288,7 @@ func (d *kvDB) UpdateWalletStatus(assetID uint32, disable bool) error {
 	if disable {
 		v = encode.ByteTrue
 	}
-	return d.wallets.Set(fieldKey(assetID, disabledTag), v, true)
+	return d.wallets.Set(fieldKey(assetID, disabledTag), v, kvstore.WithReplace())
 }
 
 // walletRow collects the field records of a single wallet during iteration.
@@ -361,7 +362,7 @@ func (d *kvDB) Wallets() ([]*Wallet, error) {
 			}
 			return nil
 		})
-	}, false, nil)
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -409,15 +410,23 @@ func (d *kvDB) Wallet(assetID uint32) (*Wallet, error) {
 	return row.assemble(assetID)
 }
 
-// encodeNoteRecord encodes a notes-table value: the notification encoding
-// plus its ack flag, in a versioned envelope. noteB must be the encoding from
-// (*Notification).Encode.
-func encodeNoteRecord(noteB []byte, ack bool) []byte {
+// noteRecord is the value inserted into the notes table: the notification and
+// its ack flag. The typed record is what gets passed to Set, so the stamp
+// index recovers it with a type assertion and reads the timestamp directly
+// instead of decoding the stored bytes.
+type noteRecord struct {
+	note *Notification
+	ack  bool
+}
+
+// MarshalBinary satisfies encoding.BinaryMarshaler, encoding the notification
+// encoding plus the ack flag in a versioned envelope.
+func (r *noteRecord) MarshalBinary() ([]byte, error) {
 	ackB := encode.ByteFalse
-	if ack {
+	if r.ack {
 		ackB = encode.ByteTrue
 	}
-	return versionedBytes(0).AddData(noteB).AddData(ackB)
+	return versionedBytes(0).AddData(r.note.Encode()).AddData(ackB), nil
 }
 
 // decodeNoteRecord splits a notes-table value into the raw notification
@@ -438,17 +447,13 @@ func decodeNoteRecord(b []byte) (noteB []byte, ack bool, _ error) {
 }
 
 // noteStampIndexFunc derives the stamp index entry — the notification's
-// 8-byte big-endian timestamp — from a notes-table value.
-func noteStampIndexFunc(_, v []byte) ([]byte, error) {
-	noteB, _, err := decodeNoteRecord(v)
-	if err != nil {
-		return nil, err
+// 8-byte big-endian timestamp — from the *noteRecord under insertion.
+func noteStampIndexFunc(_, vI kvstore.KV) ([]byte, error) {
+	rec, ok := vI.(*noteRecord)
+	if !ok {
+		return nil, fmt.Errorf("expected *noteRecord value, got %T", vI)
 	}
-	note, err := DecodeNotification(noteB)
-	if err != nil {
-		return nil, err
-	}
-	return uint64Bytes(note.TimeStamp), nil
+	return uint64Bytes(rec.note.TimeStamp), nil
 }
 
 // SaveNotification saves the notification. Re-saving a notification preserves
@@ -468,7 +473,7 @@ func (d *kvDB) SaveNotification(note *Notification) error {
 	} else if !errors.Is(err, kvstore.ErrKeyNotFound) {
 		return err
 	}
-	return d.notes.Set(id, encodeNoteRecord(note.Encode(), ack), true)
+	return d.notes.Set(id, &noteRecord{note: note, ack: ack}, kvstore.WithReplace())
 }
 
 // AckNotification sets the acknowledgement flag for the notification.
@@ -486,7 +491,11 @@ func (d *kvDB) AckNotification(id []byte) error {
 	if err != nil {
 		return err
 	}
-	return d.notes.Set(id, encodeNoteRecord(noteB, true), true)
+	note, err := DecodeNotification(noteB)
+	if err != nil {
+		return err
+	}
+	return d.notes.Set(id, &noteRecord{note: note, ack: true}, kvstore.WithReplace())
 }
 
 // NotificationsN reads out the N most recent notifications, newest first.
@@ -523,7 +532,7 @@ func (d *kvDB) NotificationsN(n int) ([]*Notification, error) {
 			return kvstore.ErrEndIteration
 		}
 		return nil
-	}, true, nil)
+	}, kvstore.WithReverse())
 	if err != nil {
 		return nil, err
 	}
@@ -537,7 +546,7 @@ func (d *kvDB) SavePokes(pokes []*Notification) error {
 	if err != nil {
 		return fmt.Errorf("JSON marshal error: %w", err)
 	}
-	return d.app.Set(pokesKey, b, true)
+	return d.app.Set(pokesKey, b, kvstore.WithReplace())
 }
 
 // LoadPokes loads the slice of notifications last saved with SavePokes. The
@@ -569,7 +578,7 @@ func (d *kvDB) SaveDisabledRateSources(disabledSources []string) error {
 	if err != nil {
 		return fmt.Errorf("JSON marshal error: %w", err)
 	}
-	return d.app.Set(disabledRateSourcesKey, b, true)
+	return d.app.Set(disabledRateSourcesKey, b, kvstore.WithReplace())
 }
 
 // DisabledRateSources retrieves disabled fiat rate sources.
@@ -594,7 +603,7 @@ func (d *kvDB) SetLanguage(lang string) error {
 	if lang == "" {
 		return deleteIfExists(d.app, langKey)
 	}
-	return d.app.Set(langKey, []byte(lang), true)
+	return d.app.Set(langKey, []byte(lang), kvstore.WithReplace())
 }
 
 // Language gets the language stored with SetLanguage. If no language has been
@@ -609,7 +618,7 @@ func (d *kvDB) SetCompanionToken(token string) error {
 	if token == "" {
 		return deleteIfExists(d.app, companionTokenKey)
 	}
-	return d.app.Set(companionTokenKey, []byte(token), true)
+	return d.app.Set(companionTokenKey, []byte(token), kvstore.WithReplace())
 }
 
 // CompanionToken retrieves the companion app auth token hash stored with
@@ -625,7 +634,7 @@ func (d *kvDB) SetAPIToken(token string) error {
 	if token == "" {
 		return deleteIfExists(d.app, apiTokenKey)
 	}
-	return d.app.Set(apiTokenKey, []byte(token), true)
+	return d.app.Set(apiTokenKey, []byte(token), kvstore.WithReplace())
 }
 
 // APIToken retrieves the local API token hash stored with SetAPIToken. If no
@@ -654,7 +663,7 @@ func (d *kvDB) SetSendRequiresPassword(require bool) error {
 	if !require {
 		return deleteIfExists(d.app, sendRequiresPwKey)
 	}
-	return d.app.Set(sendRequiresPwKey, encode.ByteTrue, true)
+	return d.app.Set(sendRequiresPwKey, encode.ByteTrue, kvstore.WithReplace())
 }
 
 // SendRequiresPassword retrieves whether sending requires the app password.
@@ -686,7 +695,7 @@ func (d *kvDB) NextMultisigKeyIndex(assetID uint32) (uint32, error) {
 	} else if !errors.Is(err, kvstore.ErrKeyNotFound) {
 		return 0, err
 	}
-	if err := d.multisigIndexes.Set(k, uint32Bytes(idx+1), true); err != nil {
+	if err := d.multisigIndexes.Set(k, uint32Bytes(idx+1), kvstore.WithReplace()); err != nil {
 		return 0, err
 	}
 	return idx, nil
@@ -703,7 +712,7 @@ func pubkeyKey(assetID uint32, pubkey [33]byte) []byte {
 // StoreMultisigIndexForPubkey stores the key index for the compressed pubkey
 // bytes of assetID.
 func (d *kvDB) StoreMultisigIndexForPubkey(assetID, idx uint32, pubkey [33]byte) error {
-	return d.multisigPubkeys.Set(pubkeyKey(assetID, pubkey), uint32Bytes(idx), true)
+	return d.multisigPubkeys.Set(pubkeyKey(assetID, pubkey), uint32Bytes(idx), kvstore.WithReplace())
 }
 
 // MultisigIndexForPubkey returns the key index for the compressed pubkey

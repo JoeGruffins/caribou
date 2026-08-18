@@ -8,34 +8,35 @@ import (
 	"errors"
 	"fmt"
 
-	"github.com/bisoncraft/caribou/util"
+	"github.com/bisoncraft/caribou/util/kvstore"
 	"github.com/dgraph-io/badger/v4"
 )
 
 const (
 	// ErrEndIteration can be returned from the function passed to Iterate
 	// to end iteration. No error will be returned from Iterate.
-	ErrEndIteration = util.ErrorKind("end iteration")
+	ErrEndIteration = kvstore.ErrEndIteration
 	// ErrNotIndexed can be returned from the function passed to AddIndex
 	// to indicate that a datum should not be added to the index.
-	ErrNotIndexed = util.ErrorKind("not indexed")
+	ErrNotIndexed = kvstore.ErrNotIndexed
 )
 
 // Index is just a lexicographically-ordered list of byte slices. An Index is
 // associated with a Table, and a datum inserted into a table can put entries
 // into the Index. The Index can be iterated to view sorted data in the table.
+// Index implements kvstore.StoreIndex.
 type Index struct {
 	*DB
 	name                    string
 	table                   *Table
 	prefix                  keyPrefix
-	f                       func(k, v KV) ([]byte, error)
+	f                       kvstore.IndexFunc
 	unique                  bool
-	defaultIterationOptions iteratorOpts
+	defaultIterationOptions kvstore.IterationOpts
 }
 
-func (t *Table) addIndex(name string, f func(k, v KV) ([]byte, error), unique bool) (*Index, error) {
-	p, err := t.prefixForName(t.name + "__idx__" + name)
+func (t *Table) addIndex(name string, f kvstore.IndexFunc, unique bool) (*Index, error) {
+	p, err := t.prefixForName(t.name + indexNameSeparator + name)
 	if err != nil {
 		return nil, err
 	}
@@ -54,8 +55,12 @@ func (t *Table) addIndex(name string, f func(k, v KV) ([]byte, error), unique bo
 // AddIndex adds an index to a Table. After an index is added, every item
 // added to the Table with Set will automatically generate a corresponding
 // entry in this index.
-func (t *Table) AddIndex(name string, f func(k, v KV) ([]byte, error)) (*Index, error) {
-	return t.addIndex(name, f, false)
+func (t *Table) AddIndex(name string, f kvstore.IndexFunc) (kvstore.StoreIndex, error) {
+	idx, err := t.addIndex(name, f, false)
+	if err != nil {
+		return nil, err
+	}
+	return idx, nil
 }
 
 // AddUniqueIndex adds a unique index to a Table. After an index is added, every
@@ -65,8 +70,12 @@ func (t *Table) AddIndex(name string, f func(k, v KV) ([]byte, error)) (*Index, 
 // duplicate in the unique index, an error will be returned. However, if Set() is
 // called with the WithReplace() option, the existing entry will be overwritten
 // instead.
-func (t *Table) AddUniqueIndex(name string, f func(k, v KV) ([]byte, error)) (*Index, error) {
-	return t.addIndex(name, f, true)
+func (t *Table) AddUniqueIndex(name string, f kvstore.IndexFunc) (kvstore.StoreIndex, error) {
+	idx, err := t.addIndex(name, f, true)
+	if err != nil {
+		return nil, err
+	}
+	return idx, nil
 }
 
 // uniqueIndexConflictError is returned when a unique index conflict is encountered.
@@ -143,53 +152,16 @@ func (idx *Index) add(txn *badger.Txn, k, v KV, dbID DBID) ([]byte, error) {
 	return b, nil
 }
 
-type iteratorOpts struct {
-	update  bool
-	reverse bool
-	seek    []byte
-}
-
-// IterationOption is a knob to change how Iterate runs on an Index.
-type IterationOption func(opts *iteratorOpts)
-
-// WithUpdate must be used if the caller intends to make modifications during
-// iteration, such as deleting elements.
-func WithUpdate() IterationOption {
-	return func(opts *iteratorOpts) {
-		opts.update = true
-	}
-}
-
-// WithReverse sets the direction of iteration to reverse-lexicographical.
-func WithReverse() IterationOption {
-	return func(opts *iteratorOpts) {
-		opts.reverse = true
-	}
-}
-
-// WithForward sets the direction of iteration to lexicographical.
-func WithForward() IterationOption {
-	return func(opts *iteratorOpts) {
-		opts.reverse = false
-	}
-}
-
-// WithSeek starts iteration at the specified prefix.
-func WithSeek(prefix []byte) IterationOption {
-	return func(opts *iteratorOpts) {
-		opts.seek = prefix
-	}
-}
-
 // UseDefaultIterationOptions sets default options for Iterate.
-func (idx *Index) UseDefaultIterationOptions(optss ...IterationOption) {
+func (idx *Index) UseDefaultIterationOptions(optss ...kvstore.IterationOption) {
 	for i := range optss {
 		optss[i](&idx.defaultIterationOptions)
 	}
 }
 
 // Iter is an entry in the Index or Table. The caller can use Iter to access and
-// delete data associated with the entry and it's datum.
+// delete data associated with the entry and it's datum. Iter implements
+// kvstore.StoreIter.
 type Iter struct {
 	table   *Table
 	isIndex bool
@@ -197,6 +169,9 @@ type Iter struct {
 	txn     *badger.Txn
 	dbID    DBID
 	d       *datum
+	// update records whether the iteration runs in a read-write transaction
+	// (WithUpdate), which Delete requires.
+	update bool
 	// k is the caller's key, set during table iteration where the key-map entry
 	// already carries it. Nil during index iteration, where K resolves it.
 	k []byte
@@ -220,8 +195,8 @@ func (i *Iter) K() ([]byte, error) {
 	}
 	item, err := i.txn.Get(PrefixedKey(IdToKeyPrefix, i.dbID[:]))
 	if err != nil {
-		if errors.Is(err, ErrKeyNotFound) {
-			return nil, fmt.Errorf("dangling entry for table %q: %w", i.table.name, err)
+		if errors.Is(err, badger.ErrKeyNotFound) {
+			return nil, fmt.Errorf("dangling entry for table %q: %w", i.table.name, ErrKeyNotFound)
 		}
 		return nil, err
 	}
@@ -259,8 +234,12 @@ func (i *Iter) datum() (_ *datum, err error) {
 	return i.d, nil
 }
 
-// Delete deletes the indexed datum and any associated index entries.
+// Delete deletes the indexed datum and any associated index entries. The
+// iteration must have been started with WithUpdate.
 func (i *Iter) Delete() error {
+	if !i.update {
+		return errors.New("lexi: Delete requires WithUpdate")
+	}
 	d, err := i.datum()
 	if err != nil {
 		return err
@@ -270,7 +249,7 @@ func (i *Iter) Delete() error {
 
 // Iterate iterates the index, providing access to the index entry, datum, and
 // datum key via the Iter.
-func (idx *Index) Iterate(prefixI KV, f func(*Iter) error, iterOpts ...IterationOption) error {
+func (idx *Index) Iterate(prefixI KV, f func(kvstore.StoreIter) error, iterOpts ...kvstore.IterationOption) error {
 	return idx.iterate(idx.prefix[:], idx.table, idx.defaultIterationOptions, true, prefixI, f, iterOpts...)
 }
 
@@ -279,8 +258,8 @@ func (idx *Index) Iterate(prefixI KV, f func(*Iter) error, iterOpts ...Iteration
 // prefix and seek are appended to it, so both are interpreted in the space that
 // range is ordered by - index-entry order for an index, user-key order for a
 // table.
-func (db *DB) iterate(base []byte, table *Table, io iteratorOpts, isIndex bool, prefixI KV, f func(*Iter) error, iterOpts ...IterationOption) error {
-	prefix, err := parseKV(prefixI)
+func (db *DB) iterate(base []byte, table *Table, io kvstore.IterationOpts, isIndex bool, prefixI KV, f func(kvstore.StoreIter) error, iterOpts ...kvstore.IterationOption) error {
+	prefix, err := kvstore.ParseKV(prefixI)
 	if err != nil {
 		return err
 	}
@@ -288,11 +267,11 @@ func (db *DB) iterate(base []byte, table *Table, io iteratorOpts, isIndex bool, 
 		iterOpts[i](&io)
 	}
 	iterFunc := iteratePrefix
-	if io.reverse {
+	if io.Reverse {
 		iterFunc = reverseIteratePrefix
 	}
 	viewUpdate := db.View
-	if io.update {
+	if io.Update {
 		viewUpdate = db.Update
 	}
 	joined := func(b []byte) []byte {
@@ -302,8 +281,8 @@ func (db *DB) iterate(base []byte, table *Table, io iteratorOpts, isIndex bool, 
 		return k
 	}
 	var seek []byte
-	if len(io.seek) > 0 {
-		seek = joined(io.seek)
+	if len(io.Seek) > 0 {
+		seek = joined(io.Seek)
 	}
 	return viewUpdate(func(txn *badger.Txn) error {
 		return iterFunc(txn, joined(prefix), seek, func(iter *badger.Iterator) error {
@@ -315,6 +294,7 @@ func (db *DB) iterate(base []byte, table *Table, io iteratorOpts, isIndex bool, 
 				table:   table,
 				item:    item,
 				txn:     txn,
+				update:  io.Update,
 			}
 			if isIndex {
 				if len(k) < PrefixSize+DBIDSize {

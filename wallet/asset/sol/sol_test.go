@@ -12,6 +12,7 @@ import (
 	"testing"
 
 	"github.com/bisoncraft/caribou/util"
+	"github.com/bisoncraft/caribou/util/kvstore"
 	"github.com/bisoncraft/caribou/wallet/asset/keystore"
 	"github.com/bisoncraft/caribou/wallet/txdb"
 	"github.com/decred/base58"
@@ -145,29 +146,47 @@ type mockTable struct {
 
 func newMockTable() *mockTable { return &mockTable{data: make(map[string][]byte)} }
 
-func (t *mockTable) Get(k []byte) ([]byte, error) {
-	v, ok := t.data[string(k)]
+func (t *mockTable) Get(k txdb.KV, _ ...txdb.GetOption) ([]byte, error) {
+	kB, err := kvstore.ParseKV(k)
+	if err != nil {
+		return nil, err
+	}
+	v, ok := t.data[string(kB)]
 	if !ok {
 		return nil, txdb.ErrKeyNotFound
 	}
 	return v, nil
 }
-func (t *mockTable) Set(k, v []byte, _ bool) error {
-	t.data[string(k)] = v
+func (t *mockTable) Set(k, v txdb.KV, _ ...txdb.SetOption) error {
+	kB, err := kvstore.ParseKV(k)
+	if err != nil {
+		return err
+	}
+	vB, err := kvstore.ParseKV(v)
+	if err != nil {
+		return err
+	}
+	t.data[string(kB)] = vB
 	return nil
 }
-func (t *mockTable) Delete(k []byte) error {
-	delete(t.data, string(k))
+func (t *mockTable) Delete(k txdb.KV) error {
+	kB, err := kvstore.ParseKV(k)
+	if err != nil {
+		return err
+	}
+	delete(t.data, string(kB))
 	return nil
 }
-func (t *mockTable) SetBatch(_ []txdb.BatchEntry, _ bool) error { return nil }
+func (t *mockTable) SetBatch(_ []txdb.BatchEntry, _ ...txdb.SetOption) error { return nil }
+func (t *mockTable) UseDefaultSetOptions(_ ...txdb.SetOption)                {}
+func (t *mockTable) UseDefaultIterationOptions(_ ...txdb.IterationOption)    {}
 func (t *mockTable) AddIndex(_ string, _ txdb.IndexFunc) (txdb.StoreIndex, error) {
 	return nil, nil
 }
 func (t *mockTable) AddUniqueIndex(_ string, _ txdb.IndexFunc) (txdb.StoreIndex, error) {
 	return nil, nil
 }
-func (t *mockTable) Iterate(_ []byte, _ func(txdb.StoreIter) error, _ bool, _ []byte) error {
+func (t *mockTable) Iterate(_ txdb.KV, _ func(txdb.StoreIter) error, _ ...txdb.IterationOption) error {
 	return nil
 }
 
@@ -668,7 +687,7 @@ func TestBackfillHistory(t *testing.T) {
 	t.Run("fetches and stores sigs older than beforeCursor", func(t *testing.T) {
 		db := &mockTxDB{}
 		table := newMockTable()
-		_ = table.Set(metaKey(BipID, beforeCursorField), []byte("sig501"), true)
+		_ = table.Set(metaKey(BipID, beforeCursorField), []byte("sig501"), txdb.WithReplace())
 
 		rpc := &mockRPC{
 			sigsFunc: func(before, until *string, _ int) ([]signatureInfo, error) {
@@ -701,7 +720,7 @@ func TestBackfillHistory(t *testing.T) {
 	t.Run("page-capped backfill advances beforeCursor", func(t *testing.T) {
 		db := &mockTxDB{}
 		table := newMockTable()
-		_ = table.Set(metaKey(BipID, beforeCursorField), []byte("sig501"), true)
+		_ = table.Set(metaKey(BipID, beforeCursorField), []byte("sig501"), txdb.WithReplace())
 
 		// 1000 sigs, newest-first in the old range: sig500 .. sig-499.
 		allSigs := make([]signatureInfo, 1000)
@@ -734,7 +753,7 @@ func TestBackfillHistory(t *testing.T) {
 	t.Run("fetch errors skip individual sigs without stopping", func(t *testing.T) {
 		db := &mockTxDB{}
 		table := newMockTable()
-		_ = table.Set(metaKey(BipID, beforeCursorField), []byte("sig4"), true)
+		_ = table.Set(metaKey(BipID, beforeCursorField), []byte("sig4"), txdb.WithReplace())
 
 		rpc := &mockRPC{
 			sigsFunc: func(_, _ *string, _ int) ([]signatureInfo, error) {
@@ -763,7 +782,7 @@ func TestBackfillHistory(t *testing.T) {
 		// so the same batch is retried on the next call.
 		db := &mockTxDB{storeTxsErr: fmt.Errorf("disk full")}
 		table := newMockTable()
-		_ = table.Set(metaKey(BipID, beforeCursorField), []byte("sig501"), true)
+		_ = table.Set(metaKey(BipID, beforeCursorField), []byte("sig501"), txdb.WithReplace())
 
 		allSigs := make([]signatureInfo, 1000)
 		for i := range allSigs {
@@ -796,7 +815,7 @@ func TestBackfillHistory(t *testing.T) {
 		// when StoreTxs fails, so the tail is retried next run.
 		db := &mockTxDB{storeTxsErr: fmt.Errorf("disk full")}
 		table := newMockTable()
-		_ = table.Set(metaKey(BipID, beforeCursorField), []byte("sig4"), true)
+		_ = table.Set(metaKey(BipID, beforeCursorField), []byte("sig4"), txdb.WithReplace())
 
 		rpc := &mockRPC{
 			sigsFunc: func(_, _ *string, _ int) ([]signatureInfo, error) {
@@ -820,8 +839,8 @@ func TestBackfillHistory(t *testing.T) {
 	t.Run("backfillUntil is passed as until and cleared on completion", func(t *testing.T) {
 		db := &mockTxDB{}
 		table := newMockTable()
-		_ = table.Set(metaKey(BipID, beforeCursorField), []byte("sig501"), true)
-		_ = table.Set(metaKey(BipID, backfillUntilField), []byte("sig100"), true)
+		_ = table.Set(metaKey(BipID, beforeCursorField), []byte("sig501"), txdb.WithReplace())
+		_ = table.Set(metaKey(BipID, backfillUntilField), []byte("sig100"), txdb.WithReplace())
 
 		var gotUntil *string
 		rpc := &mockRPC{

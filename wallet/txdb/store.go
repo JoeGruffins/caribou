@@ -10,6 +10,9 @@ import "github.com/bisoncraft/caribou/util/kvstore"
 // use them to manage their own auxiliary tables through NetworkTxDB.
 
 type (
+	// KV is a key or value argument accepted by the store: raw bytes, one of
+	// a few common scalar types, or an encoding.BinaryMarshaler.
+	KV = kvstore.KV
 	// Store is an indexed key-value store.
 	Store = kvstore.Store
 	// StoreTable is a namespaced section of a Store that supports secondary
@@ -23,7 +26,33 @@ type (
 	IndexFunc = kvstore.IndexFunc
 	// BatchEntry is a single key/value pair for StoreTable.SetBatch.
 	BatchEntry = kvstore.BatchEntry
+	// SetOption is a knob controlling StoreTable.Set and SetBatch.
+	SetOption = kvstore.SetOption
+	// GetOption is a knob controlling StoreTable.Get.
+	GetOption = kvstore.GetOption
+	// IterationOption is a knob controlling Iterate on a table or index.
+	IterationOption = kvstore.IterationOption
 )
+
+// The option constructors are re-exported as functions rather than assigned
+// package variables so an importer cannot reassign them.
+
+// WithReplace allows replacing a pre-existing value when calling Set.
+func WithReplace() SetOption { return kvstore.WithReplace() }
+
+// WithReverse sets the direction of iteration to reverse-lexicographical.
+func WithReverse() IterationOption { return kvstore.WithReverse() }
+
+// WithSeek starts iteration at the specified key.
+func WithSeek(seek []byte) IterationOption { return kvstore.WithSeek(seek) }
+
+// WithUpdate must be used if an Iterate callback intends to modify the
+// database, e.g. via StoreIter.Delete.
+func WithUpdate() IterationOption { return kvstore.WithUpdate() }
+
+// WithForward sets the direction of iteration to lexicographical, clearing a
+// WithReverse default established with UseDefaultIterationOptions.
+func WithForward() IterationOption { return kvstore.WithForward() }
 
 const (
 	// ErrKeyNotFound is returned by StoreTable.Get when a key is absent.

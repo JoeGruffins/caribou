@@ -63,9 +63,10 @@ type NetworkTxDB interface {
 // TxIndex is a wallet-defined secondary index over a network's transactions,
 // returned by AddTxIndex/AddUniqueTxIndex.
 type TxIndex interface {
-	// Iterate visits the network's transactions in index order. prefix and seek
-	// are in index-entry space (the bytes returned by the index function).
-	Iterate(prefix []byte, f func(*WalletTransaction) error, reverse bool, seek []byte) error
+	// Iterate visits the network's transactions in index order. prefix and
+	// WithSeek are in index-entry space (the bytes returned by the index
+	// function).
+	Iterate(prefix []byte, f func(*WalletTransaction) error, opts ...IterationOption) error
 }
 
 // networkTxDB is the concrete NetworkTxDB, a thin view over TxDB scoped to one
@@ -107,7 +108,7 @@ func (n *networkTxDB) GetAssetPendingTxs(assetID *uint32) ([]*WalletTransaction,
 
 // resolveAssetID returns assetID if set, otherwise this network's own
 // native-asset ID (the ID that WalletTransaction.TokenID-unset records are
-// stored under; see encodeRecord).
+// stored under; see newTxRecord).
 func (n *networkTxDB) resolveAssetID(assetID *uint32) uint32 {
 	if assetID != nil {
 		return *assetID
@@ -131,17 +132,18 @@ func (n *networkTxDB) Table(name string) (StoreTable, error) {
 
 // txIndexFunc wraps a wallet-supplied index function so the index lives on the
 // shared txs table but is scoped to this network: records belonging to other
-// networks are skipped.
+// networks are skipped. The record under insertion arrives typed, so the
+// wallet's function gets its *WalletTransaction without any decoding.
 func (n *networkTxDB) txIndexFunc(f func(*WalletTransaction) ([]byte, error)) IndexFunc {
-	return func(_, v []byte) ([]byte, error) {
-		wt, recNet, err := decodeRecord(v)
+	return func(_, vI KV) ([]byte, error) {
+		rec, err := txRecordV(vI)
 		if err != nil {
 			return nil, err
 		}
-		if recNet != n.network {
+		if rec.network != n.network {
 			return nil, ErrNotIndexed
 		}
-		return f(wt)
+		return f(rec.wt)
 	}
 }
 
@@ -168,12 +170,12 @@ type txIndex struct {
 	idx StoreIndex
 }
 
-func (i *txIndex) Iterate(prefix []byte, f func(*WalletTransaction) error, reverse bool, seek []byte) error {
+func (i *txIndex) Iterate(prefix []byte, f func(*WalletTransaction) error, opts ...IterationOption) error {
 	return i.idx.Iterate(prefix, func(it StoreIter) error {
 		wt, err := decodeIter(it)
 		if err != nil {
 			return err
 		}
 		return f(wt)
-	}, reverse, seek)
+	}, opts...)
 }

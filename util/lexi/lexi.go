@@ -5,7 +5,6 @@ package lexi
 
 import (
 	"context"
-	"encoding"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -13,13 +12,15 @@ import (
 	"time"
 
 	"github.com/bisoncraft/caribou/util"
+	"github.com/bisoncraft/caribou/util/kvstore"
 	"github.com/dgraph-io/badger/v4"
 )
 
-// ErrKeyNotFound is an alias for badger.ErrKeyNotFound so that the caller
-// doesn't have to import badger to use the semantics. Either error will satisfy
-// errors.Is the same.
-var ErrKeyNotFound = badger.ErrKeyNotFound
+// ErrKeyNotFound is returned when a requested key is not in the database. It
+// is kvstore's sentinel, matching glossi, so consumers don't have to care
+// which engine is in use; badger.ErrKeyNotFound is translated to it at this
+// package's boundary (see convertError).
+const ErrKeyNotFound = kvstore.ErrKeyNotFound
 
 // ErrDBClosed is returned by Update once the context passed to Connect has been
 // canceled. It is an alias for badger.ErrDBClosed, which is what a write that
@@ -33,6 +34,15 @@ func convertError(err error) error {
 	}
 	return err
 }
+
+// The engine chooser (util/kvstore/engine) only compiles this engine's
+// conformance on desktop builds, so it is asserted here for every build.
+var (
+	_ kvstore.Store      = (*DB)(nil)
+	_ kvstore.StoreTable = (*Table)(nil)
+	_ kvstore.StoreIndex = (*Index)(nil)
+	_ kvstore.StoreIter  = (*Iter)(nil)
+)
 
 // DB is the Lexi DB. The Lexi DB wraps a badger key-value database and provides
 // the ability to add indexed data.
@@ -244,15 +254,18 @@ func (db *DB) nextID() (dbID DBID, _ error) {
 	return
 }
 
-// KeyID returns the DBID for the key within this Table. This is the same DBID
-// that will be used internally for the key when a datum is inserted with Set.
-// This method is provided as a tool to keep database index entries short.
-func (t *Table) KeyID(kB []byte) (dbID DBID, err error) {
-	err = t.View(func(txn *badger.Txn) error {
+// keyDBID returns the DBID for the key within this Table. This is the same
+// DBID that is used internally for the key when a datum is inserted with Set.
+// (Named apart from the embedded DB's keyID, which would otherwise be
+// shadowed.)
+func (t *Table) keyDBID(kB []byte) (DBID, error) {
+	var dbID DBID
+	err := t.View(func(txn *badger.Txn) error {
+		var err error
 		dbID, err = t.keyID(txn, t.prefix, kB, true)
 		return err
 	})
-	return
+	return dbID, convertError(err)
 }
 
 // keyID resolves a table-scoped key to its DBID, assigning one if the key is
@@ -273,7 +286,7 @@ func (db *DB) keyID(txn *badger.Txn, tPrefix keyPrefix, kB []byte, readOnly bool
 		})
 		return
 	}
-	if !readOnly && errors.Is(err, ErrKeyNotFound) {
+	if !readOnly && errors.Is(err, badger.ErrKeyNotFound) {
 		if dbID, err = db.nextID(); err != nil {
 			return
 		}
@@ -321,24 +334,6 @@ func (db *DB) deleteDBID(txn *badger.Txn, dbID DBID) error {
 }
 
 // KV is any one of a number of common types whose binary encoding is
-// straight-forward.
-type KV any
-
-func parseKV(i KV) (b []byte, err error) {
-	switch it := i.(type) {
-	case []byte:
-		b = it
-	case uint32:
-		b = make([]byte, 4)
-		binary.BigEndian.PutUint32(b[:], it)
-	case time.Time:
-		b = make([]byte, 8)
-		binary.BigEndian.PutUint64(b[:], uint64(it.UnixMilli()))
-	case encoding.BinaryMarshaler:
-		b, err = it.MarshalBinary()
-	case nil:
-	default:
-		err = fmt.Errorf("unknown IndexBucket type %T", it)
-	}
-	return
-}
+// straight-forward. It is an alias of kvstore.KV; see kvstore.ParseKV for the
+// supported types.
+type KV = kvstore.KV

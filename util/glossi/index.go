@@ -8,17 +8,17 @@ import (
 	"errors"
 	"fmt"
 
-	"github.com/bisoncraft/caribou/util"
+	"github.com/bisoncraft/caribou/util/kvstore"
 	"go.etcd.io/bbolt"
 )
 
 const (
 	// ErrEndIteration can be returned from an Iterate callback to end iteration
 	// without returning an error.
-	ErrEndIteration = util.ErrorKind("end iteration")
+	ErrEndIteration = kvstore.ErrEndIteration
 	// ErrNotIndexed can be returned from an index function to indicate that a
 	// datum should not be added to the index.
-	ErrNotIndexed = util.ErrorKind("not indexed")
+	ErrNotIndexed = kvstore.ErrNotIndexed
 )
 
 // Index is a lexicographically-ordered secondary index on a Table. Each datum
@@ -36,24 +36,42 @@ type Index struct {
 	table  *Table
 	name   string
 	id     byte
-	f      func(k, v []byte) ([]byte, error)
+	f      kvstore.IndexFunc
 	unique bool
+
+	defaultIterationOptions kvstore.IterationOpts
+}
+
+// UseDefaultIterationOptions sets default options for Iterate.
+func (idx *Index) UseDefaultIterationOptions(opts ...kvstore.IterationOption) {
+	for _, opt := range opts {
+		opt(&idx.defaultIterationOptions)
+	}
 }
 
 // AddIndex adds a non-unique index to the Table. After an index is added, every
-// item added with Set generates a corresponding entry.
-func (t *Table) AddIndex(name string, f func(k, v []byte) ([]byte, error)) (*Index, error) {
-	return t.addIndex(name, f, false)
+// item added with Set generates a corresponding entry. The index function
+// receives the caller's original (unparsed) key and value KVs, as with lexi.
+func (t *Table) AddIndex(name string, f kvstore.IndexFunc) (kvstore.StoreIndex, error) {
+	idx, err := t.addIndex(name, f, false)
+	if err != nil {
+		return nil, err
+	}
+	return idx, nil
 }
 
 // AddUniqueIndex adds a unique index to the Table. Set will return
 // ErrUniqueConflict if an insert would create a duplicate index value, unless
 // WithReplace is specified.
-func (t *Table) AddUniqueIndex(name string, f func(k, v []byte) ([]byte, error)) (*Index, error) {
-	return t.addIndex(name, f, true)
+func (t *Table) AddUniqueIndex(name string, f kvstore.IndexFunc) (kvstore.StoreIndex, error) {
+	idx, err := t.addIndex(name, f, true)
+	if err != nil {
+		return nil, err
+	}
+	return idx, nil
 }
 
-func (t *Table) addIndex(name string, f func(k, v []byte) ([]byte, error), unique bool) (*Index, error) {
+func (t *Table) addIndex(name string, f kvstore.IndexFunc, unique bool) (*Index, error) {
 	if name == "" {
 		return nil, errors.New("glossi: empty index name")
 	}
@@ -89,17 +107,18 @@ func (t *Table) addIndex(name string, f func(k, v []byte) ([]byte, error), uniqu
 }
 
 // entryKey returns the full index-bucket key (indexID||indexEntry||primaryKey)
-// for the datum (k, v). It returns ErrNotIndexed (from f) if the datum should
-// not be indexed.
-func (idx *Index) entryKey(k, v []byte) ([]byte, error) {
+// for the datum (k, v). kB is k's parsed encoding, which is what the entry key
+// embeds; k and v themselves are handed to the index function unparsed. It
+// returns ErrNotIndexed (from f) if the datum should not be indexed.
+func (idx *Index) entryKey(k, v KV, kB []byte) ([]byte, error) {
 	idxB, err := idx.f(k, v)
 	if err != nil {
 		return nil, err
 	}
-	key := make([]byte, 1+len(idxB)+len(k))
+	key := make([]byte, 1+len(idxB)+len(kB))
 	key[0] = idx.id
 	copy(key[1:], idxB)
-	copy(key[1+len(idxB):], k)
+	copy(key[1+len(idxB):], kB)
 	return key, nil
 }
 
@@ -118,47 +137,26 @@ func (idx *Index) uniqueConflict(index *bbolt.Bucket, fullKey, k []byte) []byte 
 	return nil
 }
 
-type iterOpts struct {
-	reverse bool
-	update  bool
-	seek    []byte
-}
-
-// IterationOption is a knob controlling how Iterate runs.
-type IterationOption func(*iterOpts)
-
-// WithReverse sets the direction of iteration to reverse-lexicographical.
-func WithReverse() IterationOption {
-	return func(o *iterOpts) { o.reverse = true }
-}
-
-// WithUpdate must be used if the callback intends to modify the database during
-// iteration, e.g. via Iter.Delete.
-func WithUpdate() IterationOption {
-	return func(o *iterOpts) { o.update = true }
-}
-
-// WithSeek starts iteration at the specified index-space prefix.
-func WithSeek(prefix []byte) IterationOption {
-	return func(o *iterOpts) { o.seek = prefix }
-}
-
 // Iterate iterates the index in entry order. prefix, if non-empty, constrains
 // iteration to index entries beginning with it (in index space, i.e. without
 // the internal index id). The key and value exposed via the Iter are only valid
 // for the duration of the callback.
-func (idx *Index) Iterate(prefix []byte, f func(*Iter) error, opts ...IterationOption) error {
-	var o iterOpts
+func (idx *Index) Iterate(prefixI KV, f func(kvstore.StoreIter) error, opts ...kvstore.IterationOption) error {
+	prefix, err := kvstore.ParseKV(prefixI)
+	if err != nil {
+		return fmt.Errorf("glossi: error marshaling prefix: %w", err)
+	}
+	o := idx.defaultIterationOptions
 	for _, opt := range opts {
 		opt(&o)
 	}
 	bound := append([]byte{idx.id}, prefix...)
 	var seek []byte
-	if len(o.seek) > 0 {
-		seek = append([]byte{idx.id}, o.seek...)
+	if len(o.Seek) > 0 {
+		seek = append([]byte{idx.id}, o.Seek...)
 	}
 	run := idx.table.db.View
-	if o.update {
+	if o.Update {
 		run = idx.table.db.Update
 	}
 	return run(func(tx *bbolt.Tx) error {
@@ -166,7 +164,7 @@ func (idx *Index) Iterate(prefix []byte, f func(*Iter) error, opts ...IterationO
 		index := tb.Bucket(indexBucketKey)
 		data := tb.Bucket(dataBucketKey)
 		c := index.Cursor()
-		return walk(c, bound, seek, o.reverse, func(entryKey, k []byte) error {
+		return walk(c, bound, seek, o.Reverse, func(entryKey, k []byte) error {
 			raw := data.Get(k)
 			if raw == nil {
 				return fmt.Errorf("dangling index entry for index %q", idx.name)
@@ -180,6 +178,7 @@ func (idx *Index) Iterate(prefix []byte, f func(*Iter) error, opts ...IterationO
 				v:       value,
 				entry:   entryKey,
 				kLen:    len(k),
+				update:  o.Update,
 				index:   index,
 				dataBkt: data,
 			})
@@ -187,14 +186,17 @@ func (idx *Index) Iterate(prefix []byte, f func(*Iter) error, opts ...IterationO
 	})
 }
 
-// Iter is an entry yielded during iteration of a Table or Index.
+// Iter is an entry yielded during iteration of a Table or Index. Iter
+// implements kvstore.StoreIter.
 type Iter struct {
 	k     []byte
 	v     []byte
 	entry []byte // index entry key (index iteration only); nil for table iteration
 	kLen  int
 
-	// For Delete during iteration (requires WithUpdate).
+	// update records whether the iteration runs in a read-write transaction
+	// (WithUpdate), which Delete requires.
+	update  bool
 	index   *bbolt.Bucket
 	dataBkt *bbolt.Bucket
 }
@@ -220,7 +222,7 @@ func (i *Iter) Entry(f func(idxB []byte) error) error {
 // Delete removes the datum at the current entry along with all of its index
 // entries. The iteration must have been started with WithUpdate.
 func (i *Iter) Delete() error {
-	if i.index == nil || i.dataBkt == nil {
+	if !i.update {
 		return errors.New("glossi: Delete requires WithUpdate")
 	}
 	raw := i.dataBkt.Get(i.k)

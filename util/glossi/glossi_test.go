@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/bisoncraft/caribou/util"
+	"github.com/bisoncraft/caribou/util/kvstore"
 	"go.etcd.io/bbolt"
 )
 
@@ -36,7 +37,7 @@ func u64(v uint64) []byte {
 
 func TestSetGetDelete(t *testing.T) {
 	db := newTestDB(t)
-	tbl, err := db.Table("things")
+	tbl, err := db.table("things")
 	if err != nil {
 		t.Fatalf("Table: %v", err)
 	}
@@ -58,7 +59,7 @@ func TestSetGetDelete(t *testing.T) {
 		t.Fatal("expected error replacing without WithReplace")
 	}
 	// Replacing with WithReplace must succeed.
-	if err := tbl.Set(k, []byte("value2"), WithReplace()); err != nil {
+	if err := tbl.Set(k, []byte("value2"), kvstore.WithReplace()); err != nil {
 		t.Fatalf("Set replace: %v", err)
 	}
 	got, _ = tbl.Get(k)
@@ -79,7 +80,7 @@ func TestSetGetDelete(t *testing.T) {
 
 func TestZeroLengthKey(t *testing.T) {
 	db := newTestDB(t)
-	tbl, _ := db.Table("things")
+	tbl, _ := db.table("things")
 	if err := tbl.Set(nil, []byte("v")); err == nil {
 		t.Fatal("expected error for zero-length key")
 	}
@@ -87,7 +88,7 @@ func TestZeroLengthKey(t *testing.T) {
 
 func TestSetBatch(t *testing.T) {
 	db := newTestDB(t)
-	tbl, err := db.Table("things")
+	tbl, err := db.table("things")
 	if err != nil {
 		t.Fatalf("Table: %v", err)
 	}
@@ -97,7 +98,7 @@ func TestSetBatch(t *testing.T) {
 		t.Fatalf("SetBatch(nil): %v", err)
 	}
 
-	entries := []KV{
+	entries := []kvstore.BatchEntry{
 		{K: []byte("k1"), V: []byte("v1")},
 		{K: []byte("k2"), V: []byte("v2")},
 		{K: []byte("k3"), V: []byte("v3")},
@@ -107,13 +108,13 @@ func TestSetBatch(t *testing.T) {
 	}
 	for _, e := range entries {
 		got, err := tbl.Get(e.K)
-		if err != nil || !bytes.Equal(got, e.V) {
+		if err != nil || !bytes.Equal(got, e.V.([]byte)) {
 			t.Fatalf("Get(%q) = %q, %v", e.K, got, err)
 		}
 	}
 
 	// A zero-length key anywhere in the batch is rejected before any write.
-	if err := tbl.SetBatch([]KV{{K: []byte("k4"), V: []byte("v4")}, {K: nil, V: []byte("x")}}); err == nil {
+	if err := tbl.SetBatch([]kvstore.BatchEntry{{K: []byte("k4"), V: []byte("v4")}, {K: nil, V: []byte("x")}}); err == nil {
 		t.Fatal("expected error for zero-length key in batch")
 	}
 	if _, err := tbl.Get([]byte("k4")); !errors.Is(err, ErrKeyNotFound) {
@@ -122,7 +123,7 @@ func TestSetBatch(t *testing.T) {
 
 	// Without WithReplace, a conflict mid-batch rolls back the whole batch:
 	// the earlier entry in the same batch must not persist.
-	err = tbl.SetBatch([]KV{
+	err = tbl.SetBatch([]kvstore.BatchEntry{
 		{K: []byte("fresh"), V: []byte("a")},
 		{K: []byte("k1"), V: []byte("dup")}, // k1 already exists -> conflict
 	})
@@ -134,7 +135,7 @@ func TestSetBatch(t *testing.T) {
 	}
 
 	// With WithReplace, existing keys are updated.
-	if err := tbl.SetBatch([]KV{{K: []byte("k1"), V: []byte("v1-new")}}, WithReplace()); err != nil {
+	if err := tbl.SetBatch([]kvstore.BatchEntry{{K: []byte("k1"), V: []byte("v1-new")}}, kvstore.WithReplace()); err != nil {
 		t.Fatalf("SetBatch replace: %v", err)
 	}
 	if got, _ := tbl.Get([]byte("k1")); !bytes.Equal(got, []byte("v1-new")) {
@@ -143,13 +144,14 @@ func TestSetBatch(t *testing.T) {
 }
 
 // blockIndexFunc indexes a value whose first 8 bytes are a big-endian uint64.
-func blockIndexFunc(_, v []byte) ([]byte, error) {
+func blockIndexFunc(_, vI KV) ([]byte, error) {
+	v := vI.([]byte)
 	return v[:8], nil
 }
 
 func TestIndexIterationOrder(t *testing.T) {
 	db := newTestDB(t)
-	tbl, _ := db.Table("txs")
+	tbl, _ := db.table("txs")
 	idx, err := tbl.AddIndex("block", blockIndexFunc)
 	if err != nil {
 		t.Fatalf("AddIndex: %v", err)
@@ -164,9 +166,9 @@ func TestIndexIterationOrder(t *testing.T) {
 		}
 	}
 
-	collect := func(opts ...IterationOption) []uint64 {
+	collect := func(opts ...kvstore.IterationOption) []uint64 {
 		var out []uint64
-		err := idx.Iterate(nil, func(it *Iter) error {
+		err := idx.Iterate(nil, func(it kvstore.StoreIter) error {
 			return it.V(func(v []byte) error {
 				out = append(out, binary.BigEndian.Uint64(v[:8]))
 				return nil
@@ -184,7 +186,7 @@ func TestIndexIterationOrder(t *testing.T) {
 		t.Fatalf("forward order = %v, want %v", fwd, want)
 	}
 
-	rev := collect(WithReverse())
+	rev := collect(kvstore.WithReverse())
 	wantRev := []uint64{50, 40, 30, 20, 10}
 	if !equalU64(rev, wantRev) {
 		t.Fatalf("reverse order = %v, want %v", rev, wantRev)
@@ -193,7 +195,7 @@ func TestIndexIterationOrder(t *testing.T) {
 
 func TestIndexSeek(t *testing.T) {
 	db := newTestDB(t)
-	tbl, _ := db.Table("txs")
+	tbl, _ := db.table("txs")
 	idx, _ := tbl.AddIndex("block", blockIndexFunc)
 	for i, b := range []uint64{10, 20, 30, 40, 50} {
 		if err := tbl.Set([]byte{byte('a' + i)}, u64(b)); err != nil {
@@ -203,24 +205,24 @@ func TestIndexSeek(t *testing.T) {
 
 	// Forward seek to block 30 should yield 30,40,50.
 	var fwd []uint64
-	idx.Iterate(nil, func(it *Iter) error {
+	idx.Iterate(nil, func(it kvstore.StoreIter) error {
 		return it.V(func(v []byte) error {
 			fwd = append(fwd, binary.BigEndian.Uint64(v[:8]))
 			return nil
 		})
-	}, WithSeek(u64(30)))
+	}, kvstore.WithSeek(u64(30)))
 	if !equalU64(fwd, []uint64{30, 40, 50}) {
 		t.Fatalf("forward seek = %v", fwd)
 	}
 
 	// Reverse seek to block 30 should yield 30,20,10.
 	var rev []uint64
-	idx.Iterate(nil, func(it *Iter) error {
+	idx.Iterate(nil, func(it kvstore.StoreIter) error {
 		return it.V(func(v []byte) error {
 			rev = append(rev, binary.BigEndian.Uint64(v[:8]))
 			return nil
 		})
-	}, WithReverse(), WithSeek(u64(30)))
+	}, kvstore.WithReverse(), kvstore.WithSeek(u64(30)))
 	if !equalU64(rev, []uint64{30, 20, 10}) {
 		t.Fatalf("reverse seek = %v", rev)
 	}
@@ -228,7 +230,7 @@ func TestIndexSeek(t *testing.T) {
 
 func TestUniqueIndex(t *testing.T) {
 	db := newTestDB(t)
-	tbl, _ := db.Table("txs")
+	tbl, _ := db.table("txs")
 	// Unique index on the first 8 bytes of the value.
 	if _, err := tbl.AddUniqueIndex("nonce", blockIndexFunc); err != nil {
 		t.Fatalf("AddUniqueIndex: %v", err)
@@ -243,7 +245,7 @@ func TestUniqueIndex(t *testing.T) {
 		t.Fatalf("expected ErrUniqueConflict, got %v", err)
 	}
 	// Same key, replace -> ok.
-	if err := tbl.Set([]byte("k1"), append(u64(7), 'x'), WithReplace()); err != nil {
+	if err := tbl.Set([]byte("k1"), append(u64(7), 'x'), kvstore.WithReplace()); err != nil {
 		t.Fatalf("replace same key: %v", err)
 	}
 	// A different index value for a new key -> ok.
@@ -254,15 +256,15 @@ func TestUniqueIndex(t *testing.T) {
 
 func TestReplacePurgesIndexEntries(t *testing.T) {
 	db := newTestDB(t)
-	tbl, _ := db.Table("txs")
+	tbl, _ := db.table("txs")
 	idx, _ := tbl.AddIndex("block", blockIndexFunc)
 
 	tbl.Set([]byte("k1"), u64(100))
 	// Move it to a new block; old index entry must be purged.
-	tbl.Set([]byte("k1"), u64(200), WithReplace())
+	tbl.Set([]byte("k1"), u64(200), kvstore.WithReplace())
 
 	var blocks []uint64
-	idx.Iterate(nil, func(it *Iter) error {
+	idx.Iterate(nil, func(it kvstore.StoreIter) error {
 		return it.V(func(v []byte) error {
 			blocks = append(blocks, binary.BigEndian.Uint64(v[:8]))
 			return nil
@@ -275,9 +277,10 @@ func TestReplacePurgesIndexEntries(t *testing.T) {
 
 func TestNotIndexed(t *testing.T) {
 	db := newTestDB(t)
-	tbl, _ := db.Table("txs")
+	tbl, _ := db.table("txs")
 	// Index only values whose first byte is 1.
-	idx, _ := tbl.AddIndex("selective", func(_, v []byte) ([]byte, error) {
+	idx, _ := tbl.AddIndex("selective", func(_, vI KV) ([]byte, error) {
+		v := vI.([]byte)
 		if v[0] != 1 {
 			return nil, ErrNotIndexed
 		}
@@ -287,7 +290,7 @@ func TestNotIndexed(t *testing.T) {
 	tbl.Set([]byte("skipped"), append([]byte{0}, u64(6)...))
 
 	var n int
-	idx.Iterate(nil, func(it *Iter) error { n++; return nil })
+	idx.Iterate(nil, func(it kvstore.StoreIter) error { n++; return nil })
 	if n != 1 {
 		t.Fatalf("expected 1 indexed entry, got %d", n)
 	}
@@ -295,13 +298,13 @@ func TestNotIndexed(t *testing.T) {
 
 func TestEndIteration(t *testing.T) {
 	db := newTestDB(t)
-	tbl, _ := db.Table("txs")
+	tbl, _ := db.table("txs")
 	idx, _ := tbl.AddIndex("block", blockIndexFunc)
 	for i, b := range []uint64{10, 20, 30, 40, 50} {
 		tbl.Set([]byte{byte('a' + i)}, u64(b))
 	}
 	var seen int
-	err := idx.Iterate(nil, func(it *Iter) error {
+	err := idx.Iterate(nil, func(it kvstore.StoreIter) error {
 		seen++
 		if seen == 2 {
 			return ErrEndIteration
@@ -318,13 +321,13 @@ func TestEndIteration(t *testing.T) {
 
 func TestDeleteDuringIteration(t *testing.T) {
 	db := newTestDB(t)
-	tbl, _ := db.Table("txs")
+	tbl, _ := db.table("txs")
 	idx, _ := tbl.AddIndex("block", blockIndexFunc)
 	for i, b := range []uint64{10, 20, 30} {
 		tbl.Set([]byte{byte('a' + i)}, u64(b))
 	}
 	// Delete block 20 during iteration.
-	err := idx.Iterate(nil, func(it *Iter) error {
+	err := idx.Iterate(nil, func(it kvstore.StoreIter) error {
 		var del bool
 		it.V(func(v []byte) error {
 			del = binary.BigEndian.Uint64(v[:8]) == 20
@@ -334,12 +337,12 @@ func TestDeleteDuringIteration(t *testing.T) {
 			return it.Delete()
 		}
 		return nil
-	}, WithUpdate())
+	}, kvstore.WithUpdate())
 	if err != nil {
 		t.Fatalf("Iterate w/ delete: %v", err)
 	}
 	var blocks []uint64
-	idx.Iterate(nil, func(it *Iter) error {
+	idx.Iterate(nil, func(it kvstore.StoreIter) error {
 		return it.V(func(v []byte) error {
 			blocks = append(blocks, binary.BigEndian.Uint64(v[:8]))
 			return nil
@@ -352,13 +355,13 @@ func TestDeleteDuringIteration(t *testing.T) {
 
 func TestTablePrefixIteration(t *testing.T) {
 	db := newTestDB(t)
-	tbl, _ := db.Table("kv")
+	tbl, _ := db.table("kv")
 	tbl.Set([]byte("apple"), []byte("1"))
 	tbl.Set([]byte("apricot"), []byte("2"))
 	tbl.Set([]byte("banana"), []byte("3"))
 
 	var keys []string
-	tbl.Iterate([]byte("ap"), func(it *Iter) error {
+	tbl.Iterate([]byte("ap"), func(it kvstore.StoreIter) error {
 		k, _ := it.K()
 		keys = append(keys, string(k))
 		return nil
@@ -370,8 +373,8 @@ func TestTablePrefixIteration(t *testing.T) {
 
 func TestTableIsolation(t *testing.T) {
 	db := newTestDB(t)
-	a, _ := db.Table("a")
-	b, _ := db.Table("b")
+	a, _ := db.table("a")
+	b, _ := db.table("b")
 	a.Set([]byte("k"), []byte("va"))
 	b.Set([]byte("k"), []byte("vb"))
 	got, _ := a.Get([]byte("k"))
@@ -393,9 +396,9 @@ func TestIndexIDPersistence(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	tbl, _ := db.Table("txs")
+	tbl, _ := db.table("txs")
 	tbl.AddIndex("first", blockIndexFunc)
-	idxB, _ := tbl.AddIndex("second", blockIndexFunc)
+	idxB, _ := tbl.addIndex("second", blockIndexFunc, false)
 	secondID := idxB.id
 	tbl.Set([]byte("k"), u64(1))
 	db.Close()
@@ -406,15 +409,15 @@ func TestIndexIDPersistence(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer db2.Close()
-	tbl2, _ := db2.Table("txs")
+	tbl2, _ := db2.table("txs")
 	tbl2.AddIndex("first", blockIndexFunc)
-	idx2, _ := tbl2.AddIndex("second", blockIndexFunc)
+	idx2, _ := tbl2.addIndex("second", blockIndexFunc, false)
 	if idx2.id != secondID {
 		t.Fatalf("index id changed across reopen: %d != %d", idx2.id, secondID)
 	}
 	// The persisted entry must still be discoverable via the index.
 	var found bool
-	idx2.Iterate(nil, func(it *Iter) error { found = true; return nil })
+	idx2.Iterate(nil, func(it kvstore.StoreIter) error { found = true; return nil })
 	if !found {
 		t.Fatal("persisted index entry not found after reopen")
 	}
@@ -496,10 +499,10 @@ func TestNewBadPath(t *testing.T) {
 // and index names.
 func TestEmptyTableAndIndexNames(t *testing.T) {
 	db := newTestDB(t)
-	if _, err := db.Table(""); err == nil {
-		t.Fatal("expected error from db.Table(\"\")")
+	if _, err := db.table(""); err == nil {
+		t.Fatal("expected error from db.table(\"\")")
 	}
-	tbl, err := db.Table("ok")
+	tbl, err := db.table("ok")
 	if err != nil {
 		t.Fatalf("Table: %v", err)
 	}
@@ -527,7 +530,7 @@ func TestConnect(t *testing.T) {
 	}
 
 	// Do real work to be sure the DB is alive.
-	tbl, err := db.Table("t")
+	tbl, err := db.table("t")
 	if err != nil {
 		t.Fatalf("Table: %v", err)
 	}
@@ -556,14 +559,14 @@ func TestConnect(t *testing.T) {
 // iteration.
 func TestIterEntry(t *testing.T) {
 	db := newTestDB(t)
-	tbl, _ := db.Table("txs")
+	tbl, _ := db.table("txs")
 	idx, _ := tbl.AddIndex("block", blockIndexFunc)
 
 	tbl.Set([]byte("alpha"), u64(7))
 	tbl.Set([]byte("beta"), u64(11))
 
 	var indexEntries [][]byte
-	if err := idx.Iterate(nil, func(it *Iter) error {
+	if err := idx.Iterate(nil, func(it kvstore.StoreIter) error {
 		return it.Entry(func(e []byte) error {
 			indexEntries = append(indexEntries, append([]byte(nil), e...))
 			return nil
@@ -579,7 +582,7 @@ func TestIterEntry(t *testing.T) {
 	}
 
 	var tableEntries [][]byte
-	if err := tbl.Iterate(nil, func(it *Iter) error {
+	if err := tbl.Iterate(nil, func(it kvstore.StoreIter) error {
 		return it.Entry(func(e []byte) error {
 			tableEntries = append(tableEntries, append([]byte(nil), e...))
 			return nil
@@ -599,10 +602,10 @@ func TestIterEntry(t *testing.T) {
 // read-only iteration.
 func TestIterDeleteRequiresUpdate(t *testing.T) {
 	db := newTestDB(t)
-	tbl, _ := db.Table("kv")
+	tbl, _ := db.table("kv")
 	tbl.Set([]byte("k"), []byte("v"))
 
-	err := tbl.Iterate(nil, func(it *Iter) error {
+	err := tbl.Iterate(nil, func(it kvstore.StoreIter) error {
 		return it.Delete()
 	})
 	if err == nil {
@@ -619,9 +622,10 @@ func TestIterDeleteRequiresUpdate(t *testing.T) {
 // must still produce all matching entries rather than silently returning none.
 func TestForwardSeekBeforeBound(t *testing.T) {
 	db := newTestDB(t)
-	tbl, _ := db.Table("txs")
+	tbl, _ := db.table("txs")
 	// Index by the first byte of the value.
-	idx, _ := tbl.AddIndex("byte0", func(_, v []byte) ([]byte, error) {
+	idx, _ := tbl.AddIndex("byte0", func(_, vI KV) ([]byte, error) {
+		v := vI.([]byte)
 		return v[:1], nil
 	})
 	// Two index "groups": prefix A and prefix B.
@@ -633,11 +637,11 @@ func TestForwardSeekBeforeBound(t *testing.T) {
 	// Iterate the "B" prefix but seek to "A" (which sorts before B).
 	// The implementation must clamp seek up to bound and yield both B entries.
 	var keys []string
-	err := idx.Iterate([]byte("B"), func(it *Iter) error {
+	err := idx.Iterate([]byte("B"), func(it kvstore.StoreIter) error {
 		k, _ := it.K()
 		keys = append(keys, string(k))
 		return nil
-	}, WithSeek([]byte("A")))
+	}, kvstore.WithSeek([]byte("A")))
 	if err != nil {
 		t.Fatalf("iterate: %v", err)
 	}
@@ -650,8 +654,9 @@ func TestForwardSeekBeforeBound(t *testing.T) {
 // iteration.
 func TestReverseSeekBeforeBound(t *testing.T) {
 	db := newTestDB(t)
-	tbl, _ := db.Table("txs")
-	idx, _ := tbl.AddIndex("byte0", func(_, v []byte) ([]byte, error) {
+	tbl, _ := db.table("txs")
+	idx, _ := tbl.AddIndex("byte0", func(_, vI KV) ([]byte, error) {
+		v := vI.([]byte)
 		return v[:1], nil
 	})
 	tbl.Set([]byte("a1"), []byte{'A', 1})
@@ -659,11 +664,11 @@ func TestReverseSeekBeforeBound(t *testing.T) {
 	tbl.Set([]byte("b2"), []byte{'B', 2})
 
 	var keys []string
-	err := idx.Iterate([]byte("B"), func(it *Iter) error {
+	err := idx.Iterate([]byte("B"), func(it kvstore.StoreIter) error {
 		k, _ := it.K()
 		keys = append(keys, string(k))
 		return nil
-	}, WithReverse(), WithSeek([]byte("A")))
+	}, kvstore.WithReverse(), kvstore.WithSeek([]byte("A")))
 	if err != nil {
 		t.Fatalf("iterate: %v", err)
 	}
@@ -676,17 +681,17 @@ func TestReverseSeekBeforeBound(t *testing.T) {
 // the table in reverse with a prefix of all 0xff bytes.
 func TestReverseAllOnesPrefix(t *testing.T) {
 	db := newTestDB(t)
-	tbl, _ := db.Table("kv")
+	tbl, _ := db.table("kv")
 	tbl.Set([]byte{0xff, 0x01}, []byte("a"))
 	tbl.Set([]byte{0xff, 0x02}, []byte("b"))
 	tbl.Set([]byte{0xfe, 0x03}, []byte("c")) // outside the prefix
 
 	var keys [][]byte
-	err := tbl.Iterate([]byte{0xff}, func(it *Iter) error {
+	err := tbl.Iterate([]byte{0xff}, func(it kvstore.StoreIter) error {
 		k, _ := it.K()
 		keys = append(keys, append([]byte(nil), k...))
 		return nil
-	}, WithReverse())
+	}, kvstore.WithReverse())
 	if err != nil {
 		t.Fatalf("Iterate: %v", err)
 	}
@@ -701,17 +706,17 @@ func TestReverseAllOnesPrefix(t *testing.T) {
 // in reverseWalk via a table iteration without a prefix.
 func TestReverseTableNoPrefix(t *testing.T) {
 	db := newTestDB(t)
-	tbl, _ := db.Table("kv")
+	tbl, _ := db.table("kv")
 	tbl.Set([]byte("a"), []byte("1"))
 	tbl.Set([]byte("b"), []byte("2"))
 	tbl.Set([]byte("c"), []byte("3"))
 
 	var keys []string
-	err := tbl.Iterate(nil, func(it *Iter) error {
+	err := tbl.Iterate(nil, func(it kvstore.StoreIter) error {
 		k, _ := it.K()
 		keys = append(keys, string(k))
 		return nil
-	}, WithReverse())
+	}, kvstore.WithReverse())
 	if err != nil {
 		t.Fatalf("Iterate: %v", err)
 	}
@@ -723,14 +728,14 @@ func TestReverseTableNoPrefix(t *testing.T) {
 // TestTableIterateAll exercises the prefix-less forward branch of forwardWalk.
 func TestTableIterateAll(t *testing.T) {
 	db := newTestDB(t)
-	tbl, _ := db.Table("kv")
+	tbl, _ := db.table("kv")
 	for i := range 5 {
 		if err := tbl.Set([]byte{'k', byte(i)}, []byte{byte(i)}); err != nil {
 			t.Fatalf("Set: %v", err)
 		}
 	}
 	var n int
-	if err := tbl.Iterate(nil, func(it *Iter) error { n++; return nil }); err != nil {
+	if err := tbl.Iterate(nil, func(it kvstore.StoreIter) error { n++; return nil }); err != nil {
 		t.Fatalf("Iterate: %v", err)
 	}
 	if n != 5 {
@@ -742,9 +747,10 @@ func TestTableIterateAll(t *testing.T) {
 // prefix, in both directions.
 func TestIndexIteratePrefix(t *testing.T) {
 	db := newTestDB(t)
-	tbl, _ := db.Table("txs")
+	tbl, _ := db.table("txs")
 	// Two-byte index: group, ordinal.
-	idx, _ := tbl.AddIndex("grp", func(_, v []byte) ([]byte, error) {
+	idx, _ := tbl.AddIndex("grp", func(_, vI KV) ([]byte, error) {
+		v := vI.([]byte)
 		return v[:2], nil
 	})
 	tbl.Set([]byte("a"), []byte{0x10, 0x01})
@@ -753,7 +759,7 @@ func TestIndexIteratePrefix(t *testing.T) {
 	tbl.Set([]byte("d"), []byte{0x20, 0x02})
 
 	var keys []string
-	if err := idx.Iterate([]byte{0x10}, func(it *Iter) error {
+	if err := idx.Iterate([]byte{0x10}, func(it kvstore.StoreIter) error {
 		k, _ := it.K()
 		keys = append(keys, string(k))
 		return nil
@@ -765,11 +771,11 @@ func TestIndexIteratePrefix(t *testing.T) {
 	}
 
 	keys = nil
-	if err := idx.Iterate([]byte{0x20}, func(it *Iter) error {
+	if err := idx.Iterate([]byte{0x20}, func(it kvstore.StoreIter) error {
 		k, _ := it.K()
 		keys = append(keys, string(k))
 		return nil
-	}, WithReverse()); err != nil {
+	}, kvstore.WithReverse()); err != nil {
 		t.Fatalf("Iterate reverse: %v", err)
 	}
 	if len(keys) != 2 || keys[0] != "d" || keys[1] != "c" {
@@ -780,13 +786,13 @@ func TestIndexIteratePrefix(t *testing.T) {
 // TestSeekPastEnd verifies that seeking beyond all entries yields no rows.
 func TestSeekPastEnd(t *testing.T) {
 	db := newTestDB(t)
-	tbl, _ := db.Table("txs")
+	tbl, _ := db.table("txs")
 	idx, _ := tbl.AddIndex("block", blockIndexFunc)
 	for i, b := range []uint64{10, 20, 30} {
 		tbl.Set([]byte{byte('a' + i)}, u64(b))
 	}
 	var n int
-	err := idx.Iterate(nil, func(it *Iter) error { n++; return nil }, WithSeek(u64(999)))
+	err := idx.Iterate(nil, func(it kvstore.StoreIter) error { n++; return nil }, kvstore.WithSeek(u64(999)))
 	if err != nil {
 		t.Fatalf("Iterate: %v", err)
 	}
@@ -799,9 +805,9 @@ func TestSeekPastEnd(t *testing.T) {
 // function aborts the Set call.
 func TestIndexFnError(t *testing.T) {
 	db := newTestDB(t)
-	tbl, _ := db.Table("txs")
+	tbl, _ := db.table("txs")
 	sentinel := errors.New("index function exploded")
-	_, err := tbl.AddIndex("explode", func(_, _ []byte) ([]byte, error) {
+	_, err := tbl.AddIndex("explode", func(_, _ KV) ([]byte, error) {
 		return nil, sentinel
 	})
 	if err != nil {
@@ -824,17 +830,18 @@ func TestIndexFnError(t *testing.T) {
 // Delete purge entries from every index a datum populated.
 func TestMultipleIndexesReplaceAndDelete(t *testing.T) {
 	db := newTestDB(t)
-	tbl, _ := db.Table("txs")
+	tbl, _ := db.table("txs")
 	byBlock, _ := tbl.AddIndex("block", blockIndexFunc)
-	bySuffix, _ := tbl.AddIndex("suffix", func(_, v []byte) ([]byte, error) {
+	bySuffix, _ := tbl.AddIndex("suffix", func(_, vI KV) ([]byte, error) {
+		v := vI.([]byte)
 		return v[len(v)-1:], nil
 	})
 
 	// Initial Set populates both indexes.
 	tbl.Set([]byte("k"), append(u64(100), 0xaa))
-	count := func(idx *Index) int {
+	count := func(idx kvstore.StoreIndex) int {
 		var n int
-		idx.Iterate(nil, func(_ *Iter) error { n++; return nil })
+		idx.Iterate(nil, func(_ kvstore.StoreIter) error { n++; return nil })
 		return n
 	}
 	if got := count(byBlock); got != 1 {
@@ -845,10 +852,10 @@ func TestMultipleIndexesReplaceAndDelete(t *testing.T) {
 	}
 
 	// Replace moves both index values; the old entries must be gone.
-	tbl.Set([]byte("k"), append(u64(200), 0xbb), WithReplace())
+	tbl.Set([]byte("k"), append(u64(200), 0xbb), kvstore.WithReplace())
 
 	got := []uint64{}
-	byBlock.Iterate(nil, func(it *Iter) error {
+	byBlock.Iterate(nil, func(it kvstore.StoreIter) error {
 		return it.V(func(v []byte) error {
 			got = append(got, binary.BigEndian.Uint64(v[:8]))
 			return nil
@@ -859,7 +866,7 @@ func TestMultipleIndexesReplaceAndDelete(t *testing.T) {
 	}
 
 	suffixes := []byte{}
-	bySuffix.Iterate(nil, func(it *Iter) error {
+	bySuffix.Iterate(nil, func(it kvstore.StoreIter) error {
 		return it.V(func(v []byte) error {
 			suffixes = append(suffixes, v[len(v)-1])
 			return nil
@@ -886,7 +893,7 @@ func TestMultipleIndexesReplaceAndDelete(t *testing.T) {
 // have to allocate 255 real indexes.
 func TestTooManyIndexes(t *testing.T) {
 	db := newTestDB(t)
-	tbl, _ := db.Table("kv")
+	tbl, _ := db.table("kv")
 	// Add one real index so the sequence sub-bucket exists and is initialized
 	// by addIndex's normal path.
 	if _, err := tbl.AddIndex("first", blockIndexFunc); err != nil {
@@ -916,7 +923,7 @@ func TestUniqueIndexAcrossReopen(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	tbl, _ := db.Table("txs")
+	tbl, _ := db.table("txs")
 	if _, err := tbl.AddUniqueIndex("nonce", blockIndexFunc); err != nil {
 		t.Fatalf("AddUniqueIndex: %v", err)
 	}
@@ -932,7 +939,7 @@ func TestUniqueIndexAcrossReopen(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { db2.Close() })
-	tbl2, _ := db2.Table("txs")
+	tbl2, _ := db2.table("txs")
 	if _, err := tbl2.AddUniqueIndex("nonce", blockIndexFunc); err != nil {
 		t.Fatalf("re-AddUniqueIndex: %v", err)
 	}
@@ -946,7 +953,7 @@ func TestUniqueIndexAcrossReopen(t *testing.T) {
 // the underlying bbolt transaction: mutating them must not affect later reads.
 func TestGetValueIsolated(t *testing.T) {
 	db := newTestDB(t)
-	tbl, _ := db.Table("kv")
+	tbl, _ := db.table("kv")
 	tbl.Set([]byte("k"), []byte("original"))
 
 	got, err := tbl.Get([]byte("k"))
@@ -970,10 +977,10 @@ func TestGetValueIsolated(t *testing.T) {
 // failing index — useful when multiple indexes are in play.
 func TestIndexFuncErrorWrapped(t *testing.T) {
 	db := newTestDB(t)
-	tbl, _ := db.Table("kv")
+	tbl, _ := db.table("kv")
 	tbl.AddIndex("ok", blockIndexFunc)
 	boom := errors.New("kaboom")
-	tbl.AddIndex("breakable", func(_, _ []byte) ([]byte, error) { return nil, boom })
+	tbl.AddIndex("breakable", func(_, _ KV) ([]byte, error) { return nil, boom })
 
 	err := tbl.Set([]byte("k"), u64(1))
 	if err == nil {
@@ -1014,28 +1021,29 @@ func TestIterDeleteOnBareIter(t *testing.T) {
 // that Iter.Delete can purge entries during a table iteration.
 func TestTableIterateUpdate(t *testing.T) {
 	db := newTestDB(t)
-	tbl, _ := db.Table("kv")
-	idx, _ := tbl.AddIndex("byte0", func(_, v []byte) ([]byte, error) {
+	tbl, _ := db.table("kv")
+	idx, _ := tbl.addIndex("byte0", func(_, vI KV) ([]byte, error) {
+		v := vI.([]byte)
 		return v[:1], nil
-	})
+	}, false)
 	tbl.Set([]byte("a"), []byte{1})
 	tbl.Set([]byte("b"), []byte{2})
 	tbl.Set([]byte("c"), []byte{3})
 
 	// Iterate the table with WithUpdate and delete "b".
-	err := tbl.Iterate(nil, func(it *Iter) error {
+	err := tbl.Iterate(nil, func(it kvstore.StoreIter) error {
 		k, _ := it.K()
 		if bytes.Equal(k, []byte("b")) {
 			return it.Delete()
 		}
 		return nil
-	}, WithUpdate())
+	}, kvstore.WithUpdate())
 	if err != nil {
 		t.Fatalf("Iterate w/ update: %v", err)
 	}
 
 	var keys []string
-	tbl.Iterate(nil, func(it *Iter) error {
+	tbl.Iterate(nil, func(it kvstore.StoreIter) error {
 		k, _ := it.K()
 		keys = append(keys, string(k))
 		return nil
@@ -1045,7 +1053,7 @@ func TestTableIterateUpdate(t *testing.T) {
 	}
 	// The index entry for "b" must also be gone.
 	var idxKeys []string
-	idx.Iterate(nil, func(it *Iter) error {
+	idx.Iterate(nil, func(it kvstore.StoreIter) error {
 		k, _ := it.K()
 		idxKeys = append(idxKeys, string(k))
 		return nil
@@ -1059,19 +1067,19 @@ func TestTableIterateUpdate(t *testing.T) {
 // iteration callback terminates cleanly (no error returned).
 func TestEndIterationReverse(t *testing.T) {
 	db := newTestDB(t)
-	tbl, _ := db.Table("txs")
+	tbl, _ := db.table("txs")
 	idx, _ := tbl.AddIndex("block", blockIndexFunc)
 	for i, b := range []uint64{10, 20, 30, 40, 50} {
 		tbl.Set([]byte{byte('a' + i)}, u64(b))
 	}
 	var seen int
-	err := idx.Iterate(nil, func(it *Iter) error {
+	err := idx.Iterate(nil, func(it kvstore.StoreIter) error {
 		seen++
 		if seen == 2 {
 			return ErrEndIteration
 		}
 		return nil
-	}, WithReverse())
+	}, kvstore.WithReverse())
 	if err != nil {
 		t.Fatalf("Iterate: %v", err)
 	}
@@ -1084,15 +1092,15 @@ func TestEndIterationReverse(t *testing.T) {
 // returned from a reverse-iteration callback is propagated.
 func TestIterateCallbackErrorReverse(t *testing.T) {
 	db := newTestDB(t)
-	tbl, _ := db.Table("txs")
+	tbl, _ := db.table("txs")
 	idx, _ := tbl.AddIndex("block", blockIndexFunc)
 	for i, b := range []uint64{10, 20, 30} {
 		tbl.Set([]byte{byte('a' + i)}, u64(b))
 	}
 	sentinel := errors.New("cb error")
-	err := idx.Iterate(nil, func(it *Iter) error {
+	err := idx.Iterate(nil, func(it kvstore.StoreIter) error {
 		return sentinel
-	}, WithReverse())
+	}, kvstore.WithReverse())
 	if !errors.Is(err, sentinel) {
 		t.Fatalf("expected callback error, got %v", err)
 	}
@@ -1102,11 +1110,11 @@ func TestIterateCallbackErrorReverse(t *testing.T) {
 // error-propagation path.
 func TestIterateCallbackErrorForward(t *testing.T) {
 	db := newTestDB(t)
-	tbl, _ := db.Table("txs")
+	tbl, _ := db.table("txs")
 	idx, _ := tbl.AddIndex("block", blockIndexFunc)
 	tbl.Set([]byte("k"), u64(1))
 	sentinel := errors.New("cb error")
-	err := idx.Iterate(nil, func(it *Iter) error {
+	err := idx.Iterate(nil, func(it kvstore.StoreIter) error {
 		return sentinel
 	})
 	if !errors.Is(err, sentinel) {
@@ -1118,7 +1126,7 @@ func TestIterateCallbackErrorForward(t *testing.T) {
 // the stored bytes don't parse. Corruption is injected directly via bbolt.
 func TestGetCorruptDatum(t *testing.T) {
 	db := newTestDB(t)
-	tbl, _ := db.Table("kv")
+	tbl, _ := db.table("kv")
 	// Inject a value whose first byte is a non-zero version, which will fail
 	// the version check in decodeDatum.
 	assertNoErr(t, "inject", db.Update(func(tx *bbolt.Tx) error {
@@ -1133,12 +1141,12 @@ func TestGetCorruptDatum(t *testing.T) {
 // replace branch.
 func TestSetReplaceCorruptDatum(t *testing.T) {
 	db := newTestDB(t)
-	tbl, _ := db.Table("kv")
+	tbl, _ := db.table("kv")
 	// Inject a corrupted existing entry.
 	assertNoErr(t, "inject", db.Update(func(tx *bbolt.Tx) error {
 		return tx.Bucket(tbl.name).Bucket(dataBucketKey).Put([]byte("k"), []byte{0xff})
 	}))
-	if err := tbl.Set([]byte("k"), []byte("v2"), WithReplace()); err == nil {
+	if err := tbl.Set([]byte("k"), []byte("v2"), kvstore.WithReplace()); err == nil {
 		t.Fatal("expected decode error during replace of corrupt entry")
 	}
 }
@@ -1146,7 +1154,7 @@ func TestSetReplaceCorruptDatum(t *testing.T) {
 // TestDeleteCorruptDatum forces the decodeDatum error path inside Delete.
 func TestDeleteCorruptDatum(t *testing.T) {
 	db := newTestDB(t)
-	tbl, _ := db.Table("kv")
+	tbl, _ := db.table("kv")
 	assertNoErr(t, "inject", db.Update(func(tx *bbolt.Tx) error {
 		return tx.Bucket(tbl.name).Bucket(dataBucketKey).Put([]byte("k"), []byte{0xff})
 	}))
@@ -1159,11 +1167,11 @@ func TestDeleteCorruptDatum(t *testing.T) {
 // Table.Iterate's per-entry decoding.
 func TestTableIterateCorruptDatum(t *testing.T) {
 	db := newTestDB(t)
-	tbl, _ := db.Table("kv")
+	tbl, _ := db.table("kv")
 	assertNoErr(t, "inject", db.Update(func(tx *bbolt.Tx) error {
 		return tx.Bucket(tbl.name).Bucket(dataBucketKey).Put([]byte("k"), []byte{0xff})
 	}))
-	err := tbl.Iterate(nil, func(it *Iter) error { return nil })
+	err := tbl.Iterate(nil, func(it kvstore.StoreIter) error { return nil })
 	if err == nil {
 		t.Fatal("expected decode error from Iterate over corrupt datum")
 	}
@@ -1173,10 +1181,11 @@ func TestTableIterateCorruptDatum(t *testing.T) {
 // injecting an index entry that points to a non-existent primary key.
 func TestIndexDanglingEntry(t *testing.T) {
 	db := newTestDB(t)
-	tbl, _ := db.Table("kv")
-	idx, _ := tbl.AddIndex("byte0", func(_, v []byte) ([]byte, error) {
+	tbl, _ := db.table("kv")
+	idx, _ := tbl.addIndex("byte0", func(_, vI KV) ([]byte, error) {
+		v := vI.([]byte)
 		return v[:1], nil
-	})
+	}, false)
 	// Inject an index entry whose trailing primary key doesn't exist in the
 	// data bucket. The shape is [idx.id][indexEntry][primaryKey] -> primaryKey.
 	bogusKey := []byte("nope")
@@ -1184,7 +1193,7 @@ func TestIndexDanglingEntry(t *testing.T) {
 	assertNoErr(t, "inject", db.Update(func(tx *bbolt.Tx) error {
 		return tx.Bucket(tbl.name).Bucket(indexBucketKey).Put(entryKey, bogusKey)
 	}))
-	err := idx.Iterate(nil, func(it *Iter) error { return nil })
+	err := idx.Iterate(nil, func(it kvstore.StoreIter) error { return nil })
 	if err == nil {
 		t.Fatal("expected dangling-index-entry error")
 	}
@@ -1194,10 +1203,11 @@ func TestIndexDanglingEntry(t *testing.T) {
 // (the entry resolves to a data row whose bytes don't parse).
 func TestIndexIterateCorruptDatum(t *testing.T) {
 	db := newTestDB(t)
-	tbl, _ := db.Table("kv")
-	idx, _ := tbl.AddIndex("byte0", func(_, v []byte) ([]byte, error) {
+	tbl, _ := db.table("kv")
+	idx, _ := tbl.addIndex("byte0", func(_, vI KV) ([]byte, error) {
+		v := vI.([]byte)
 		return v[:1], nil
-	})
+	}, false)
 	// Plant an index entry that points at a primary key, then overwrite the
 	// data row at that key with garbage so decodeDatum fails.
 	pk := []byte("k1")
@@ -1209,7 +1219,7 @@ func TestIndexIterateCorruptDatum(t *testing.T) {
 		}
 		return tb.Bucket(dataBucketKey).Put(pk, []byte{0xff})
 	}))
-	err := idx.Iterate(nil, func(it *Iter) error { return nil })
+	err := idx.Iterate(nil, func(it kvstore.StoreIter) error { return nil })
 	if err == nil {
 		t.Fatal("expected decode error from index iterate over corrupt datum")
 	}
@@ -1220,7 +1230,7 @@ func TestIndexIterateCorruptDatum(t *testing.T) {
 // over the second index must stop at the first index's keys.
 func TestBoundedReverseHitsBreak(t *testing.T) {
 	db := newTestDB(t)
-	tbl, _ := db.Table("kv")
+	tbl, _ := db.table("kv")
 	idxA, _ := tbl.AddIndex("A", blockIndexFunc)
 	idxB, _ := tbl.AddIndex("B", blockIndexFunc)
 
@@ -1230,7 +1240,7 @@ func TestBoundedReverseHitsBreak(t *testing.T) {
 
 	// Sanity: forward over A first.
 	var aFwd []uint64
-	idxA.Iterate(nil, func(it *Iter) error {
+	idxA.Iterate(nil, func(it kvstore.StoreIter) error {
 		return it.V(func(v []byte) error {
 			aFwd = append(aFwd, binary.BigEndian.Uint64(v[:8]))
 			return nil
@@ -1244,13 +1254,56 @@ func TestBoundedReverseHitsBreak(t *testing.T) {
 	// of iteration: c.Prev() walks past B's first key into A's entries and the
 	// bound check must end iteration.
 	var bRev []uint64
-	idxB.Iterate(nil, func(it *Iter) error {
+	idxB.Iterate(nil, func(it kvstore.StoreIter) error {
 		return it.V(func(v []byte) error {
 			bRev = append(bRev, binary.BigEndian.Uint64(v[:8]))
 			return nil
 		})
-	}, WithReverse())
+	}, kvstore.WithReverse())
 	if !equalU64(bRev, []uint64{2, 1, 0}) {
 		t.Fatalf("B reverse = %v", bRev)
+	}
+}
+
+// TestTransactionOptions covers WithTxn and WithGetTxn: operations inside a
+// caller-managed transaction see each other's effects and roll back with it,
+// and a wrong-typed transaction handle is rejected.
+func TestTransactionOptions(t *testing.T) {
+	db := newTestDB(t)
+	tbl, err := db.table("txn")
+	if err != nil {
+		t.Fatalf("Table: %v", err)
+	}
+
+	// A transaction that rolls back must take its Set with it.
+	rollback := errors.New("intentional rollback")
+	err = db.Update(func(tx *bbolt.Tx) error {
+		if err := tbl.Set([]byte("k"), []byte("v"), WithTxn(tx)); err != nil {
+			return err
+		}
+		b, err := tbl.Get([]byte("k"), WithGetTxn(tx))
+		if err != nil {
+			return fmt.Errorf("Get within txn: %w", err)
+		}
+		if !bytes.Equal(b, []byte("v")) {
+			return fmt.Errorf("Get within txn = %q, want v", b)
+		}
+		return rollback
+	})
+	if !errors.Is(err, rollback) {
+		t.Fatalf("Update = %v, want the rollback error", err)
+	}
+	if _, err := tbl.Get([]byte("k")); !errors.Is(err, ErrKeyNotFound) {
+		t.Fatalf("Get after rollback = %v, want ErrKeyNotFound", err)
+	}
+
+	// A wrong-typed transaction handle is a caller error.
+	badSet := func(o *kvstore.SetOpts) { o.Txn = 42 }
+	if err := tbl.Set([]byte("k"), []byte("v"), badSet); err == nil {
+		t.Fatal("Set with wrong-typed txn handle succeeded")
+	}
+	badGet := func(o *kvstore.GetOpts) { o.Txn = 42 }
+	if _, err := tbl.Get([]byte("k"), badGet); err == nil {
+		t.Fatal("Get with wrong-typed txn handle succeeded")
 	}
 }
