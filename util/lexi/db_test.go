@@ -2,6 +2,7 @@ package lexi
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"path/filepath"
 	"reflect"
@@ -259,6 +260,9 @@ func TestDatum(t *testing.T) {
 		if d.version != 0 {
 			t.Fatalf("%s: wrong datum version. expected %d, got %d", tag, d.version, reD.version)
 		}
+		if reD.keyID != d.keyID {
+			t.Fatalf("%s: wrong datum KeyID. expected %s, got %s", tag, d.keyID, reD.keyID)
+		}
 		if len(d.indexes) != len(reD.indexes) {
 			t.Fatalf("%s: wrong number of indexes. wanted %d, got %d", tag, len(d.indexes), reD.indexes)
 		}
@@ -274,15 +278,16 @@ func TestDatum(t *testing.T) {
 		t.Fatalf("Wrong error for unknown datum version: %v", err)
 	}
 	d.version = 0
+	d.keyID = KeyID{1, 2, 3, 4, 5, 6, 7, 8}
 
 	testEncodeDecode("simple", d)
 
-	// An empty value with no indexes is the minimum legal datum, 3 bytes:
-	// a version byte and two zero varints.
+	// An empty value with no indexes is the minimum legal datum, 11 bytes:
+	// a version byte, a KeyID, and two zero varints.
 	testEncodeDecode("empty", &datum{})
 	testEncodeDecode("empty value with index", &datum{indexes: [][]byte{encode.RandomBytes(5)}})
 
-	d = &datum{v: encode.RandomBytes(300)}
+	d = &datum{keyID: KeyID{0xff}, v: encode.RandomBytes(300)}
 	d.indexes = append(d.indexes, encode.RandomBytes(5))
 	d.indexes = append(d.indexes, encode.RandomBytes(300))
 	testEncodeDecode("complex", d)
@@ -309,22 +314,26 @@ func TestDecodeDatumOversizedLengths(t *testing.T) {
 	// maxVarInt is 0xff followed by eight length bytes, i.e. the largest value
 	// wire.ReadVarInt will hand back.
 	maxVarInt := []byte{0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff}
+	// The framed payload follows the version byte and the KeyID.
+	frame := func(payload ...byte) []byte {
+		return append(append([]byte{0}, make([]byte, KeyIDSize)...), payload...)
+	}
 
 	for _, tt := range []struct {
 		name string
 		blob []byte
 	}{{
-		// version 0, index count = 2^64-1, nothing following it.
+		// index count = 2^64-1, nothing following it.
 		name: "index count",
-		blob: append([]byte{0x00}, maxVarInt...),
+		blob: append(frame(), maxVarInt...),
 	}, {
-		// version 0, one index, whose length is 2^64-1.
+		// one index, whose length is 2^64-1.
 		name: "index length",
-		blob: append([]byte{0x00, 0x01}, maxVarInt...),
+		blob: append(frame(0x01), maxVarInt...),
 	}, {
-		// version 0, no indexes, value length 2^64-1.
+		// no indexes, value length 2^64-1.
 		name: "value length",
-		blob: append([]byte{0x00, 0x00}, maxVarInt...),
+		blob: append(frame(0x00), maxVarInt...),
 	}} {
 		t.Run(tt.name, func(t *testing.T) {
 			if _, err := decodeDatum(tt.blob); err == nil {
@@ -696,11 +705,12 @@ func TestSetBatchIgnoresCallerTxn(t *testing.T) {
 	}
 }
 
-// TestTableDanglingKeyMapEntry forces Table.Iterate's dangling-entry path by
-// injecting a key→DBID mapping whose row does not exist. The error has to name
-// the condition: iteration resolves rows in a second lookup, so a bare
-// ErrKeyNotFound out of a full-table scan says nothing about what is missing.
-func TestTableDanglingKeyMapEntry(t *testing.T) {
+// TestIndexDanglingRow forces Iter.datum's dangling-entry path for index
+// iteration by removing the row an index entry ultimately resolves to. The
+// error has to name the condition: the datum is resolved through the KeyID→key
+// map in extra lookups, so a bare ErrKeyNotFound out of an index scan says
+// nothing about what is missing.
+func TestIndexDanglingRow(t *testing.T) {
 	db, shutdown := newTestDB(t)
 	defer shutdown()
 
@@ -708,20 +718,24 @@ func TestTableDanglingKeyMapEntry(t *testing.T) {
 	if err != nil {
 		t.Fatalf("error creating table: %v", err)
 	}
+	idx, err := tbl.AddIndex("byte0", func(_, v KV) ([]byte, error) {
+		return v.([]byte)[:1], nil
+	})
+	if err != nil {
+		t.Fatalf("error adding index: %v", err)
+	}
 	if err := tbl.Set([]byte("k"), []byte("v")); err != nil {
 		t.Fatalf("error setting: %v", err)
 	}
 
-	// Map a second key to a DBID that was never assigned a row.
-	var orphan DBID
-	orphan[0] = 0xff
+	// Remove the row out from under the index entry and the KeyID→key map.
 	if err := db.Update(func(txn *badger.Txn) error {
-		return txn.Set(PrefixedKey(keyToIDPrefix, PrefixedKey(tbl.prefix, []byte("orphan"))), orphan[:])
+		return txn.Delete(PrefixedKey(tbl.prefix, []byte("k")))
 	}); err != nil {
-		t.Fatalf("error injecting key map entry: %v", err)
+		t.Fatalf("error deleting row: %v", err)
 	}
 
-	err = tbl.Iterate(nil, func(it kvstore.StoreIter) error {
+	err = idx.Iterate(nil, func(it kvstore.StoreIter) error {
 		return it.V(func(_ []byte) error { return nil })
 	})
 	if err == nil {
@@ -733,8 +747,8 @@ func TestTableDanglingKeyMapEntry(t *testing.T) {
 }
 
 // TestIndexDanglingIDMapEntry forces Iter.K's dangling-entry path by removing
-// the id→key mapping an index entry depends on. Same reasoning as
-// TestTableDanglingKeyMapEntry: K resolves the key in a second lookup, so a bare
+// the KeyID→key mapping an index entry depends on. Same reasoning as
+// TestIndexDanglingRow: K resolves the key in a second lookup, so a bare
 // ErrKeyNotFound out of an index scan says nothing about what is missing.
 func TestIndexDanglingIDMapEntry(t *testing.T) {
 	db, shutdown := newTestDB(t)
@@ -754,13 +768,13 @@ func TestIndexDanglingIDMapEntry(t *testing.T) {
 		t.Fatalf("error setting: %v", err)
 	}
 
-	// Drop the id→key mapping the index entry resolves through.
+	// Drop the KeyID→key mapping the index entry resolves through.
+	keyID, err := tbl.KeyID([]byte("k"))
+	if err != nil {
+		t.Fatalf("KeyID: %v", err)
+	}
 	if err := db.Update(func(txn *badger.Txn) error {
-		dbID, err := tbl.keyID(txn, tbl.prefix, []byte("k"), true)
-		if err != nil {
-			return err
-		}
-		return txn.Delete(PrefixedKey(IdToKeyPrefix, dbID[:]))
+		return txn.Delete(idMapKey(tbl.prefix, keyID))
 	}); err != nil {
 		t.Fatalf("error deleting id map entry: %v", err)
 	}
@@ -773,6 +787,126 @@ func TestIndexDanglingIDMapEntry(t *testing.T) {
 		t.Fatal("expected dangling-entry error")
 	}
 	if !strings.Contains(err.Error(), "dangling entry") {
+		t.Fatalf("error does not name the condition: %v", err)
+	}
+}
+
+// TestUniqueIndexPrefixShadowing pins the exact-value match in the unique
+// conflict check. The conflict scan matches the index value as a byte prefix,
+// so with variable-length values an entry for "ab" is visited when checking
+// "a" (and, through the KeyID bytes, potentially the reverse); only an entry
+// of exactly the checked value's length is a real conflict. Without the
+// length guard the shorter value reported a false conflict - and under
+// WithReplace evicted the unrelated row.
+func TestUniqueIndexPrefixShadowing(t *testing.T) {
+	db, shutdown := newTestDB(t)
+	defer shutdown()
+
+	tbl, err := db.Table("T")
+	if err != nil {
+		t.Fatalf("Table: %v", err)
+	}
+	if _, err := tbl.AddUniqueIndex("u", func(_, v KV) ([]byte, error) {
+		return v.(*tValue).idx, nil
+	}); err != nil {
+		t.Fatalf("AddUniqueIndex: %v", err)
+	}
+
+	set := func(k, idx string, opts ...kvstore.SetOption) error {
+		return tbl.Set([]byte(k), &tValue{v: []byte("v-" + k), idx: []byte(idx)}, opts...)
+	}
+	if err := set("k1", "ab"); err != nil {
+		t.Fatalf("initial Set: %v", err)
+	}
+	// A value that is a strict prefix of an existing value is not a conflict.
+	if err := set("k2", "a"); err != nil {
+		t.Fatalf("prefix of an existing value reported as conflict: %v", err)
+	}
+	// Nor is a value that extends an existing one.
+	if err := set("k3", "abc"); err != nil {
+		t.Fatalf("extension of an existing value reported as conflict: %v", err)
+	}
+	// An exact duplicate is.
+	if err := set("k4", "ab"); err == nil {
+		t.Fatal("exact duplicate not reported as conflict")
+	}
+	// Under WithReplace, only the row actually holding the value is evicted.
+	if err := set("k4", "ab", kvstore.WithReplace()); err != nil {
+		t.Fatalf("replace of exact duplicate failed: %v", err)
+	}
+	if _, err := tbl.Get([]byte("k1")); !errors.Is(err, ErrKeyNotFound) {
+		t.Fatalf("conflicting row not evicted, Get(k1) = %v", err)
+	}
+	for _, k := range []string{"k2", "k3", "k4"} {
+		if _, err := tbl.Get([]byte(k)); err != nil {
+			t.Fatalf("row %q lost to a false conflict: %v", k, err)
+		}
+	}
+}
+
+// TestLayoutVersionGuard covers checkLayoutVersion: a fresh database is
+// stamped and reopens cleanly, while a version mismatch or a pre-stamp
+// database with data in it refuses to open rather than being misread.
+func TestLayoutVersionGuard(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "test.db")
+	newDB := func() (*DB, error) {
+		return New(&Config{Path: dir, Log: util.StdOutLogger("T", util.LevelError)})
+	}
+
+	db, err := newDB()
+	if err != nil {
+		t.Fatalf("fresh open: %v", err)
+	}
+	tbl, err := db.Table("T")
+	if err != nil {
+		t.Fatalf("Table: %v", err)
+	}
+	if err := tbl.Set([]byte("k"), []byte("v")); err != nil {
+		t.Fatalf("Set: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	// Reopen with a matching stamp.
+	db, err = newDB()
+	if err != nil {
+		t.Fatalf("reopen with matching stamp: %v", err)
+	}
+
+	// A version from the future refuses to open.
+	if err := db.DB.Update(func(txn *badger.Txn) error {
+		return txn.Set(layoutVersionKey, []byte{layoutVersion + 1})
+	}); err != nil {
+		t.Fatalf("bump version: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if _, err := newDB(); err == nil {
+		t.Fatal("expected error opening a newer-layout database")
+	} else if !strings.Contains(err.Error(), "layout version") {
+		t.Fatalf("error does not name the condition: %v", err)
+	}
+
+	// A database with data but no stamp predates the versioning and also
+	// refuses to open. New itself refuses this database, so strip the stamp
+	// through a raw badger handle.
+	bdb, err := badger.Open(badger.DefaultOptions(dir).WithLogger(nil))
+	if err != nil {
+		t.Fatalf("raw open: %v", err)
+	}
+	if err := bdb.Update(func(txn *badger.Txn) error {
+		return txn.Delete(layoutVersionKey)
+	}); err != nil {
+		t.Fatalf("strip stamp: %v", err)
+	}
+	if err := bdb.Close(); err != nil {
+		t.Fatalf("raw close: %v", err)
+	}
+	if _, err := newDB(); err == nil {
+		t.Fatal("expected error opening a pre-stamp database with data")
+	} else if !strings.Contains(err.Error(), "predates layout version") {
 		t.Fatalf("error does not name the condition: %v", err)
 	}
 }
