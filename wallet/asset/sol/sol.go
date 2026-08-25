@@ -6,12 +6,14 @@ package sol
 import (
 	"context"
 	"crypto/ed25519"
+	"errors"
 	"fmt"
 	"math"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/bisoncraft/caribou/util"
@@ -24,6 +26,12 @@ import (
 
 const (
 	pollInterval = 2 * time.Second
+
+	// fetchWorkers bounds how many getTransaction RPC calls run
+	// concurrently when resolving a batch of signatures. Bounded rather
+	// than unbounded so a large batch (up to 1000 signatures) cannot open
+	// a thousand simultaneous connections to the RPC endpoint.
+	fetchWorkers = 8
 )
 
 var (
@@ -127,12 +135,16 @@ type Wallet struct {
 	pubKey  ed25519.PublicKey
 	address string
 
-	// rpc, metaTable, and ctx are set once in Connect before the wallet is
-	// used and are never reassigned; no mutex is needed.
-	rpc       rpcI
-	txDB      txdb.NetworkTxDB
-	metaTable txdb.StoreTable
-	ctx       context.Context
+	// conn holds the rpc client, context, and metadata table (re)set on
+	// every Connect, which Core re-runs on reconnect (e.g. mobile
+	// background resume). Exported, error-free methods such as Balance
+	// and Send are reachable from a UI poll goroutine concurrently with
+	// a reconnect's Connect call, so these are accessed atomically
+	// through client(), table(), and context() rather than as plain
+	// fields — kept in one struct behind one pointer so a Load() never
+	// sees a mix of pre- and post-reconnect values.
+	conn atomic.Pointer[conn]
+	txDB txdb.NetworkTxDB
 
 	tipMtx  sync.RWMutex
 	tip     uint64
@@ -150,6 +162,50 @@ type Wallet struct {
 
 var _ asset.Wallet = (*Wallet)(nil)
 var _ asset.Authenticator = (*Wallet)(nil)
+
+// conn is the rpc client, context, and metadata table Connect (re)establishes,
+// held behind a single atomic.Pointer on Wallet so readers get a consistent
+// snapshot of all three rather than three independently-torn loads.
+type conn struct {
+	rpc   rpcI
+	ctx   context.Context
+	table txdb.StoreTable
+}
+
+// errNotConnected is returned by client() when the wallet's RPC client has
+// not been set (Connect not yet run).
+var errNotConnected = errors.New("wallet not connected")
+
+// client returns the wallet's RPC client, or errNotConnected if Connect has
+// not run. It reads the pointer atomically, so it is safe to call
+// concurrently with Connect.
+func (w *Wallet) client() (rpcI, error) {
+	c := w.conn.Load()
+	if c == nil || c.rpc == nil {
+		return nil, errNotConnected
+	}
+	return c.rpc, nil
+}
+
+// context returns the context Connect was called with, or a background
+// context if Connect has not run yet. It reads the pointer atomically, so
+// it is safe to call concurrently with Connect.
+func (w *Wallet) context() context.Context {
+	if c := w.conn.Load(); c != nil && c.ctx != nil {
+		return c.ctx
+	}
+	return context.Background()
+}
+
+// table returns the wallet's metadata table, or nil if Connect has not run
+// or the wallet has no txDB. It reads the pointer atomically, so it is safe
+// to call concurrently with Connect.
+func (w *Wallet) table() txdb.StoreTable {
+	if c := w.conn.Load(); c != nil {
+		return c.table
+	}
+	return nil
+}
 
 func newWallet(cfg *asset.WalletConfig, logger util.Logger, network util.Network) (*Wallet, error) {
 	pubKeyB, err := keystore.PubKey(filepath.Join(cfg.DataDir, keyFileName))
@@ -205,15 +261,19 @@ func (w *Wallet) Locked() bool {
 }
 
 func (w *Wallet) Connect(ctx context.Context) (*sync.WaitGroup, error) {
-	w.ctx = ctx
-	w.rpc = newRPCClient(w.rpcEndpoint(), w.wsEndpoint())
+	rpc := newRPCClient(w.rpcEndpoint(), w.wsEndpoint())
+	var mt txdb.StoreTable
 	if w.txDB != nil {
-		mt, err := w.txDB.Table(metaTableName)
+		var err error
+		mt, err = w.txDB.Table(metaTableName)
 		if err != nil {
 			return nil, fmt.Errorf("error opening meta table: %w", err)
 		}
-		w.metaTable = mt
 	}
+	// Store rpc, ctx, and table together in a single Store: a reader must
+	// never observe the new rpc/ctx paired with the previous connection's
+	// (or no) table.
+	w.conn.Store(&conn{rpc: rpc, ctx: ctx, table: mt})
 	// Only do the fast synchronous part (tip probe + peer signal) at connect
 	// time. History sync can take minutes on a first run and must not block.
 	if err := w.updateTip(ctx); err != nil {
@@ -247,7 +307,11 @@ func (w *Wallet) Connect(ctx context.Context) (*sync.WaitGroup, error) {
 }
 
 func (w *Wallet) updateTip(ctx context.Context) error {
-	slot, err := w.rpc.getSlot(ctx)
+	rpc, err := w.client()
+	if err != nil {
+		return err
+	}
+	slot, err := rpc.getSlot(ctx)
 	if err != nil {
 		if w.peersChange != nil {
 			w.peersChange(0, err)
@@ -287,14 +351,16 @@ func (w *Wallet) Info() *asset.WalletInfo {
 }
 
 func (w *Wallet) Balance() (*asset.Balance, error) {
-	if w.rpc == nil {
-		return nil, fmt.Errorf("wallet not connected")
-	}
-	bal, err := w.rpc.getBalance(w.ctx, w.address)
+	rpc, err := w.client()
 	if err != nil {
 		return nil, err
 	}
-	reserve, err := w.rentExemptReserve(w.ctx)
+	ctx := w.context()
+	bal, err := rpc.getBalance(ctx, w.address)
+	if err != nil {
+		return nil, err
+	}
+	reserve, err := w.rentExemptReserve(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -317,8 +383,9 @@ func (w *Wallet) OwnsDepositAddress(address string) (bool, error) {
 }
 
 func (w *Wallet) Send(address string, value, _ uint64) (asset.Coin, error) {
-	if w.rpc == nil {
-		return nil, fmt.Errorf("wallet not connected")
+	rpc, err := w.client()
+	if err != nil {
+		return nil, err
 	}
 	if !w.ValidateAddress(address) {
 		return nil, fmt.Errorf("invalid address %q", address)
@@ -332,23 +399,24 @@ func (w *Wallet) Send(address string, value, _ uint64) (asset.Coin, error) {
 	w.keyMtx.RUnlock()
 	defer encode.ClearBytes(privKey)
 
-	balance, err := w.rpc.getBalance(w.ctx, w.address)
+	ctx := w.context()
+	balance, err := rpc.getBalance(ctx, w.address)
 	if err != nil {
 		return nil, fmt.Errorf("getBalance: %w", err)
 	}
-	reserve, err := w.rentExemptReserve(w.ctx)
+	reserve, err := w.rentExemptReserve(ctx)
 	if err != nil {
 		return nil, err
 	}
 	fee := w.StandardSendFee(0)
-	if liveFee, err := w.rpc.getFeeForMessage(w.ctx, encodeTransferMessage(w.address, address, base58.Encode(make([]byte, 32)), value)); err == nil && liveFee > 0 {
+	if liveFee, err := rpc.getFeeForMessage(ctx, encodeTransferMessage(w.address, address, base58.Encode(make([]byte, 32)), value)); err == nil && liveFee > 0 {
 		fee = liveFee
 	}
 	if fee > math.MaxUint64-value || balance < value+fee || balance-value-fee < reserve {
 		return nil, asset.ErrInsufficientBalance
 	}
 
-	blockhash, lastValidBlockHeight, err := w.rpc.getLatestBlockhash(w.ctx)
+	blockhash, lastValidBlockHeight, err := rpc.getLatestBlockhash(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("getLatestBlockhash: %w", err)
 	}
@@ -356,7 +424,7 @@ func (w *Wallet) Send(address string, value, _ uint64) (asset.Coin, error) {
 		return nil, fmt.Errorf("getLatestBlockhash: invalid blockhash length %d", len(bh))
 	}
 	_, txB, sig := signTransfer(w.address, address, blockhash, value, privKey)
-	if _, err = w.rpc.sendTransaction(w.ctx, txB); err != nil {
+	if _, err = rpc.sendTransaction(ctx, txB); err != nil {
 		return nil, fmt.Errorf("sendTransaction: %w", err)
 	}
 	recipient := address
@@ -422,7 +490,11 @@ func (w *Wallet) tokenAccountRent(ctx context.Context) (uint64, error) {
 	if w.tokenAccountRentLamports > 0 {
 		return w.tokenAccountRentLamports, nil
 	}
-	rent, err := w.rpc.getMinimumBalanceForRentExemption(ctx, splTokenAccountSize)
+	rpc, err := w.client()
+	if err != nil {
+		return 0, err
+	}
+	rent, err := rpc.getMinimumBalanceForRentExemption(ctx, splTokenAccountSize)
 	if err != nil {
 		return 0, err
 	}
@@ -459,7 +531,11 @@ func (w *Wallet) WalletTransaction(ctx context.Context, txID string) (*txdb.Wall
 			return wt, nil
 		}
 	}
-	tx, err := w.rpc.getTransaction(ctx, txID)
+	rpc, err := w.client()
+	if err != nil {
+		return nil, err
+	}
+	tx, err := rpc.getTransaction(ctx, txID)
 	if err != nil {
 		return nil, fmt.Errorf("getTransaction: %w", err)
 	}
@@ -485,9 +561,68 @@ func (w *Wallet) PendingTransactions(_ context.Context) []*txdb.WalletTransactio
 	return pending
 }
 
+// fetchResult is one getTransaction outcome from fetchTransactions, at the
+// same index as the signature it was fetched for.
+type fetchResult struct {
+	tx  *rpcTransaction
+	err error
+}
+
+// fetchTransactions resolves sigs to their transactions, up to fetchWorkers
+// requests in flight at once, and returns results at the same index as the
+// input signature.
+//
+// When stopOnFailure is true, a failed or nil result stops further dispatch:
+// a caller applying only a contiguous successful prefix (cursor contiguity)
+// would otherwise pay for the full batch (up to 1000) and discard most of
+// it — the wrong behavior against a rate-limiting endpoint. A cancelled ctx
+// stops dispatch the same way. Indices past a stopped point keep their zero
+// value, which callers already treat as "stop" (a nil tx).
+//
+// Dispatch of index i waits on index i-fetchWorkers specifically (a ring of
+// fetchWorkers slots) rather than any free slot from a plain semaphore: a
+// goroutine already given a semaphore slot has no safe way to re-check and
+// bail once started, so it can skip a request that had nothing to do with a
+// concurrently-dispatched sibling's failure. Gating on the specific
+// predecessor avoids that while still bounding the waste to fetchWorkers-1,
+// deterministically, for a failure at any index.
+func fetchTransactions(ctx context.Context, rpc rpcI, sigs []string, stopOnFailure bool) []fetchResult {
+	results := make([]fetchResult, len(sigs))
+	var stop atomic.Bool
+	slots := make([]chan struct{}, fetchWorkers)
+	for i := range slots {
+		slots[i] = make(chan struct{}, 1)
+		slots[i] <- struct{}{}
+	}
+	var wg sync.WaitGroup
+	for i, sig := range sigs {
+		slot := slots[i%fetchWorkers]
+		<-slot
+		if ctx.Err() != nil || (stopOnFailure && stop.Load()) {
+			slot <- struct{}{}
+			break
+		}
+		wg.Add(1)
+		go func(i int, sig string) {
+			defer wg.Done()
+			defer func() { slot <- struct{}{} }()
+			results[i].tx, results[i].err = rpc.getTransaction(ctx, sig)
+			if stopOnFailure && (results[i].err != nil || results[i].tx == nil) {
+				stop.Store(true)
+			}
+		}(i, sig)
+	}
+	wg.Wait()
+	return results
+}
+
 func (w *Wallet) syncHistory(ctx context.Context) error {
 	if w.txDB == nil {
 		return nil
+	}
+	rpc, err := w.client()
+	if err != nil {
+		return err
 	}
 	// Fetch any sigs older than the current batch that a previous page-capped
 	// run left for later.
@@ -506,13 +641,13 @@ func (w *Wallet) syncHistory(ctx context.Context) error {
 	var sigs []signatureInfo
 	pageCapped := true
 	for pages := 0; pages < 10; pages++ {
-		batch, err := w.rpc.getSignaturesForAddress(ctx, w.address, before, until, 100)
+		batch, err := rpc.getSignaturesForAddress(ctx, w.address, before, until, 100)
 		if err != nil && until != nil && isNotFoundRPCError(err) {
 			// The cursor references a transaction that no longer exists (e.g.
 			// after a ledger reset). Clear the stale cursor and do a full scan.
 			_ = w.setLastScannedSignature("")
 			until = nil
-			batch, err = w.rpc.getSignaturesForAddress(ctx, w.address, before, nil, 100)
+			batch, err = rpc.getSignaturesForAddress(ctx, w.address, before, nil, 100)
 		}
 		if err != nil {
 			return fmt.Errorf("getSignaturesForAddress: %w", err)
@@ -545,26 +680,32 @@ func (w *Wallet) syncHistory(ctx context.Context) error {
 			}
 		}
 	}
-	// Walk oldest-first and stop at the first fetch failure so the cursor only
-	// advances through a contiguous successful run. A nil RPC response is
-	// treated the same as an error and stops the cursor. When getTransaction
-	// succeeds but walletTransactionFromRPC returns nil (the tx exists on-chain
-	// but is not relevant to this wallet), the sig is still counted as
-	// successfully processed and cursorSig advances past it.
+	// Resolve oldest-first, concurrently (fetchTransactions), but apply the
+	// results in that same oldest-first order and stop at the first fetch
+	// failure so the cursor only advances through a contiguous successful
+	// run. A nil RPC response is treated the same as an error and stops the
+	// cursor. When getTransaction succeeds but walletTransactionFromRPC
+	// returns nil (the tx exists on-chain but is not relevant to this
+	// wallet), the sig is still counted as successfully processed and
+	// cursorSig advances past it.
+	oldestFirst := make([]string, len(sigs))
+	for i, s := range sigs {
+		oldestFirst[len(sigs)-1-i] = s.Signature
+	}
+	results := fetchTransactions(ctx, rpc, oldestFirst, true)
 	var wts []*txdb.WalletTransaction
 	cursorSig := ""
-	for i := len(sigs) - 1; i >= 0; i-- {
-		tx, err := w.rpc.getTransaction(ctx, sigs[i].Signature)
-		if err != nil || tx == nil {
+	for i, res := range results {
+		if res.err != nil || res.tx == nil {
 			break
 		}
-		if wt := walletTransactionFromRPC(tx, w.address); wt != nil {
+		if wt := walletTransactionFromRPC(res.tx, w.address); wt != nil {
 			wts = append(wts, wt)
 		}
-		cursorSig = sigs[i].Signature
+		cursorSig = oldestFirst[i]
 	}
 	if len(wts) > 0 {
-		preservePendingData(w.txDB, wts, w.log)
+		preservePendingData(w.txDB, nil, wts, w.log)
 		if err := w.txDB.StoreTxs(wts); err != nil {
 			return err
 		}
@@ -580,6 +721,10 @@ func (w *Wallet) syncHistory(ctx context.Context) error {
 // exhausted or another page cap is hit (in which case the breadcrumb is
 // advanced for the next call).
 func (w *Wallet) backfillHistory(ctx context.Context) error {
+	rpc, err := w.client()
+	if err != nil {
+		return err
+	}
 	beforeCursor, err := w.getBeforeCursor()
 	if err != nil || beforeCursor == "" {
 		return err
@@ -596,7 +741,7 @@ func (w *Wallet) backfillHistory(ctx context.Context) error {
 	var sigs []signatureInfo
 	pageCapped := true
 	for pages := 0; pages < 10; pages++ {
-		batch, err := w.rpc.getSignaturesForAddress(ctx, w.address, before, until, 100)
+		batch, err := rpc.getSignaturesForAddress(ctx, w.address, before, until, 100)
 		if err != nil {
 			return fmt.Errorf("getSignaturesForAddress backfill: %w", err)
 		}
@@ -616,18 +761,22 @@ func (w *Wallet) backfillHistory(ctx context.Context) error {
 	// stopping, because there is no cursor here to protect for contiguity.
 	// Skipped sigs will be absent from history but will not cause the main
 	// sync cursor to stall.
+	oldestFirst := make([]string, len(sigs))
+	for i, s := range sigs {
+		oldestFirst[len(sigs)-1-i] = s.Signature
+	}
+	results := fetchTransactions(ctx, rpc, oldestFirst, false)
 	var wts []*txdb.WalletTransaction
-	for i := len(sigs) - 1; i >= 0; i-- {
-		tx, err := w.rpc.getTransaction(ctx, sigs[i].Signature)
-		if err != nil || tx == nil {
+	for _, res := range results {
+		if res.err != nil || res.tx == nil {
 			continue
 		}
-		if wt := walletTransactionFromRPC(tx, w.address); wt != nil {
+		if wt := walletTransactionFromRPC(res.tx, w.address); wt != nil {
 			wts = append(wts, wt)
 		}
 	}
 	if len(wts) > 0 {
-		preservePendingData(w.txDB, wts, w.log)
+		preservePendingData(w.txDB, nil, wts, w.log)
 		if err := w.txDB.StoreTxs(wts); err != nil {
 			return err
 		}
@@ -646,6 +795,10 @@ func (w *Wallet) backfillHistory(ctx context.Context) error {
 func (w *Wallet) checkPendingTxs(ctx context.Context) error {
 	if w.txDB == nil {
 		return nil
+	}
+	rpc, err := w.client()
+	if err != nil {
+		return err
 	}
 	// Scoped to the native asset only: unlike XRP, SOL sequencing is
 	// per-transaction (a blockhash + nonce, not a shared account counter),
@@ -668,7 +821,7 @@ func (w *Wallet) checkPendingTxs(ctx context.Context) error {
 		if end > len(ids) {
 			end = len(ids)
 		}
-		batch, err := w.rpc.getSignatureStatuses(ctx, ids[i:end])
+		batch, err := rpc.getSignatureStatuses(ctx, ids[i:end])
 		if err != nil {
 			return err
 		}
@@ -687,7 +840,7 @@ func (w *Wallet) checkPendingTxs(ctx context.Context) error {
 	}
 	if needHeight {
 		var heightErr error
-		height, heightErr = w.rpc.getBlockHeight(ctx)
+		height, heightErr = rpc.getBlockHeight(ctx)
 		if heightErr != nil {
 			w.log.Debugf("getBlockHeight: %v", heightErr)
 		}
@@ -702,7 +855,7 @@ func (w *Wallet) checkPendingTxs(ctx context.Context) error {
 					// A lagging or load-balanced RPC node can return nil status
 					// for a tx that actually landed. Confirm absence on-chain
 					// before marking it rejected.
-					onChain, err := w.rpc.getTransaction(ctx, tx.ID)
+					onChain, err := rpc.getTransaction(ctx, tx.ID)
 					if err != nil {
 						w.log.Debugf("expiry confirm getTransaction: %v", err)
 						continue // transient error — retry next poll, do not reject
@@ -714,7 +867,7 @@ func (w *Wallet) checkPendingTxs(ctx context.Context) error {
 						// path and it is the thing that came back nil. Settle it
 						// here off a finalized-commitment read, which is the same
 						// evidence the "finalized" status branch below acts on.
-						final, err := w.rpc.getTransactionAtCommitment(ctx, tx.ID, "finalized")
+						final, err := rpc.getTransactionAtCommitment(ctx, tx.ID, "finalized")
 						if err != nil {
 							w.log.Debugf("expiry confirm finalized getTransaction: %v", err)
 							continue
@@ -766,7 +919,7 @@ func (w *Wallet) checkPendingTxs(ctx context.Context) error {
 			}
 			tx.Confirms = &txdb.Confirms{Current: current, Target: 1}
 		}
-		if onChain, err := w.rpc.getTransaction(ctx, tx.ID); err == nil && onChain != nil {
+		if onChain, err := rpc.getTransaction(ctx, tx.ID); err == nil && onChain != nil {
 			if parsed := walletTransactionFromRPC(onChain, w.address); parsed != nil {
 				mergePendingInto(parsed, tx)
 				tx = parsed
@@ -924,16 +1077,19 @@ func mergePendingInto(dst, src *txdb.WalletTransaction) {
 
 // preservePendingData applies mergePendingInto to every record in wts that is
 // still pending, for a history scan that reparsed signatures it may already be
-// tracking. Records from GetPendingTxs are unconfirmed by construction — the
-// pending index is keyed on !Confirmed — so this leaves them pending.
+// tracking. Records from GetAssetPendingTxs are unconfirmed by construction —
+// the pending index is keyed on !Confirmed — so this leaves them pending.
 //
 // It reads the pending set once rather than probing each record: a backfill
 // page can carry a thousand transactions, and all but the handful still in
-// flight would be a miss.
-func preservePendingData(txDB txdb.NetworkTxDB, wts []*txdb.WalletTransaction, log util.Logger) {
-	pending, err := txDB.GetPendingTxs()
+// flight would be a miss. assetID scopes that read to wts' own asset (nil
+// for native SOL, a token's asset ID for an SPL token wallet) rather than
+// every asset sharing this NetworkTxDB, since wts can only ever contain
+// that one asset's records.
+func preservePendingData(txDB txdb.NetworkTxDB, assetID *uint32, wts []*txdb.WalletTransaction, log util.Logger) {
+	pending, err := txDB.GetAssetPendingTxs(assetID)
 	if err != nil {
-		log.Errorf("GetPendingTxs: %v", err)
+		log.Errorf("GetAssetPendingTxs: %v", err)
 		return
 	}
 	if len(pending) == 0 {
@@ -956,7 +1112,11 @@ func (w *Wallet) rentExemptReserve(ctx context.Context) (uint64, error) {
 	if cached, err := w.getCachedRentExemptReserve(); err == nil && cached > 0 {
 		return cached, nil
 	}
-	reserve, err := w.rpc.getMinimumBalanceForRentExemption(ctx, 0)
+	rpc, err := w.client()
+	if err != nil {
+		return 0, err
+	}
+	reserve, err := rpc.getMinimumBalanceForRentExemption(ctx, 0)
 	if err != nil {
 		return 0, err
 	}

@@ -9,6 +9,8 @@ import (
 	"crypto/ed25519"
 	"fmt"
 	"path/filepath"
+	"sync"
+	"sync/atomic"
 	"testing"
 
 	"github.com/bisoncraft/caribou/util"
@@ -192,13 +194,13 @@ func (t *mockTable) Iterate(_ txdb.KV, _ func(txdb.StoreIter) error, _ ...txdb.I
 
 // newTestWallet returns a Wallet wired with mock rpc, txdb, and meta table.
 func newTestWallet(addr string, rpc rpcI, db txdb.NetworkTxDB, table txdb.StoreTable) *Wallet {
-	return &Wallet{
-		address:   addr,
-		rpc:       rpc,
-		txDB:      db,
-		metaTable: table,
-		log:       util.Disabled,
+	w := &Wallet{
+		address: addr,
+		txDB:    db,
+		log:     util.Disabled,
 	}
+	w.conn.Store(&conn{rpc: rpc, ctx: context.Background(), table: table})
+	return w
 }
 
 // makeSig returns a minimal signatureInfo.
@@ -659,6 +661,111 @@ func TestSyncHistory(t *testing.T) {
 	})
 }
 
+// TestSyncHistoryBoundsFetchesOnFailure verifies that when the oldest
+// signature in a batch fails to resolve, fetchTransactions' bounded-
+// concurrency dispatch does not still issue a getTransaction call for
+// every signature in the batch (up to 1000) before syncHistory discards
+// all but the (empty) successful prefix — it must stop once the failure
+// is observed, wasting at most fetchWorkers-1 calls, not the whole batch.
+func TestSyncHistoryBoundsFetchesOnFailure(t *testing.T) {
+	ctx := context.Background()
+	const walletAddr = "walletAddr"
+	const n = 40
+
+	// newest-first, matching getSignaturesForAddress's convention; oldest
+	// (processed first) is sig0.
+	sigs := make([]signatureInfo, n)
+	for i := 0; i < n; i++ {
+		sigs[i] = makeSig(fmt.Sprintf("sig%d", n-1-i))
+	}
+
+	var calls atomic.Int32
+	db := &mockTxDB{}
+	table := newMockTable()
+	rpc := &mockRPC{
+		sigsFunc: func(_, _ *string, _ int) ([]signatureInfo, error) {
+			return sigs, nil
+		},
+		txFunc: func(sig string) (*rpcTransaction, error) {
+			calls.Add(1)
+			if sig == "sig0" {
+				return nil, fmt.Errorf("boom")
+			}
+			return makeWalletTx(walletAddr, "other"), nil
+		},
+	}
+	w := newTestWallet(walletAddr, rpc, db, table)
+
+	if err := w.syncHistory(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got := int(calls.Load()); got > fetchWorkers {
+		t.Fatalf("getTransaction called %d times after an oldest-first failure, want at most %d (fetchWorkers)", got, fetchWorkers)
+	}
+	if len(db.stored) != 0 {
+		t.Fatalf("stored %d txs, want 0 (oldest signature failed)", len(db.stored))
+	}
+}
+
+// TestFetchTransactionsBoundsFetchesOnMidBatchFailure verifies the
+// fetchWorkers-1 waste bound holds for a failure well past the start of
+// the batch, not just at index 0.
+func TestFetchTransactionsBoundsFetchesOnMidBatchFailure(t *testing.T) {
+	const n = 400
+	const failAt = 300
+
+	sigs := make([]string, n)
+	for i := range sigs {
+		sigs[i] = fmt.Sprintf("sig%d", i)
+	}
+
+	var calls atomic.Int32
+	rpc := &mockRPC{
+		txFunc: func(sig string) (*rpcTransaction, error) {
+			calls.Add(1)
+			if sig == sigs[failAt] {
+				return nil, fmt.Errorf("boom")
+			}
+			return makeWalletTx("addr", "other"), nil
+		},
+	}
+
+	fetchTransactions(context.Background(), rpc, sigs, true)
+	if got := int(calls.Load()); got > failAt+fetchWorkers {
+		t.Fatalf("getTransaction called %d times after a mid-batch failure at index %d, want at most %d (failAt+fetchWorkers)", got, failAt, failAt+fetchWorkers)
+	}
+}
+
+// TestFetchTransactionsStopsOnCancelledContext verifies fetchTransactions
+// dispatches no further requests once ctx is already cancelled, rather than
+// still issuing every request in the batch (each of which fails fast, but
+// still costs a goroutine, an HTTP request object, and a slot in the
+// WaitGroup Connect's caller waits on during shutdown).
+func TestFetchTransactionsStopsOnCancelledContext(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	var calls atomic.Int32
+	rpc := &mockRPC{
+		txFunc: func(string) (*rpcTransaction, error) {
+			calls.Add(1)
+			return nil, nil
+		},
+	}
+	sigs := make([]string, 100)
+	for i := range sigs {
+		sigs[i] = fmt.Sprintf("sig%d", i)
+	}
+
+	results := fetchTransactions(ctx, rpc, sigs, true)
+	if len(results) != len(sigs) {
+		t.Fatalf("results len = %d, want %d", len(results), len(sigs))
+	}
+	if got := int(calls.Load()); got != 0 {
+		t.Fatalf("getTransaction called %d times against an already-cancelled context, want 0", got)
+	}
+}
+
 func TestBackfillHistory(t *testing.T) {
 	ctx := context.Background()
 	const walletAddr = "walletAddr"
@@ -1072,6 +1179,56 @@ func TestTokenAccountRentCached(t *testing.T) {
 	if calls != 1 {
 		t.Fatalf("getMinimumBalanceForRentExemption called %d times, want 1", calls)
 	}
+}
+
+// TestReconnectRace verifies that Balance and getCachedRentExemptReserve
+// (exported/internal methods reachable from a UI-poll goroutine) can run
+// concurrently with a reconnect rewriting rpc, ctx, and metaTable without
+// racing, panicking, or ever observing a nil rpc — the exact hazard
+// Core.Resume's re-run of Connect on the same wallet creates (e.g. mobile
+// background resume). The race detector (-race) is what actually proves
+// the absence of a data race here — a plain-field version would not
+// compile against this test's Store calls, so this cannot be run against
+// the pre-fix code, but it guards the atomic accessors going forward and
+// documents the exact concurrent-access shape Connect's reconnect path
+// creates.
+func TestReconnectRace(t *testing.T) {
+	w := newTestWallet("addr", &mockRPC{}, nil, newMockTable())
+
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+
+	// Simulates repeated Connect calls rewriting the connection state,
+	// the same writes Connect itself performs.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; ; i++ {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			var rpc rpcI = &mockRPC{}
+			ctx, cancel := context.WithCancel(context.Background())
+			w.conn.Store(&conn{rpc: rpc, ctx: ctx, table: newMockTable()})
+			cancel()
+		}
+	}()
+
+	// Simulates a UI poll hitting Balance and a metaTable-backed read
+	// concurrently with the above.
+	for i := 0; i < 500; i++ {
+		if _, err := w.Balance(); err != nil && err != errNotConnected {
+			t.Fatalf("unexpected Balance error: %v", err)
+		}
+		if _, err := w.getCachedRentExemptReserve(); err != nil {
+			t.Fatalf("unexpected getCachedRentExemptReserve error: %v", err)
+		}
+	}
+
+	close(stop)
+	wg.Wait()
 }
 
 func TestKeyFileRoundTrip(t *testing.T) {
