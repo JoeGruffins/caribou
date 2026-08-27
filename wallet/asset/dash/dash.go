@@ -28,24 +28,19 @@ const (
 )
 
 var (
-	// spvWalletDefinition is the WalletDefinition for the neutrino-backed
-	// (BIP-157/158) seeded Dash wallet. Shares the same lean wallet and database
-	// as the electrum wallet, driven by the neutrino backend instead.
-	spvWalletDefinition = &asset.WalletDefinition{
-		Type:        walletTypeSPV,
-		Tab:         "Native",
-		Description: "Use the built-in SPV wallet",
-		ConfigOpts:  nil,
-		Seeded:      true,
-	}
+	// spvWalletDefinition lives in wallets_desktop.go: it is referenced only by
+	// that file's availableWallets, so defining it here would leave it unused
+	// under the mobile tag.
 
 	// WalletInfo defines some general information about a Dash wallet.
-	// AvailableWallets is ordered electrum-first so it is the default.
+	// AvailableWallets is ordered electrum-first so it is the default, and is
+	// build-tagged to drop SPV entirely on mobile. See wallets_desktop.go and
+	// wallets_mobile.go.
 	WalletInfo = &asset.WalletInfo{
 		Name:              "Dash",
 		SupportedVersions: []uint32{version},
 		UnitInfo:          UnitInfo,
-		AvailableWallets:  []*asset.WalletDefinition{dashElectrumWalletDefinition, spvWalletDefinition},
+		AvailableWallets:  availableWallets,
 		BlockchainClass:   asset.BlockchainClassUTXO,
 		Network: &asset.Network{
 			ID:            BipID,

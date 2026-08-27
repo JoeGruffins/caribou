@@ -38,23 +38,19 @@ var (
 	// through this package.
 	DefaultWalletBirthday = wallet.DefaultWalletBirthday
 
-	spvWalletDefinition = &asset.WalletDefinition{
-		Type:        walletTypeSPV,
-		Tab:         "Native",
-		Description: "Use the built-in SPV wallet",
-		Seeded:      true,
-	}
+	// spvWalletDefinition lives in wallets_desktop.go: it is referenced only by
+	// that file's availableWallets, so defining it here would leave it unused
+	// under the mobile tag.
 
 	// WalletInfo defines some general information about a Bitcoin wallet.
+	// AvailableWallets is build-tagged: SPV-first on desktop, electrum-only on
+	// mobile. See wallets_desktop.go and wallets_mobile.go.
 	WalletInfo = &asset.WalletInfo{
 		Name:              "Bitcoin",
 		SupportedVersions: []uint32{version},
 		UnitInfo:          UnitInfo,
-		AvailableWallets: []*asset.WalletDefinition{
-			spvWalletDefinition,
-			electrumWalletDefinition,
-		},
-		BlockchainClass: asset.BlockchainClassUTXO,
+		AvailableWallets:  availableWallets,
+		BlockchainClass:   asset.BlockchainClassUTXO,
 		// Historical extremes are in the several-hundred sat/vB range, so
 		// 5,000 never binds on a real market but catches units mixups.
 		MaxFeeRate: 5_000,
