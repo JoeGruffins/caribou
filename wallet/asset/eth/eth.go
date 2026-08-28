@@ -357,6 +357,12 @@ type Balance struct {
 type ethFetcher interface {
 	address() common.Address
 	addressBalance(ctx context.Context, addr common.Address) (*big.Int, error)
+	// addressBalanceAt is addressBalance pinned to a specific block, used by
+	// the incoming-transfer scan's balance-diff gate (scan.go) so the balance
+	// compared against always corresponds exactly to the block range being
+	// scanned, rather than whatever the node considers "latest" at query
+	// time.
+	addressBalanceAt(ctx context.Context, addr common.Address, blockNumber *big.Int) (*big.Int, error)
 	bestHeader(ctx context.Context) (*types.Header, error)
 	chainConfig() *params.ChainConfig
 	connect(ctx context.Context) error
@@ -381,6 +387,11 @@ type ethFetcher interface {
 	transactionReceipt(ctx context.Context, txHash common.Hash) (*types.Receipt, error)
 	transactionAndReceipt(ctx context.Context, txHash common.Hash) (*types.Receipt, *types.Transaction, error)
 	nonce(ctx context.Context) (confirmed, next *big.Int, err error)
+	// FilterLogs and blockByNumber are used by the incoming-transfer scan
+	// (scan.go) to discover ERC20 Transfer events and native-value transfers
+	// respectively.
+	FilterLogs(ctx context.Context, query ethereum.FilterQuery) ([]types.Log, error)
+	blockByNumber(ctx context.Context, n *big.Int) (*types.Block, error)
 	// l1FeeForCalldata estimates the L1 fee for the given calldata using
 	// the OP Stack GasPriceOracle precompile.
 	l1FeeForCalldata(ctx context.Context, calldata []byte) (*big.Int, error)
@@ -441,6 +452,11 @@ type baseWallet struct {
 	walletType string
 	torProxy   string
 
+	// privKeyFn derives the raw private key from the wallet seed. Defaults to
+	// the package's own BIP-39-based derivation; overridden by chains (e.g.
+	// hyperevm) that must derive the same key as another registered asset.
+	privKeyFn func([]byte) ([]byte, func(), error)
+
 	finalizeConfs uint64
 
 	multiBalanceAddress  common.Address
@@ -498,6 +514,9 @@ type baseWallet struct {
 	// netTxDB is the master transaction database handle supplied by Core,
 	// scoped to this wallet's base-chain network. It backs txDB.
 	netTxDB txdb.NetworkTxDB
+	// metaTable holds auxiliary per-chain state, such as the incoming-transfer
+	// scan cursor (see scan.go), that isn't itself a transaction.
+	metaTable txdb.StoreTable
 
 	bridges       map[string]bridge
 	bridgeManager *bridgeManager
@@ -556,6 +575,16 @@ type ETHWallet struct {
 	pollingTip       atomic.Bool
 
 	*assetWallet
+
+	// lastScanBalance is the confirmed native balance as of the last
+	// incoming-transfer scan tick (see scan.go). It is only read and written
+	// by the single scanIncomingTransfers goroutine, so it needs no lock.
+	lastScanBalance *big.Int
+
+	// nativeScanBackoff and erc20ScanBackoff cool down each half of the
+	// incoming-transfer scan independently after a failure (see scan.go).
+	nativeScanBackoff scanBackoff
+	erc20ScanBackoff  scanBackoff
 }
 
 // TokenWallet implements some token-specific methods.
@@ -608,7 +637,17 @@ func privKeyFromSeed(seed []byte) (pk []byte, zero func(), err error) {
 	return pk, extKey.Zero, nil
 }
 
+// CreateEVMWallet creates a wallet using the package's standard BIP-39-based
+// key derivation. See CreateEVMWalletKeyed for chains that must derive a
+// different key.
 func CreateEVMWallet(chainID int64, createWalletParams *asset.CreateWalletParams, compat *CompatibilityData, skipConnect bool) error {
+	return CreateEVMWalletKeyed(chainID, createWalletParams, compat, skipConnect, privKeyFromSeed)
+}
+
+// CreateEVMWalletKeyed is CreateEVMWallet for chains whose keys are not
+// derived by the standard eth path. keyFn derives the raw private key from
+// the wallet seed.
+func CreateEVMWalletKeyed(chainID int64, createWalletParams *asset.CreateWalletParams, compat *CompatibilityData, skipConnect bool, keyFn func([]byte) ([]byte, func(), error)) error {
 	switch createWalletParams.Type {
 	case walletTypeGeth:
 		return asset.ErrWalletTypeDisabled
@@ -619,7 +658,7 @@ func CreateEVMWallet(chainID int64, createWalletParams *asset.CreateWalletParams
 
 	walletDir := getWalletDir(createWalletParams.DataDir, createWalletParams.Net)
 
-	privateKey, zero, err := privKeyFromSeed(createWalletParams.Seed)
+	privateKey, zero, err := keyFn(createWalletParams.Seed)
 	if err != nil {
 		return err
 	}
@@ -730,6 +769,11 @@ type EVMWalletConfig struct {
 	// IsOpStack is true for OP Stack L2s (Base, etc.) that have an additional
 	// L1 security fee for posting calldata to Ethereum.
 	IsOpStack bool
+	// PrivKeyFromSeed overrides how the wallet's private key is derived from
+	// the wallet seed. Defaults to the package's own BIP-39-based derivation
+	// when nil. Set this when the chain must derive the same key as another
+	// registered asset (e.g. hyperevm sharing hyperliquid's address).
+	PrivKeyFromSeed func([]byte) ([]byte, func(), error)
 }
 
 func NewEVMWallet(cfg *EVMWalletConfig) (w *ETHWallet, err error) {
@@ -757,7 +801,12 @@ func NewEVMWallet(cfg *EVMWalletConfig) (w *ETHWallet, err error) {
 	if gasFeeLimit == 0 {
 		gasFeeLimit = defaultGasFeeLimit
 	}
+	privKeyFn := cfg.PrivKeyFromSeed
+	if privKeyFn == nil {
+		privKeyFn = privKeyFromSeed
+	}
 	eth := &baseWallet{
+		privKeyFn:           privKeyFn,
 		net:                 cfg.Net,
 		baseChainID:         cfg.BaseChainID,
 		chainCfg:            cfg.ChainCfg,
@@ -865,6 +914,11 @@ func (w *ETHWallet) Connect(ctx context.Context) (_ *sync.WaitGroup, err error) 
 	w.txDB, err = NewTxDB(w.netTxDB, w.log.SubLogger("TXDB"), w.baseChainID)
 	if err != nil {
 		return nil, err
+	}
+
+	w.metaTable, err = w.netTxDB.Table(scanMetaTableName)
+	if err != nil {
+		return nil, fmt.Errorf("error opening meta table: %w", err)
 	}
 
 	pendingTxs, err := w.txDB.getPendingTxs()
@@ -981,6 +1035,12 @@ func (w *ETHWallet) Connect(ctx context.Context) (_ *sync.WaitGroup, err error) 
 	go func() {
 		defer wg.Done()
 		w.monitorPeers(ctx)
+	}()
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		w.scanIncomingTransfers(ctx)
 	}()
 
 	w.connected.Store(true)
@@ -2644,7 +2704,7 @@ func (w *TokenWallet) StandardSendFee(feeRate uint64) uint64 {
 // RestorationInfo returns information about how to restore the wallet in
 // various external wallets.
 func (w *ETHWallet) RestorationInfo(seed []byte) ([]*asset.WalletRestoration, error) {
-	privateKey, zero, err := privKeyFromSeed(seed)
+	privateKey, zero, err := w.privKeyFn(seed)
 	if err != nil {
 		return nil, err
 	}
