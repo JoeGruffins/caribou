@@ -154,6 +154,26 @@ type TaperingTickerQueue struct {
 	fastestInterval time.Duration
 	slowestInterval time.Duration
 	queueWaiter     chan *taperingWaiter
+
+	// mu guards done and the decision to register in inFlight below. It is
+	// held only across that fast check-and-register step, never across the
+	// send itself: the send can legitimately block on a full buffer, and
+	// Run's shutdown must be able to close done while that block is
+	// outstanding, so mu cannot be the thing a blocked send is holding.
+	//
+	// A select checking done and then sending to queueWaiter cannot be made
+	// race-free by reordering alone: a Wait() that passes the done check
+	// can still be descheduled before its send, landing in queueWaiter
+	// after Run's drain loop already stopped reading it, silently dropping
+	// the waiter. inFlight closes that gap: Run's defer closes done and
+	// then waits on inFlight before draining, and every Wait() that
+	// observed done still open registered in inFlight (under mu, so
+	// atomically with that observation) before attempting its send — so
+	// Run's drain cannot start until every such Wait() has either landed in
+	// queueWaiter or taken the done branch itself.
+	mu       sync.Mutex
+	done     chan struct{}
+	inFlight sync.WaitGroup
 }
 
 // NewTaperingTickerQueue is a constructor for a TaperingTicketQueue. The
@@ -166,6 +186,7 @@ func NewTaperingTickerQueue(fastestInterval, slowestInterval time.Duration) *Tap
 		fastestInterval: fastestInterval,
 		slowestInterval: slowestInterval,
 		queueWaiter:     make(chan *taperingWaiter, 16),
+		done:            make(chan struct{}),
 	}
 }
 
@@ -180,13 +201,80 @@ func (q *TaperingTickerQueue) Wait(waiter *Waiter) {
 	// We don't want the caller to hang here, so we won't call TryFunc. Instead
 	// set the nextTick as now and the run loop will call it in a goroutine
 	// immediately.
-	q.queueWaiter <- &taperingWaiter{Waiter: waiter, nextTick: time.Now()}
+	q.mu.Lock()
+	done := q.done
+	select {
+	case <-done:
+		q.mu.Unlock()
+		waiter.ExpireFunc()
+		return
+	default:
+	}
+	q.inFlight.Add(1)
+	q.mu.Unlock()
+	defer q.inFlight.Done()
+
+	// done is the snapshot taken under mu above, not a fresh read of
+	// q.done: Run may restart and swap q.done concurrently, and this select
+	// must keep watching the generation this call registered against in
+	// inFlight, not whatever Run has moved on to.
+	select {
+	case q.queueWaiter <- &taperingWaiter{Waiter: waiter, nextTick: time.Now()}:
+	case <-done:
+		waiter.ExpireFunc()
+	}
 }
 
-// Run runs the primary wait loop until the context is canceled.
+// Run runs the primary wait loop until the context is canceled. Run may be
+// called again after a previous call has returned, e.g. across a reconnect.
 func (q *TaperingTickerQueue) Run(ctx context.Context) {
+	q.mu.Lock()
+	// Swap in a fresh done only on a genuine restart, when the previous
+	// cycle's done is already closed. On the first call, q.done is still
+	// the channel NewTaperingTickerQueue created and is reused as-is:
+	// unconditionally creating a new one here would orphan it if a Wait()
+	// call raced in — via its own mu.Lock() — and read q.done before this
+	// swap, since that call would then watch a channel this Run cycle
+	// never closes, and could block on it forever.
+	select {
+	case <-q.done:
+		q.done = make(chan struct{})
+	default:
+	}
+	done := q.done
+	q.mu.Unlock()
+
 	var wg sync.WaitGroup
-	defer wg.Wait()
+	defer func() {
+		// Taking mu here makes closing done atomic with every Wait() call's
+		// check-and-register: any Wait() that observes done still open under
+		// mu is guaranteed to have registered in inFlight before this close
+		// is visible to it.
+		q.mu.Lock()
+		close(done)
+		q.mu.Unlock()
+		// Wait for every Wait() call registered above to finish its enqueue
+		// attempt (send or expire) before draining — otherwise a send that
+		// wins its race with the close below would land in queueWaiter after
+		// the drain already stopped reading it, right back to the bug this
+		// closes. This cannot deadlock against a backpressured send: done is
+		// already closed above, so every such select has a ready branch.
+		q.inFlight.Wait()
+		// Let every in-flight runWaiter either send back to queueWaiter or
+		// observe ctx.Done() and expire on its own.
+		wg.Wait()
+		// Anything left in queueWaiter — from runWaiter above or a Wait()
+		// that won its send race with the close above — never gets picked
+		// back up: expire it.
+		for {
+			select {
+			case w := <-q.queueWaiter:
+				w.ExpireFunc()
+			default:
+				return
+			}
+		}
+	}()
 
 	runWaiter := func(w *taperingWaiter) {
 		defer wg.Done()
@@ -205,7 +293,11 @@ func (q *TaperingTickerQueue) Run(ctx context.Context) {
 		w.nextTick = nextTick(w.tick, q.slowestInterval, q.fastestInterval,
 			time.Now(), w.Expiration)
 
-		q.queueWaiter <- w // send it back to the queue
+		select {
+		case q.queueWaiter <- w: // send it back to the queue
+		case <-ctx.Done():
+			w.ExpireFunc() // early, but still ending prior to DontTryAgain
+		}
 	}
 
 	waiters := make([]*taperingWaiter, 0, 100) // only used in the loop

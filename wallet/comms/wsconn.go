@@ -95,6 +95,10 @@ var ErrInvalidCert = fmt.Errorf("invalid certificate")
 // cert was provided.
 var ErrCertRequired = fmt.Errorf("certificate required")
 
+// errShuttingDown is returned by connect when it discards a completed dial
+// because Connect's cleanup goroutine has already committed to shutdown.
+var errShuttingDown = fmt.Errorf("wsConn: shutting down")
+
 // WsConn is an interface for a websocket client.
 type WsConn interface {
 	NextID() uint64
@@ -172,9 +176,28 @@ type wsConn struct {
 	readCh chan *msgjson.Message
 	urlV   atomic.Value // string
 
-	wsMtx    sync.Mutex
-	writeMtx sync.Mutex
-	ws       *websocket.Conn
+	// readerWg tracks only the read/readRaw goroutine, separately from wg:
+	// the shutdown cleanup goroutine (added to wg itself) must wait for the
+	// reader to fully exit before closing readCh, since the reader can be
+	// past its ctx.Err() check — decoding a message it already read — at
+	// the moment cancellation lands, and a send on a channel closed out
+	// from under it would panic. Waiting on wg here would deadlock, as wg
+	// also counts the cleanup goroutine doing the waiting.
+	readerWg sync.WaitGroup
+
+	wsMtx sync.Mutex
+	// shuttingDown is set under wsMtx by Connect's cleanup goroutine before
+	// it closes readCh, and checked under wsMtx by connect() before it
+	// installs a freshly dialed connection. keepAlive's own ctx.Err() check
+	// before calling connect is a check-then-act gap spanning a full dial:
+	// without this second, mutex-serialized check, a connect that started
+	// dialing just before shutdown could still land its websocket and reader
+	// goroutine after the cleanup goroutine has already stopped waiting on
+	// readerWg, leaking the connection and re-adding to a WaitGroup whose
+	// Wait has already returned.
+	shuttingDown bool
+	writeMtx     sync.Mutex
+	ws           *websocket.Conn
 
 	connectionStatus uint32 // atomic
 
@@ -311,6 +334,14 @@ func (conn *wsConn) connect(ctx context.Context) error {
 	})
 
 	conn.wsMtx.Lock()
+	if conn.shuttingDown {
+		// Connect's cleanup goroutine has already committed to closing
+		// readCh without waiting for a reader this call would otherwise
+		// register. Discard the dial rather than installing it.
+		conn.wsMtx.Unlock()
+		ws.Close()
+		return errShuttingDown
+	}
 	// If keepAlive called connect, the wsConn's current websocket.Conn may need
 	// to be closed depending on the error that triggered the reconnect.
 	if conn.ws != nil {
@@ -321,8 +352,10 @@ func (conn *wsConn) connect(ctx context.Context) error {
 
 	conn.setConnectionStatus(Connected)
 	conn.wg.Add(1)
+	conn.readerWg.Add(1)
 	go func() {
 		defer conn.wg.Done()
+		defer conn.readerWg.Done()
 		if conn.cfg.RawHandler != nil {
 			conn.readRaw(ctx)
 		} else {
@@ -342,11 +375,14 @@ func (conn *wsConn) SetReadLimit(limit int64) {
 	}
 }
 
-func (conn *wsConn) handleReadError(err error) {
+func (conn *wsConn) handleReadError(ctx context.Context, err error) {
 	reconnect := func() {
 		conn.setConnectionStatus(Disconnected)
 		if !conn.cfg.DisableAutoReconnect {
-			conn.reconnectCh <- struct{}{}
+			select {
+			case conn.reconnectCh <- struct{}{}:
+			case <-ctx.Done():
+			}
 		}
 	}
 
@@ -407,7 +443,7 @@ func (conn *wsConn) readRaw(ctx context.Context) {
 			return
 		}
 		if err != nil {
-			conn.handleReadError(err)
+			conn.handleReadError(ctx, err)
 			return
 		}
 
@@ -466,7 +502,7 @@ func (conn *wsConn) read(ctx context.Context) {
 				conn.log.Errorf("json decode error: %v", mErr)
 				continue
 			}
-			conn.handleReadError(err)
+			conn.handleReadError(ctx, err)
 			return
 		}
 
@@ -500,7 +536,7 @@ func (conn *wsConn) read(ctx context.Context) {
 			conn.log.Warnf("Read channel full, message buffered (overflow size: %d). "+
 				"Consumer may be too slow.", len(overflow))
 			if len(overflow) >= maxReadOverflow {
-				conn.handleReadError(fmt.Errorf("message source consumer stalled with %d messages buffered", len(overflow)))
+				conn.handleReadError(ctx, fmt.Errorf("message source consumer stalled with %d messages buffered", len(overflow)))
 				return
 			}
 		}
@@ -531,7 +567,10 @@ func (conn *wsConn) keepAlive(ctx context.Context) {
 				conn.log.Errorf("Reconnect failed. Scheduling reconnect to %s in %.1f seconds.",
 					conn.url(), rcInt.Seconds())
 				time.AfterFunc(rcInt, func() {
-					conn.reconnectCh <- struct{}{}
+					select {
+					case conn.reconnectCh <- struct{}{}:
+					case <-ctx.Done():
+					}
 				})
 				// Increment the wait up to PingWait.
 				if rcInt < maxReconnectInterval {
@@ -581,7 +620,10 @@ func (conn *wsConn) Connect(ctx context.Context) (*sync.WaitGroup, error) {
 		// on account of a connect error.
 		conn.log.Errorf("Initial connection failed, starting reconnect loop: %v", err)
 		time.AfterFunc(5*time.Second, func() {
-			conn.reconnectCh <- struct{}{}
+			select {
+			case conn.reconnectCh <- struct{}{}:
+			case <-ctxInternal.Done():
+			}
 		})
 	}
 
@@ -599,6 +641,12 @@ func (conn *wsConn) Connect(ctx context.Context) (*sync.WaitGroup, error) {
 		<-ctxInternal.Done()
 		conn.setConnectionStatus(Disconnected)
 		conn.wsMtx.Lock()
+		// Set under the same lock connect() checks before installing a
+		// dial: a connect already past this point completes normally (its
+		// reader is counted in readerWg before readerWg.Wait() below can
+		// return), and a connect that hasn't reached its own wsMtx.Lock()
+		// yet will see this and discard its dial instead of leaking it.
+		conn.shuttingDown = true
 		if conn.ws != nil {
 			conn.log.Debug("Sending close 1000 (normal) message.")
 			conn.close()
@@ -616,6 +664,11 @@ func (conn *wsConn) Connect(ctx context.Context) (*sync.WaitGroup, error) {
 			h.abort()
 		}
 
+		// Wait for the reader to fully exit before closing readCh: it may
+		// still be past its ctx.Err() check, decoding a message it already
+		// read off the wire, and a send into a channel closed out from
+		// under it would panic.
+		conn.readerWg.Wait()
 		close(conn.readCh) // signal to MessageSource receivers that the wsConn is dead
 	}()
 

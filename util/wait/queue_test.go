@@ -4,6 +4,7 @@ import (
 	"context"
 	"math"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -137,6 +138,219 @@ func TestTaperingQueue(t *testing.T) {
 			}
 			prevWantTryTime = wantTryTime
 			prevGotTryTimed = gotTryTimed
+		}
+	}
+}
+
+// TestTaperingQueueShutdownExpiresAllWaiters cancels the queue's context
+// while more waiters are in flight than the queueWaiter buffer (16) can
+// hold, forcing genuine backpressure on the re-queue send in runWaiter.
+// Every one of them must still receive exactly one ExpireFunc call, and Run
+// must return promptly instead of hanging in wg.Wait().
+//
+// tryBlock holds every runWaiter goroutine inside TryFunc until every
+// waiter has actually reached it, so all waiterCount goroutines are
+// contending for the 16-slot buffer at the moment of cancellation instead
+// of racing to finish first. Without that, waiterCount waiters at a
+// 1ms interval reliably finish and requeue well before a fixed sleep
+// elapses, so the test never actually created backpressure and would pass
+// on any revision regardless of whether the shutdown fix worked.
+func TestTaperingQueueShutdownExpiresAllWaiters(t *testing.T) {
+	const waiterCount = 32 // > the queueWaiter buffer size of 16
+
+	q := NewTaperingTickerQueue(time.Millisecond, time.Millisecond)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	runDone := make(chan struct{})
+	go func() {
+		defer close(runDone)
+		q.Run(ctx)
+	}()
+
+	tryBlock := make(chan struct{})
+	var inFlight atomic.Int32
+	var expiredCount atomic.Int32
+	for i := 0; i < waiterCount; i++ {
+		q.Wait(&Waiter{
+			Expiration: time.Now().Add(time.Hour),
+			TryFunc: func() TryDirective {
+				inFlight.Add(1)
+				<-tryBlock
+				return TryAgain
+			},
+			ExpireFunc: func() {
+				expiredCount.Add(1)
+			},
+		})
+	}
+
+	deadline := time.Now().Add(5 * time.Second)
+	for inFlight.Load() < waiterCount {
+		if time.Now().After(deadline) {
+			t.Fatalf("only %d of %d waiters reached TryFunc before timeout", inFlight.Load(), waiterCount)
+		}
+		time.Sleep(time.Millisecond)
+	}
+	cancel()
+	close(tryBlock)
+
+	select {
+	case <-runDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Run did not return after context cancellation; likely deadlocked in wg.Wait()")
+	}
+
+	if got := expiredCount.Load(); got != waiterCount {
+		t.Fatalf("expected all %d waiters to be expired on shutdown, got %d", waiterCount, got)
+	}
+}
+
+// TestTaperingQueueWaitRaceWithShutdownNeverDrops races concurrent Wait()
+// calls against Run's shutdown across many iterations. Every waiter must
+// receive exactly one ExpireFunc call. This is the case the check-then-send
+// shape in Wait could not close by reordering alone: a Wait() that passed
+// the done check could still be descheduled before its send and land in
+// queueWaiter after Run's drain loop had already stopped reading it,
+// silently dropping the waiter — reproduced at roughly a 1-2% rate before
+// mu made the check-then-send and the shutdown close-and-drain mutually
+// exclusive.
+func TestTaperingQueueWaitRaceWithShutdownNeverDrops(t *testing.T) {
+	const iterations = 300
+	const concurrency = 64
+
+	for iter := 0; iter < iterations; iter++ {
+		q := NewTaperingTickerQueue(time.Millisecond, time.Millisecond)
+
+		ctx, cancel := context.WithCancel(context.Background())
+		runDone := make(chan struct{})
+		go func() {
+			defer close(runDone)
+			q.Run(ctx)
+		}()
+
+		var expired atomic.Int32
+		var started sync.WaitGroup
+		started.Add(concurrency)
+		var waiters sync.WaitGroup
+		waiters.Add(concurrency)
+		for i := 0; i < concurrency; i++ {
+			go func() {
+				defer waiters.Done()
+				started.Done()
+				q.Wait(&Waiter{
+					Expiration: time.Now().Add(time.Hour),
+					TryFunc: func() TryDirective {
+						return TryAgain
+					},
+					ExpireFunc: func() {
+						expired.Add(1)
+					},
+				})
+			}()
+		}
+		// Only guarantees the goroutines have started, not that any have
+		// reached Wait's critical section yet — cancel races the rest, which
+		// is the point.
+		started.Wait()
+		cancel()
+
+		waitersDone := make(chan struct{})
+		go func() {
+			defer close(waitersDone)
+			waiters.Wait()
+		}()
+		select {
+		case <-waitersDone:
+		case <-time.After(5 * time.Second):
+			t.Fatalf("iteration %d: not all Wait() calls returned", iter)
+		}
+
+		select {
+		case <-runDone:
+		case <-time.After(5 * time.Second):
+			t.Fatalf("iteration %d: Run did not return", iter)
+		}
+
+		if got := expired.Load(); got != concurrency {
+			t.Fatalf("iteration %d: %d of %d waiters were never expired (silently dropped)",
+				iter, got, concurrency)
+		}
+	}
+}
+
+// TestTaperingQueueWaitAfterRunReturnedExpiresImmediately covers Wait()
+// called once Run has already returned, as opposed to
+// TestTaperingQueueShutdownExpiresAllWaiters above, which only exercises
+// waiters already in flight when the context is canceled. done is checked
+// first and on its own in Wait(), so this must be deterministic rather than
+// a coin flip between the done and queueWaiter cases of a single select.
+func TestTaperingQueueWaitAfterRunReturnedExpiresImmediately(t *testing.T) {
+	q := NewTaperingTickerQueue(time.Millisecond, time.Millisecond)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	runDone := make(chan struct{})
+	go func() {
+		defer close(runDone)
+		q.Run(ctx)
+	}()
+	cancel()
+	select {
+	case <-runDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Run did not return after context cancellation")
+	}
+
+	const waiterCount = 400
+	var expiredCount atomic.Int32
+	for i := 0; i < waiterCount; i++ {
+		q.Wait(&Waiter{
+			Expiration: time.Now().Add(time.Hour),
+			TryFunc: func() TryDirective {
+				return TryAgain
+			},
+			ExpireFunc: func() {
+				expiredCount.Add(1)
+			},
+		})
+	}
+
+	if got := expiredCount.Load(); got != waiterCount {
+		t.Fatalf("expected all %d post-shutdown waiters to be expired, got %d", waiterCount, got)
+	}
+}
+
+// TestTaperingQueueRunIsRestartable covers running the same queue again after
+// a previous Run has returned, the shape a reconnect or re-login needs.
+func TestTaperingQueueRunIsRestartable(t *testing.T) {
+	q := NewTaperingTickerQueue(time.Millisecond, time.Millisecond)
+
+	for i := 0; i < 2; i++ {
+		ctx, cancel := context.WithCancel(context.Background())
+		runDone := make(chan struct{})
+		go func() {
+			defer close(runDone)
+			q.Run(ctx)
+		}()
+
+		var expired atomic.Bool
+		q.Wait(&Waiter{
+			Expiration: time.Now().Add(time.Hour),
+			TryFunc: func() TryDirective {
+				return TryAgain
+			},
+			ExpireFunc: func() {
+				expired.Store(true)
+			},
+		})
+
+		cancel()
+		select {
+		case <-runDone:
+		case <-time.After(5 * time.Second):
+			t.Fatalf("Run did not return on iteration %d", i)
+		}
+		if !expired.Load() {
+			t.Fatalf("waiter from iteration %d was never expired", i)
 		}
 	}
 }
