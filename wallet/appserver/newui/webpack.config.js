@@ -58,6 +58,13 @@ module.exports = {
     path: path.resolve(__dirname, 'dist'),
     publicPath: '/js/'
   },
+  // This bundle is large by design and mostly served over loopback, but it
+  // can also cross a real network via --tor or a non-loopback --webaddr, so
+  // keep a budget instead of disabling the warning outright.
+  performance: {
+    maxAssetSize: 2 * 1024 * 1024,
+    maxEntrypointSize: 2 * 1024 * 1024
+  },
   plugins: [
     new MiniCssExtractPlugin({
       filename: 'bundle.css'
