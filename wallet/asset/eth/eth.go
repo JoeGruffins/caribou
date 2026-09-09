@@ -47,19 +47,14 @@ func registerToken(tokenID uint32, desc string) {
 		panic("token " + strconv.Itoa(int(tokenID)) + " not known")
 	}
 	netAddrs := make(map[util.Network]string)
-	netAssetVersions := make(map[util.Network][]uint32, 3)
 	for net, netToken := range token.NetTokens {
 		netAddrs[net] = netToken.Address.String()
-		netAssetVersions[net] = make([]uint32, 0, 1)
-		for ver := range netToken.Gas {
-			netAssetVersions[net] = append(netAssetVersions[net], ver)
-		}
 	}
 	asset.RegisterToken(tokenID, token.Token, &asset.WalletDefinition{
 		Type:        walletTypeToken,
 		Tab:         "Ethereum token",
 		Description: desc,
-	}, netAddrs, netAssetVersions)
+	}, netAddrs)
 }
 
 var (
@@ -101,6 +96,11 @@ const (
 	defaultGasFee       = 82  // gwei
 	defaultGasFeeLimit  = 200 // gwei
 	defaultSendGasLimit = 21_000
+	// liveGasLimitBufferPct and liveGasLimitBufferMin are the multiplicative
+	// and additive buffers applied to a live eth_estimateGas result to produce
+	// a transaction's gas limit. See bufferedGasLimit.
+	liveGasLimitBufferPct = 20
+	liveGasLimitBufferMin = 20_000
 
 	walletTypeGeth  = "geth"
 	walletTypeRPC   = "rpc"
@@ -118,8 +118,6 @@ const (
 	// coinIDTakerFoundMakerRedemption is a prefix to identify one of CoinID formats,
 	// see DecodeCoinID func for details.
 	coinIDTakerFoundMakerRedemption = "TakerFoundMakerRedemption:"
-
-	LiveEstimateFailedError = util.ErrorKind("live gas estimate failed")
 
 	// txAgeOut is the amount of time after which we forego any tx
 	// synchronization efforts for unconfirmed pending txs.
@@ -142,6 +140,40 @@ const (
 	maxUnindexedTxs = 10
 	peerCountTicker = 5 * time.Second // no rpc calls here
 )
+
+// bufferedGasLimit converts a live eth_estimateGas result into a gas limit:
+// the greater of estimate + liveGasLimitBufferPct percent and estimate +
+// liveGasLimitBufferMin.
+//
+// eth_estimateGas binary-searches for the lowest limit at which the call
+// succeeds against current state (geth allows itself ~1.5% overestimate), so
+// any headroom has to be added by the caller. The buffer covers state drift
+// between estimation and inclusion. The dominant hazard for ERC20 transfer and
+// approve is a recipient balance or spender allowance slot that is non-zero at
+// estimation time but zero at inclusion: the SSTORE then costs 20,000 instead
+// of 2,900 (+2,100 cold access), +17,100 gas. A percentage alone does not cover
+// that on a ~50k-gas call, hence the additive floor. The percentage covers
+// upgradable token contracts and nested-call (EIP-150 63/64) slack.
+//
+// Wallet and tooling convention ranges from 1.1x (OpenZeppelin Relayer) through
+// 1.2x (Uniswap interface) and 1.3x (Foundry) to 1.5x (MetaMask, Rabby);
+// libraries (geth bind, ethers, viem, web3.js) add nothing. Unused gas is
+// refunded, so the buffer only raises the balance reserved up front, not the
+// fee paid.
+func bufferedGasLimit(estimate uint64) uint64 {
+	return max(estimate*(100+liveGasLimitBufferPct)/100, estimate+liveGasLimitBufferMin)
+}
+
+// flooredGasLimit is bufferedGasLimit with a lower bound: the greater of the
+// buffered live estimate and floor, the token's static Gases figure for the
+// same operation. The live estimate is what tracks contract and state changes;
+// the floor guards against a provider returning an implausibly low estimate,
+// which would otherwise broadcast a transaction that runs out of gas and burns
+// its whole limit without moving any tokens. Unused gas is refunded, so when
+// the floor wins it only raises the balance reserved up front.
+func flooredGasLimit(estimate, floor uint64) uint64 {
+	return max(bufferedGasLimit(estimate), floor)
+}
 
 // GasFeeConfigOption returns the gasfeelimit ConfigOption with the supplied
 // default (gwei / gas).
@@ -184,16 +216,8 @@ var (
 
 	// WalletInfo defines some general information about a Ethereum wallet.
 	WalletInfo = asset.WalletInfo{
-		Name: "Ethereum",
-		// SupportedVersions: For Ethereum, the server backend maintains a
-		// single protocol version, so tokens and ETH have the same set of
-		// supported versions. Even though the SupportedVersions are made
-		// accessible for tokens via (*TokenWallet).Info, the versions are not
-		// exposed though any Driver methods or assets/driver functions. Use the
-		// network wallet's WalletInfo via (*Driver).Info if you need a token's
-		// supported versions before a wallet is available.
-		SupportedVersions: []uint32{0, 1},
-		UnitInfo:          UnitInfo,
+		Name:     "Ethereum",
+		UnitInfo: UnitInfo,
 		AvailableWallets: []*asset.WalletDefinition{
 			// {
 			// 	Type:        walletTypeGeth,
@@ -535,7 +559,9 @@ type assetWallet struct {
 	wi        asset.WalletInfo
 	tokenAddr common.Address // empty address for base chain asset
 
-	versionedGases map[uint32]*Gases
+	// gasEstimate is the token's typical gas usage, used for fee estimation
+	// only. nil for the base-chain asset.
+	gasEstimate *Gases
 
 	lockedFunds struct {
 		mtx                sync.RWMutex
@@ -738,7 +764,6 @@ func newWallet(assetCFG *asset.WalletConfig, logger util.Logger, net util.Networ
 		ChainCfg:         chainCfg,
 		AssetCfg:         assetCFG,
 		CompatData:       &comp,
-		VersionedGases:   VersionedGases,
 		Tokens:           Tokens,
 		FinalizeConfs:    3,
 		Logger:           logger,
@@ -756,7 +781,6 @@ type EVMWalletConfig struct {
 	ChainCfg         *params.ChainConfig
 	AssetCfg         *asset.WalletConfig
 	CompatData       *CompatibilityData
-	VersionedGases   map[uint32]*Gases
 	Tokens           map[uint32]*Token
 	FinalizeConfs    uint64
 	Logger           util.Logger
@@ -832,7 +856,6 @@ func NewEVMWallet(cfg *EVMWalletConfig) (w *ETHWallet, err error) {
 		baseWallet:        eth,
 		log:               cfg.Logger,
 		assetID:           assetID,
-		versionedGases:    cfg.VersionedGases,
 		emit:              cfg.AssetCfg.Emit,
 		pendingApprovals:  make(map[common.Address]*pendingApproval),
 		approvalCache:     make(map[common.Address]bool),
@@ -1589,22 +1612,15 @@ func (w *ETHWallet) OpenTokenWallet(tokenCfg *asset.TokenConfig) (asset.Wallet, 
 	if netToken == nil {
 		return nil, fmt.Errorf("no %s network configuration for token %s (%d)", w.net, token.Name, tokenCfg.AssetID)
 	}
-	if len(netToken.Gas) == 0 {
-		return nil, fmt.Errorf("no gas table for token %s (%d) on %s", token.Name, tokenCfg.AssetID, w.net)
-	}
-
-	supportedAssetVersions := make([]uint32, 0, 1)
-	gases := make(map[uint32]*Gases)
-	for ver, g := range netToken.Gas {
-		gases[ver] = g
-		supportedAssetVersions = append(supportedAssetVersions, ver)
+	if netToken.GasEstimate == nil {
+		return nil, fmt.Errorf("no gas estimate for token %s (%d) on %s", token.Name, tokenCfg.AssetID, w.net)
 	}
 
 	aw := &assetWallet{
 		baseWallet:       w.baseWallet,
 		log:              w.baseWallet.log.SubLogger(strings.ToUpper(util.BipIDSymbol(tokenCfg.AssetID))),
 		assetID:          tokenCfg.AssetID,
-		versionedGases:   gases,
+		gasEstimate:      netToken.GasEstimate,
 		emit:             tokenCfg.Emit,
 		peersChange:      tokenCfg.PeersChange,
 		pendingApprovals: make(map[common.Address]*pendingApproval),
@@ -1613,11 +1629,10 @@ func (w *ETHWallet) OpenTokenWallet(tokenCfg *asset.TokenConfig) (asset.Wallet, 
 		atomize:          token.EVMToAtomic,
 		ui:               token.UnitInfo,
 		wi: asset.WalletInfo{
-			Name:              token.Name,
-			SupportedVersions: supportedAssetVersions,
-			UnitInfo:          token.UnitInfo,
-			BlockchainClass:   asset.BlockchainClassEVM,
-			Network:           w.wi.Network,
+			Name:            token.Name,
+			UnitInfo:        token.UnitInfo,
+			BlockchainClass: asset.BlockchainClassEVM,
+			Network:         w.wi.Network,
 		},
 		tokenAddr:         netToken.Address,
 		pendingTxCheckBal: new(big.Int),
@@ -1687,11 +1702,6 @@ func (w *assetWallet) balance() (*asset.Balance, error) {
 	}, nil
 }
 
-// gases gets the gas table for the specified contract version.
-func (w *assetWallet) gases(contractVer uint32) *Gases {
-	return gases(contractVer, w.versionedGases)
-}
-
 // coin implements the asset.Coin interface for ETH
 type coin struct {
 	txHash common.Hash
@@ -1724,37 +1734,26 @@ func (c *coin) Value() uint64 {
 
 var _ asset.Coin = (*coin)(nil)
 
-// approvalGas gets the best available estimate for an approval tx, which is
-// the greater of the asset's registered value and a live estimate. It is an
-// error if a live estimate cannot be retrieved, which will be the case if the
-// user's eth balance is insufficient to cover tx fees for the approval.
-func (w *assetWallet) approvalGas(newGas *big.Int, contractVer uint32) (uint64, error) {
-	ourGas := w.gases(contractVer)
-	if ourGas == nil {
-		return 0, fmt.Errorf("no gases known for %d contract version %d", w.assetID, contractVer)
-	}
-
-	approveGas := ourGas.Approve
-
-	if approveEst, err := w.estimateApproveGas(newGas); err != nil {
-		return 0, fmt.Errorf("error estimating approve gas: %v", err)
-	} else if approveEst > approveGas {
-		w.log.Warnf("Approve gas estimate %d is greater than the expected value %d. Using live estimate + 10%%.", approveEst, approveGas)
-		return approveEst * 11 / 10, nil
-	}
-	return approveGas, nil
-}
-
-// estimateApproveGas estimates the gas required for an ERC20 approve
-// transaction against the token's own contract. The spender is immaterial to
-// the gas estimate, so the token contract's own address is used as a stand-in.
-func (w *assetWallet) estimateApproveGas(amount *big.Int) (uint64, error) {
+// approvalGasLimit returns the gas limit for an ERC20 approve transaction that
+// sets spender's allowance to amount: a live eth_estimateGas result plus the
+// standard buffer, floored at the token's static Gases.Approve (see
+// flooredGasLimit). The estimate is made against the actual spender because
+// the allowance slot's current state (zero vs. non-zero) changes the SSTORE
+// cost, so a stand-in spender would mis-estimate.
+func (w *assetWallet) approvalGasLimit(ctx context.Context, spender common.Address, amount *big.Int) (uint64, error) {
 	tc, err := w.tokenContractorOrErr()
 	if err != nil {
 		return 0, err
 	}
-	tokenAddr := tc.tokenAddress()
-	return estimateGas(w.ctx, w.addr, tokenAddr, erc20.ERC20ABI, w.node.contractBackend(), new(big.Int), "approve", tokenAddr, amount)
+	est, err := estimateGas(ctx, w.addr, tc.tokenAddress(), erc20.ERC20ABI, w.node.contractBackend(), new(big.Int), "approve", spender, amount)
+	if err != nil {
+		return 0, fmt.Errorf("error estimating approve gas: %w", err)
+	}
+	var floor uint64
+	if w.gasEstimate != nil {
+		floor = w.gasEstimate.Approve
+	}
+	return flooredGasLimit(est, floor), nil
 }
 
 // tokenContractorOrErr returns the wallet's token contractor or an error if it
@@ -1868,7 +1867,12 @@ func (w *assetWallet) approveBridgeContract(ctx context.Context, bridge bridge, 
 		return "", fmt.Errorf("error calculating approval fee rate: %w", err)
 	}
 	feeRateGwei := WeiToGweiCeil(maxFeeRate)
-	approvalGas, err := w.approvalGas(unlimitedAllowance, ContractVersionNewest)
+
+	bridgeAddr, err := bridge.bridgeContractAddr(ctx, w.assetID)
+	if err != nil {
+		return "", fmt.Errorf("error getting bridge contract address: %w", err)
+	}
+	approvalGas, err := w.approvalGasLimit(ctx, bridgeAddr, unlimitedAllowance)
 	if err != nil {
 		return "", fmt.Errorf("error calculating approval gas: %w", err)
 	}
@@ -1884,11 +1888,6 @@ func (w *assetWallet) approveBridgeContract(ctx context.Context, bridge bridge, 
 	if ethBal.Available < approvalGas*feeRateGwei {
 		return "", fmt.Errorf("insufficient fee balance for approval. required: %d, available: %d",
 			approvalGas*feeRateGwei, ethBal.Available)
-	}
-
-	bridgeAddr, err := bridge.bridgeContractAddr(ctx, w.assetID)
-	if err != nil {
-		return "", fmt.Errorf("error getting bridge contract address: %w", err)
 	}
 
 	var txID string
@@ -1945,7 +1944,12 @@ func (w *assetWallet) unapproveBridgeContract(ctx context.Context, bridge bridge
 		return "", fmt.Errorf("error calculating approval fee rate: %w", err)
 	}
 	feeRateGwei := WeiToGweiCeil(maxFeeRate)
-	approvalGas, err := w.approvalGas(new(big.Int), ContractVersionNewest)
+
+	bridgeAddr, err := bridge.bridgeContractAddr(ctx, w.assetID)
+	if err != nil {
+		return "", fmt.Errorf("error getting bridge contract address: %w", err)
+	}
+	approvalGas, err := w.approvalGasLimit(ctx, bridgeAddr, new(big.Int))
 	if err != nil {
 		return "", fmt.Errorf("error calculating approval gas: %w", err)
 	}
@@ -1961,11 +1965,6 @@ func (w *assetWallet) unapproveBridgeContract(ctx context.Context, bridge bridge
 	if ethBal.Available < approvalGas*feeRateGwei {
 		return "", fmt.Errorf("insufficient fee balance for approval. required: %d, available: %d",
 			approvalGas*feeRateGwei, ethBal.Available)
-	}
-
-	bridgeAddr, err := bridge.bridgeContractAddr(ctx, w.assetID)
-	if err != nil {
-		return "", fmt.Errorf("error getting bridge contract address: %w", err)
 	}
 
 	var txID string
@@ -2611,36 +2610,40 @@ func (w *ETHWallet) canSend(value uint64, verifyBalance, isPreEstimate bool) (ma
 	return
 }
 
-// canSend ensures that the wallet has enough to cover send value and returns
-// the fee rate and max fee required for the send tx.
-func (w *TokenWallet) canSend(value uint64, verifyBalance, isPreEstimate bool) (maxFee uint64, maxFeeRate, tipRate *big.Int, err error) {
+// checkTokenBalance returns an error if the wallet's available token balance
+// cannot cover value.
+func (w *TokenWallet) checkTokenBalance(value uint64) error {
+	bal, err := w.Balance()
+	if err != nil {
+		return err
+	}
+	if bal.Available < value {
+		return fmt.Errorf("not enough tokens: have %[1]d %[3]s need %[2]d %[3]s", bal.Available, value, w.ui.AtomicUnit)
+	}
+	return nil
+}
+
+// canSend returns the fee rate and max fee required for a token send with the
+// specified gas limit, and if verifyBalance is true, ensures the parent wallet
+// can cover that fee. The token balance itself is the caller's check (see
+// checkTokenBalance), made before any live gas estimate so that an
+// over-balance amount is reported as such rather than as a simulated revert.
+// gasLimit is the token's GasEstimate for a pre-estimate or the buffered live
+// estimate for an actual send.
+func (w *TokenWallet) canSend(gasLimit uint64, verifyBalance, isPreEstimate bool) (maxFee uint64, maxFeeRate, tipRate *big.Int, err error) {
 	maxFeeRate, tipRate, err = w.recommendedMaxFeeRate(w.ctx)
 	if err != nil {
 		return 0, nil, nil, fmt.Errorf("error getting max fee rate: %w", err)
 	}
 	maxFeeRateGwei := WeiToGweiCeil(maxFeeRate)
 
-	g := w.gases(ContractVersionERC20)
-	if g == nil {
-		return 0, nil, nil, fmt.Errorf("gas table not found")
-	}
-
-	maxFee = maxFeeRateGwei*g.Transfer + w.sendL1Fee()
+	maxFee = maxFeeRateGwei*gasLimit + w.sendL1Fee()
 
 	if isPreEstimate {
 		maxFee = maxFee * 12 / 10 // 20% buffer
 	}
 
 	if verifyBalance {
-		bal, err := w.Balance()
-		if err != nil {
-			return 0, nil, nil, err
-		}
-		avail := bal.Available
-		if avail < value {
-			return 0, nil, nil, fmt.Errorf("not enough tokens: have %[1]d %[3]s need %[2]d %[3]s", avail, value, w.ui.AtomicUnit)
-		}
-
 		ethBal, err := w.parent.Balance()
 		if err != nil {
 			return 0, nil, nil, fmt.Errorf("error getting base chain balance: %w", err)
@@ -2682,21 +2685,40 @@ func (w *TokenWallet) EstimateSendTxFee(addr string, value, _ uint64, _, maxWith
 	if err := isValidSend(addr, value, maxWithdraw); err != nil && addr != "" { // fee rate estimate for a send tx.
 		return 0, false, err
 	}
-	maxFee, _, _, err := w.canSend(value, addr != "", true)
+	if addr != "" {
+		if err := w.checkTokenBalance(value); err != nil {
+			return 0, false, err
+		}
+	}
+	maxFee, _, _, err := w.canSend(w.estimateSendGasLimit(addr, value), addr != "", true)
 	if err != nil {
 		return 0, false, err
 	}
 	return maxFee, w.ValidateAddress(addr), nil
 }
 
+// estimateSendGasLimit returns the gas limit a transfer of value to addr would
+// be sent with, for fee estimation. With a recipient known, that is the same
+// floored, buffered live estimate Send uses. Without one, or when the node
+// cannot produce an estimate, the token's static GasEstimate stands in. Estimation
+// fails when the simulated transfer reverts, typically because the account's
+// token balance cannot cover value; falling back keeps a fee figure available
+// alongside the balance error canSend reports.
+func (w *TokenWallet) estimateSendGasLimit(addr string, value uint64) uint64 {
+	if addr == "" {
+		return w.gasEstimate.Transfer
+	}
+	gasLimit, err := w.transferGasLimit(common.HexToAddress(addr), value)
+	if err != nil {
+		w.log.Debugf("Live transfer gas estimate failed, using static estimate %d: %v", w.gasEstimate.Transfer, err)
+		return w.gasEstimate.Transfer
+	}
+	return gasLimit
+}
+
 // StandardSendFee returns the fees for a simple send tx.
 func (w *TokenWallet) StandardSendFee(feeRate uint64) uint64 {
-	g := w.gases(ContractVersionNewest)
-	if g == nil {
-		w.log.Errorf("error getting gases for token %s", w.token.Name)
-		return 0
-	}
-	return g.Transfer*feeRate + w.sendL1Fee()
+	return w.gasEstimate.Transfer*feeRate + w.sendL1Fee()
 }
 
 // RestorationInfo returns information about how to restore the wallet in
@@ -2762,12 +2784,25 @@ func (w *TokenWallet) Send(addr string, value, _ uint64) (asset.Coin, error) {
 		return nil, err
 	}
 
-	_ /* maxFee */, maxFeeRate, tipRate, err := w.canSend(value, true, false)
+	// Reject an over-balance send before asking the node for a gas estimate.
+	// The transfer would revert during estimation, which surfaces as an opaque
+	// execution error rather than a balance error.
+	if err := w.checkTokenBalance(value); err != nil {
+		return nil, err
+	}
+
+	to := common.HexToAddress(addr)
+	gasLimit, err := w.transferGasLimit(to, value)
 	if err != nil {
 		return nil, err
 	}
 
-	tx, err := w.sendToAddr(common.HexToAddress(addr), value, maxFeeRate, tipRate)
+	_ /* maxFee */, maxFeeRate, tipRate, err := w.canSend(gasLimit, true, false)
+	if err != nil {
+		return nil, err
+	}
+
+	tx, err := w.sendToAddr(to, value, gasLimit, maxFeeRate, tipRate)
 	if err != nil {
 		return nil, err
 	}
@@ -3518,13 +3553,25 @@ func (w *ETHWallet) sendToAddr(addr common.Address, amt uint64, maxFeeRate, tipR
 	})
 }
 
-// sendToAddr sends funds to the address.
-func (w *TokenWallet) sendToAddr(addr common.Address, amt uint64, maxFeeRate, tipRate *big.Int) (*types.Transaction, error) {
-	g := w.gases(ContractVersionERC20)
-	if g == nil {
-		return nil, fmt.Errorf("no gas table")
+// transferGasLimit returns the gas limit for an ERC20 transfer of amt atomic
+// units to addr: a live eth_estimateGas result plus the standard buffer,
+// floored at the token's static Gases.Transfer (see flooredGasLimit). The
+// estimate targets the actual recipient and amount because a transfer into an
+// empty balance slot costs more than one into a funded slot.
+func (w *TokenWallet) transferGasLimit(addr common.Address, amt uint64) (uint64, error) {
+	tc, err := w.tokenContractorOrErr()
+	if err != nil {
+		return 0, err
 	}
+	est, err := tc.estimateTransferGas(w.ctx, addr, w.evmify(amt))
+	if err != nil {
+		return 0, fmt.Errorf("error estimating transfer gas: %w", err)
+	}
+	return flooredGasLimit(est, w.gasEstimate.Transfer), nil
+}
 
+// sendToAddr sends tokens to the address with the specified gas limit.
+func (w *TokenWallet) sendToAddr(addr common.Address, amt, gasLimit uint64, maxFeeRate, tipRate *big.Int) (*types.Transaction, error) {
 	recipient := addr.Hex()
 	res := &genTxResult{
 		tx:        nil,
@@ -3542,7 +3589,7 @@ func (w *TokenWallet) sendToAddr(addr common.Address, amt uint64, maxFeeRate, ti
 	}
 
 	return res.tx, w.withNonce(w.ctx, func(nonce *big.Int) (*genTxResult, error) {
-		txOpts, err := w.node.txOpts(w.ctx, 0, g.Transfer, maxFeeRate, tipRate, nonce)
+		txOpts, err := w.node.txOpts(w.ctx, 0, gasLimit, maxFeeRate, tipRate, nonce)
 		if err != nil {
 			return nil, err
 		}
@@ -4727,42 +4774,41 @@ func (getGas) returnFunds(
 	ethBal := WeiToGwei(bigEthBal)
 
 	if token != nil {
-		nt, found := token.NetTokens[net]
-		if !found {
-			return fmt.Errorf("no %s token for %s", token.Name, net)
+		tc, err := newERC20TokenContractor(net, token, cl.address(), cl.contractBackend())
+		if err != nil {
+			return fmt.Errorf("error constructing token contractor: %w", err)
 		}
-		var g Gases
-		for _, ng := range nt.Gas {
-			g = *ng
-			break
+
+		bigTokenBal, err := tc.balance(ctx)
+		if err != nil {
+			return fmt.Errorf("error getting token balance: %w", err)
 		}
-		fees := g.Transfer * WeiToGweiCeil(maxFeeRate)
+		if bigTokenBal.Sign() == 0 {
+			log.Infof("No %s balance to return", token.Name)
+			return nil
+		}
+
+		est, err := tc.estimateTransferGas(ctx, returnAddr, bigTokenBal)
+		if err != nil {
+			return fmt.Errorf("error estimating transfer gas: %w", err)
+		}
+		var floor uint64
+		if nt := token.NetTokens[net]; nt != nil && nt.GasEstimate != nil {
+			floor = nt.GasEstimate.Transfer
+		}
+		gasLimit := flooredGasLimit(est, floor)
+		fees := gasLimit * WeiToGweiCeil(maxFeeRate)
 		if fees > ethBal {
 			return fmt.Errorf("not enough base chain balance (%s) to cover fees (%s)",
 				UnitInfo.ConventionalString(ethBal), UnitInfo.ConventionalString(fees))
 		}
 
-		tokenContract, err := erc20.NewIERC20(nt.Address, cl.contractBackend())
-		if err != nil {
-			return fmt.Errorf("NewIERC20 error: %v", err)
-		}
-
-		callOpts := &bind.CallOpts{
-			From:    cl.address(),
-			Context: ctx,
-		}
-
-		bigTokenBal, err := tokenContract.BalanceOf(callOpts, cl.address())
-		if err != nil {
-			return fmt.Errorf("error getting token balance: %w", err)
-		}
-
-		txOpts, err := cl.txOpts(ctx, 0, g.Transfer, maxFeeRate, tipRate, nil)
+		txOpts, err := cl.txOpts(ctx, 0, gasLimit, maxFeeRate, tipRate, nil)
 		if err != nil {
 			return fmt.Errorf("error generating tx opts: %w", err)
 		}
 
-		tx, err := tokenContract.Transfer(txOpts, returnAddr, bigTokenBal)
+		tx, err := tc.transfer(txOpts, returnAddr, bigTokenBal)
 		if err != nil {
 			return fmt.Errorf("error transferring tokens : %w", err)
 		}
@@ -4814,19 +4860,4 @@ func newTxOpts(ctx context.Context, from common.Address, val, maxGas uint64, max
 		GasTipCap: gasTipCap,
 		GasLimit:  maxGas,
 	}
-}
-
-func gases(contractVer uint32, versionedGases map[uint32]*Gases) *Gases {
-	if contractVer != ContractVersionNewest {
-		return versionedGases[contractVer]
-	}
-	var bestVer uint32
-	var bestGases *Gases
-	for ver, gases := range versionedGases {
-		if ver >= bestVer {
-			bestGases = gases
-			bestVer = ver
-		}
-	}
-	return bestGases
 }

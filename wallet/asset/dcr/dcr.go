@@ -57,9 +57,6 @@ import (
 )
 
 const (
-	// The implementation version. This considers the dex/networks package too.
-	version = 0
-
 	// BipID is the BIP-0044 asset ID.
 	BipID = 42
 
@@ -266,9 +263,8 @@ var (
 
 	// WalletInfo defines some general information about a Decred wallet.
 	WalletInfo = &asset.WalletInfo{
-		Name:              "Decred",
-		SupportedVersions: []uint32{version},
-		UnitInfo:          UnitInfo,
+		Name:     "Decred",
+		UnitInfo: UnitInfo,
 		AvailableWallets: []*asset.WalletDefinition{
 			spvWalletDefinition,
 			{

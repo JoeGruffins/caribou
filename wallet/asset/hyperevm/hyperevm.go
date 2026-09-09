@@ -41,11 +41,10 @@ var (
 	// the two chains share one secp256k1 account, and funds sent to that
 	// address over either chain must stay reachable by this wallet.
 	WalletInfo = asset.WalletInfo{
-		Name:              "HyperEVM",
-		SupportedVersions: []uint32{1},
-		UnitInfo:          UnitInfo,
-		AvailableWallets:  []*asset.WalletDefinition{rpcWalletDefinition},
-		BlockchainClass:   asset.BlockchainClassEVM,
+		Name:             "HyperEVM",
+		UnitInfo:         UnitInfo,
+		AvailableWallets: []*asset.WalletDefinition{rpcWalletDefinition},
+		BlockchainClass:  asset.BlockchainClassEVM,
 		Network: &asset.Network{
 			ID:            BipID,
 			NativeAssetID: BipID,
@@ -77,7 +76,6 @@ func (d *Driver) Open(cfg *asset.WalletConfig, logger util.Logger, net util.Netw
 		ChainCfg:         chainCfg,
 		AssetCfg:         cfg,
 		CompatData:       &compat,
-		VersionedGases:   VersionedGases,
 		FinalizeConfs:    3,
 		Logger:           logger,
 		WalletInfo:       WalletInfo,

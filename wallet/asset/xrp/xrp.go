@@ -37,8 +37,6 @@ import (
 )
 
 const (
-	version = 0
-
 	// tipPollInterval is how often the poll fallback queries serverInfo for the
 	// latest validated ledger. This keeps the wallet alive when the websocket
 	// subscription is unavailable. Must be less than MaxBlockInterval (30 s) so
@@ -114,10 +112,9 @@ var (
 	}
 
 	WalletInfo = asset.WalletInfo{
-		Name:              "Ripple",
-		SupportedVersions: []uint32{version},
-		UnitInfo:          UnitInfo,
-		AvailableWallets:  []*asset.WalletDefinition{rpcWalletDefinition},
+		Name:             "Ripple",
+		UnitInfo:         UnitInfo,
+		AvailableWallets: []*asset.WalletDefinition{rpcWalletDefinition},
 		Network: &asset.Network{
 			ID:            BipID,
 			NativeAssetID: BipID,

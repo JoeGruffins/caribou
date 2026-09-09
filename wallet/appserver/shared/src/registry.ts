@@ -38,7 +38,6 @@ export interface Token {
   unitInfo: UnitInfo
   contractAddress: string
   definition: WalletDefinition
-  supportedAssetVersions: number[]
 }
 
 export enum ApprovalStatus {
@@ -104,7 +103,6 @@ export interface WalletInfo {
   name: string
   version: number
   availablewallets: WalletDefinition[]
-  versions: number[]
   unitinfo: UnitInfo
   network?: NetworkInfo
 }

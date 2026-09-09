@@ -19,6 +19,7 @@ import (
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/crypto"
+	"github.com/ethereum/go-ethereum/rpc"
 )
 
 func TestMultiRPCClientReconfigureNoopWhenEndpointsUnchanged(t *testing.T) {
@@ -286,5 +287,130 @@ func TestRPCTransactionUnmarshalJSON(t *testing.T) {
 	}
 	if rt.From == nil || *rt.From != from {
 		t.Errorf("from = %v, want %s", rt.From, from)
+	}
+}
+
+// tRPCError mimics the *rpc.jsonError a provider returns for a reverted
+// simulation: a message plus the hex-encoded revert payload as error data.
+type tRPCError struct {
+	msg  string
+	data interface{}
+}
+
+func (e *tRPCError) Error() string          { return e.msg }
+func (e *tRPCError) ErrorCode() int         { return 3 }
+func (e *tRPCError) ErrorData() interface{} { return e.data }
+
+func TestDecodeRevert(t *testing.T) {
+	t.Parallel()
+
+	// abi.encodeWithSelector(Error(string), "ERC20: transfer amount exceeds balance")
+	errorString := "0x08c379a0" +
+		"0000000000000000000000000000000000000000000000000000000000000020" +
+		"0000000000000000000000000000000000000000000000000000000000000026" +
+		"45524332303a207472616e7366657220616d6f756e7420657863656564732062" +
+		"616c616e63650000000000000000000000000000000000000000000000000000"
+	// abi.encodeWithSelector(Panic(uint256), 0x11) — arithmetic overflow.
+	panic11 := "0x4e487b710000000000000000000000000000000000000000000000000000000000000011"
+	// Custom error InsufficientBalance() with no decodable payload.
+	custom := "0xf4d678b8"
+
+	tests := []struct {
+		name string
+		err  error
+		want string
+	}{{
+		name: "nil",
+	}, {
+		name: "plain error, no data",
+		err:  errors.New("connection refused"),
+		want: "connection refused",
+	}, {
+		name: "bare revert with Error(string) data",
+		err:  &tRPCError{msg: "execution reverted", data: errorString},
+		want: "execution reverted: ERC20: transfer amount exceeds balance",
+	}, {
+		name: "reason already in message is not repeated",
+		err:  &tRPCError{msg: "execution reverted: ERC20: transfer amount exceeds balance", data: errorString},
+		want: "execution reverted: ERC20: transfer amount exceeds balance",
+	}, {
+		name: "wrapped by provider aggregation",
+		err:  fmt.Errorf("provider a: %w", &tRPCError{msg: "execution reverted", data: errorString}),
+		want: "provider a: execution reverted: ERC20: transfer amount exceeds balance",
+	}, {
+		name: "aggregated with a differently-shaped provider error",
+		err:  fmt.Errorf("%w: %w", &tRPCError{msg: "execution reverted", data: errorString}, errors.New("i/o timeout")),
+		want: "execution reverted: i/o timeout: ERC20: transfer amount exceeds balance",
+	}, {
+		name: "panic code",
+		err:  &tRPCError{msg: "execution reverted", data: panic11},
+		want: "execution reverted: arithmetic underflow or overflow",
+	}, {
+		name: "custom error selector",
+		err:  &tRPCError{msg: "execution reverted", data: custom},
+		want: "execution reverted: custom error selector 0xf4d678b8",
+	}, {
+		name: "non-string data",
+		err:  &tRPCError{msg: "execution reverted", data: 42},
+		want: "execution reverted",
+	}, {
+		name: "malformed hex data",
+		err:  &tRPCError{msg: "execution reverted", data: "0xzz"},
+		want: "execution reverted",
+	}, {
+		name: "empty data",
+		err:  &tRPCError{msg: "execution reverted", data: "0x"},
+		want: "execution reverted",
+	}}
+
+	for _, test := range tests {
+		got := decodeRevert(test.err)
+		if test.err == nil {
+			if got != nil {
+				t.Fatalf("%s: expected nil, got %v", test.name, got)
+			}
+			continue
+		}
+		if got.Error() != test.want {
+			t.Errorf("%s: got %q, want %q", test.name, got.Error(), test.want)
+		}
+		if !errors.Is(got, test.err) {
+			t.Errorf("%s: decoded error does not wrap the original", test.name)
+		}
+	}
+}
+
+// TestWithOneErrorAggregation asserts that the error withOne returns after
+// every provider fails keeps each provider's error reachable through
+// errors.Is/As, not only the last one. decodeRevert and the acceptability
+// filters depend on that for mixed-provider setups, where providers report
+// the same failure with differently-shaped errors.
+func TestWithOneErrorAggregation(t *testing.T) {
+	t.Parallel()
+	revert := &tRPCError{msg: "execution reverted", data: "0x"}
+	timeout := errors.New("i/o timeout")
+	m := &multiRPCClient{log: tLogger}
+	providers := []*provider{{host: "a"}, {host: "b"}}
+	err := m.withOne(context.Background(), providers, func(_ context.Context, p *provider) error {
+		if p.host == "a" {
+			return revert
+		}
+		return timeout
+	})
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if !errors.Is(err, revert) {
+		t.Errorf("first provider's error not in chain: %v", err)
+	}
+	if !errors.Is(err, timeout) {
+		t.Errorf("second provider's error not in chain: %v", err)
+	}
+	var dataErr rpc.DataError
+	if !errors.As(err, &dataErr) {
+		t.Errorf("rpc.DataError not reachable through aggregated error: %v", err)
+	}
+	if want := "execution reverted: i/o timeout"; err.Error() != want {
+		t.Errorf("aggregated error = %q, want %q", err.Error(), want)
 	}
 }

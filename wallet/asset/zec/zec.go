@@ -36,8 +36,7 @@ import (
 )
 
 const (
-	version = 0
-	BipID   = 133
+	BipID = 133
 	// The default fee is passed to the user as part of the asset.WalletInfo
 	// structure.
 	defaultFee          = 10
@@ -128,11 +127,10 @@ var (
 	}
 	// WalletInfo defines some general information about a Zcash wallet.
 	WalletInfo = &asset.WalletInfo{
-		Name:              "Zcash",
-		SupportedVersions: []uint32{version},
-		UnitInfo:          UnitInfo,
-		AvailableWallets:  []*asset.WalletDefinition{rpcWalletDefinition},
-		BlockchainClass:   asset.BlockchainClassUTXO,
+		Name:             "Zcash",
+		UnitInfo:         UnitInfo,
+		AvailableWallets: []*asset.WalletDefinition{rpcWalletDefinition},
+		BlockchainClass:  asset.BlockchainClassUTXO,
 		// ZEC fee markets run orders of magnitude below this; the ceiling
 		// exists to catch units mixups, not to track the market.
 		MaxFeeRate: 5_000,
