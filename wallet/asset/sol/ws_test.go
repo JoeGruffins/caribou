@@ -189,7 +189,9 @@ func (s *testWSServer) notify(account string) bool {
 }
 
 // holdSubscribes makes every accountSubscribe reply wait for a send on the
-// returned channel, so a test can hold one in flight.
+// returned channel, so a test can hold one in flight. It is one-shot: nothing
+// clears s.holdSubs after the single reply is released, so a second
+// subscribe in the same test would block the server's read loop forever.
 func (s *testWSServer) holdSubscribes() chan<- struct{} {
 	hold := make(chan struct{})
 	s.mtx.Lock()
@@ -347,11 +349,16 @@ func TestWSClientLiveRequiresAllAccounts(t *testing.T) {
 	waitFor(t, "live", func() bool { return c.live.Load() })
 
 	// Registering a second account immediately un-lives the client, since one
-	// of two watched accounts is now unconfirmed.
+	// of two watched accounts is now unconfirmed. Hold the reply so the
+	// assertion below can't race the server's round trip: without this, a
+	// slow scheduler tick can let the subscribe reply land and re-live the
+	// client before c.live.Load() is checked.
+	hold := srv.holdSubscribes()
 	c.watch(ata, func() {})
 	if c.live.Load() {
 		t.Fatal("live with an unconfirmed subscription")
 	}
+	hold <- struct{}{}
 	recvString(t, srv.subbed, "token subscribe")
 	waitFor(t, "live with both", func() bool { return c.live.Load() })
 

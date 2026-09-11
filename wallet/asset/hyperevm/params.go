@@ -11,14 +11,19 @@ const (
 	// MainnetChainID is HyperEVM's chain ID (verified live via eth_chainId
 	// against https://rpc.hyperliquid.xyz/evm, 2026-08-22).
 	MainnetChainID = 999
+
+	// TestnetChainID is HyperEVM testnet's chain ID (verified live via
+	// eth_chainId against the official
+	// https://rpc.hyperliquid-testnet.xyz/evm, 2026-09-03).
+	TestnetChainID = 998
 )
 
 var (
-	// ChainIDs maps only Mainnet: HyperEVM testnet's RPC endpoint could not be
-	// reached (TLS handshake failure) to verify a chain ID, and simnet has no
-	// local HyperEVM node to test against. See ChainConfig.
+	// ChainIDs does not map Simnet: there is no local HyperEVM node to test
+	// against. See ChainConfig.
 	ChainIDs = map[util.Network]int64{
 		util.Mainnet: MainnetChainID,
+		util.Testnet: TestnetChainID,
 	}
 
 	// UnitInfo describes HYPE, the native gas token on HyperEVM. This is the

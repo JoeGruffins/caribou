@@ -103,18 +103,23 @@ func (d *Driver) Open(cfg *asset.WalletConfig, logger util.Logger, net util.Netw
 		defaultProviders = []string{"http://127.0.0.1:39556"}
 	case util.Testnet:
 		defaultProviders = []string{
+			// Verified working (2026-09-01)
 			"https://base-sepolia-rpc.publicnode.com",
 			"https://sepolia.base.org",
 			"https://base-sepolia.drpc.org",
-			"https://base-sepolia.api.onfinality.io/public", // heavily rate limited, mainnet seems fine
+			"https://84532.rpc.thirdweb.com", // thirdweb
 			"https://base-sepolia.gateway.tenderly.co",
 		}
 	case util.Mainnet:
 		defaultProviders = []string{
+			// Verified working (2026-09-01)
 			"https://base-rpc.publicnode.com", // not for production use
 			"https://mainnet.base.org",
 			"https://base.drpc.org",
-			"https://base.llamarpc.com",
+			// 1rpc.io caps eth_getLogs at a 50-block range (below
+			// maxScanBlocks), so it's kept for general RPC coverage
+			// rather than the transfer scan.
+			"https://1rpc.io/base",
 			"https://base.api.onfinality.io/public",
 		}
 	}
