@@ -39,6 +39,7 @@ type fakeServer struct {
 	txs        map[string]string         // txid -> raw hex
 	peers      [][]interface{}           // server.peers.subscribe reply
 	errs       map[string]string         // method -> scripted error message
+	muted      map[string]bool           // method -> swallow the request, never reply
 	broadcasts []string                  // raw hexes received
 	conns      map[net.Conn]*fakeConnState
 	closed     bool
@@ -65,6 +66,7 @@ func newFakeServer(t *testing.T, n int) (*fakeServer, *netparams.ChainParams) {
 		hist:  make(map[string][]HistoryEntry),
 		txs:   make(map[string]string),
 		errs:  make(map[string]string),
+		muted: make(map[string]bool),
 		conns: make(map[net.Conn]*fakeConnState),
 	}
 	prev := chainhash.Hash{}
@@ -139,6 +141,20 @@ func (f *fakeServer) FailMethod(method, errMsg string) {
 		delete(f.errs, method)
 	} else {
 		f.errs[method] = errMsg
+	}
+}
+
+// MuteMethod scripts a method to be swallowed: the request is read and never
+// answered, while every other method (server.ping included) keeps working,
+// so the connection stays alive and the caller's only way out is its
+// context.
+func (f *fakeServer) MuteMethod(method string, on bool) {
+	f.mtx.Lock()
+	defer f.mtx.Unlock()
+	if on {
+		f.muted[method] = true
+	} else {
+		delete(f.muted, method)
 	}
 }
 
@@ -286,7 +302,11 @@ func (f *fakeServer) serveConn(conn net.Conn, cs *fakeConnState) {
 		}
 		f.mtx.Lock()
 		scriptedErr := f.errs[req.Method]
+		muted := f.muted[req.Method]
 		f.mtx.Unlock()
+		if muted {
+			continue
+		}
 		if scriptedErr != "" {
 			cs.send(map[string]interface{}{
 				"jsonrpc": "2.0", "id": req.ID,
@@ -612,32 +632,46 @@ func TestSurgicalRotation(t *testing.T) {
 	}
 }
 
-// TestDivergenceReorgPromotion covers rotation plan R5: an observer serving
-// an equal-work conflicting chain passes the dissent audit; the wallet
-// server is quarantined, broadcasts suspend, the dissenter is promoted, the
-// header store reorgs onto its chain, and the suspension lifts.
-func TestDivergenceReorgPromotion(t *testing.T) {
-	oldInterval := observerCompareInterval
-	observerCompareInterval = 50 * time.Millisecond
-	t.Cleanup(func() { observerCompareInterval = oldInterval })
-	oldRetry := degradedRetryInterval
-	degradedRetryInterval = 50 * time.Millisecond
-	t.Cleanup(func() { degradedRetryInterval = oldRetry })
-
+// resetServerHealth clears the package-level health and quarantine state
+// left by other tests.
+func resetServerHealth() {
 	serverHealth.mtx.Lock()
 	serverHealth.m = make(map[string]*serverRecord)
 	serverHealth.quarantined = make(map[string]bool)
 	serverHealth.mtx.Unlock()
+}
 
+// tightenObserverLoop shortens the observer compare and degraded retry
+// intervals for the test's lifetime.
+func tightenObserverLoop(t *testing.T) {
+	t.Helper()
+	oldInterval, oldRetry := observerCompareInterval, degradedRetryInterval
+	observerCompareInterval = 50 * time.Millisecond
+	degradedRetryInterval = 50 * time.Millisecond
+	t.Cleanup(func() {
+		observerCompareInterval = oldInterval
+		degradedRetryInterval = oldRetry
+	})
+}
+
+// isQuarantined reports the process-lifetime quarantine flag for addr.
+func isQuarantined(addr string) bool {
+	serverHealth.mtx.Lock()
+	defer serverHealth.mtx.Unlock()
+	return serverHealth.quarantined[addr]
+}
+
+// startDivergentPair starts a network whose wallet server A and observer B
+// carry equal-work competing chains: B forks three blocks below the tip and
+// mines back to the same height. Returns the network and the fakes.
+func startDivergentPair(t *testing.T) (*Network, *fakeServer, *fakeServer) {
+	t.Helper()
 	fA, params := newFakeServer(t, 15)
 	fB, _ := newFakeServer(t, 15)
-	// B forks three blocks below the tip and mines back to the SAME height:
-	// equal cumulative work, which the audit treats as credible dissent.
 	fB.Fork(11, 3)
 	if fB.Tip() != fA.Tip() {
 		t.Fatalf("fork setup: tips %d vs %d", fB.Tip(), fA.Tip())
 	}
-
 	chainCfg, err := NewChainConfig(bisonwire.ChainBTC, params)
 	if err != nil {
 		t.Fatalf("NewChainConfig: %v", err)
@@ -653,73 +687,546 @@ func TestDivergenceReorgPromotion(t *testing.T) {
 	if err := net_.Start(t.Context()); err != nil {
 		t.Fatalf("Start: %v", err)
 	}
-	defer stopAndWait(net_)
+	t.Cleanup(func() { stopAndWait(net_) })
 	waitFor(t, "sync on A's chain", func() bool { return net_.Synced() && net_.Tip() == 14 })
+	waitFor(t, "observer on B", func() bool { return net_.ObserverCount() == 1 })
+	return net_, fA, fB
+}
 
-	// Drain tip notifications so the reorg delivery below can't block on
-	// the unbuffered-ish channel.
+// TestDivergenceTie: an observer serving an equal-work competing block at our
+// tip height is a tie, not a loss. Nothing rotates, nobody is demoted or
+// quarantined, and the observer keeps its slot. Acting on a tie chose a side
+// at random and the other side's observers reversed it on the next rotation,
+// walking through every shipped server.
+func TestDivergenceTie(t *testing.T) {
+	tightenObserverLoop(t)
+	resetServerHealth()
+	net_, fA, fB := startDivergentPair(t)
 	go func() {
 		for range net_.TipChangeChan() { //nolint:revive
 		}
 	}()
 
-	fBTip := fB.Tip()
+	// Let the compare loop audit the tie repeatedly.
+	time.Sleep(12 * observerCompareInterval)
+
+	if got := net_.currentWalletAddr(); got != fA.addr().Addr {
+		t.Fatalf("wallet server rotated to %s on an equal-work tie", got)
+	}
+	if isQuarantined(fA.addr().Addr) || isQuarantined(fB.addr().Addr) {
+		t.Fatal("a server was quarantined on an equal-work tie")
+	}
+	serverHealth.mtx.Lock()
+	demoted := serverHealth.m[fA.addr().Addr] != nil
+	serverHealth.mtx.Unlock()
+	if demoted {
+		t.Fatal("wallet server demoted on an equal-work tie")
+	}
+	if net_.ObserverCount() != 1 {
+		t.Fatalf("observer demoted on an equal-work tie (%d observers)", net_.ObserverCount())
+	}
+}
+
+// TestDivergenceTieBrokenByExtension covers rotation plan R5, corrected: an
+// equal-work tie is settled by the next block. Once the dissenting observer's
+// chain extends, the wallet server has lost a verified divergence — it is
+// demoted (never quarantined: being behind on a fork is slowness), the
+// dissenter is promoted, and the header store reorgs onto its chain rewinding
+// exactly to the fork.
+func TestDivergenceTieBrokenByExtension(t *testing.T) {
+	tightenObserverLoop(t)
+	resetServerHealth()
+	net_, fA, fB := startDivergentPair(t)
+
+	var discMtx sync.Mutex
+	var disc []DisconnectedBlock
+	go func() {
+		for tc := range net_.TipChangeChan() {
+			discMtx.Lock()
+			disc = append(disc, tc.Disconnected...)
+			discMtx.Unlock()
+		}
+	}()
+
+	// B pulls ahead by one block: its chain now carries more work.
+	fB.MineBlocks(1)
 	fB.mtx.Lock()
-	wantTip := fB.chain[fBTip].BlockHash()
+	wantTip := fB.chain[15].BlockHash()
 	fB.mtx.Unlock()
 
-	// The observer connects to B, sees the conflicting tip at a height we
-	// have, and the divergence machinery takes it from there. The compare
-	// loop ticks every observerCompareInterval (30s) — nudge it by forcing
-	// an immediate pass through fill+compare via a fresh notification.
 	waitFor(t, "rotation to the dissenter", func() bool {
 		return net_.currentWalletAddr() == fB.addr().Addr
 	})
 	waitFor(t, "reorg onto B's chain", func() bool {
-		return net_.TipHash() == wantTip
+		return net_.Tip() == 15 && net_.TipHash() == wantTip
 	})
-	if !serverHealth.quarantined[fA.addr().Addr] {
-		t.Fatal("losing wallet server not quarantined")
+
+	// Exactly the orphaned blocks (14, 13, 12) were disconnected — not a
+	// blind window's worth, which would have rolled the wallet's tx store
+	// back through five innocent blocks.
+	discMtx.Lock()
+	got := append([]DisconnectedBlock(nil), disc...)
+	discMtx.Unlock()
+	if len(got) != 3 || got[0].Height != 14 || got[1].Height != 13 || got[2].Height != 12 {
+		heights := make([]int32, 0, len(got))
+		for _, d := range got {
+			heights = append(heights, d.Height)
+		}
+		t.Fatalf("disconnected heights = %v, want [14 13 12]", heights)
 	}
-	waitFor(t, "broadcast suspension lifted", func() bool {
-		return !net_.spendSuspect.Load()
-	})
+
+	// The loser is demoted, not quarantined.
+	if isQuarantined(fA.addr().Addr) {
+		t.Fatal("losing wallet server quarantined")
+	}
+	serverHealth.mtx.Lock()
+	demoted := serverHealth.m[fA.addr().Addr] != nil
+	serverHealth.mtx.Unlock()
+	if !demoted {
+		t.Fatal("losing wallet server not demoted")
+	}
 
 	// The divergence path rotates away from a LIVE node, so rotate itself
 	// closes it, waking the dead node's watchNode, which hands off a
 	// duplicate rotate. That duplicate must bail instead of joining the
 	// successor's healthy loop group — a join there holds the rotation
 	// mutex until the successor dies, wedging every future rotation.
-	rotMtxFree := func() bool {
+	waitFor(t, "rotation mutex released", func() bool {
 		if !net_.rot.mtx.TryLock() {
 			return false
 		}
 		net_.rot.mtx.Unlock()
 		return true
-	}
-	waitFor(t, "rotation mutex released", rotMtxFree)
-
-	// And rotation must still function end to end: kill the successor —
-	// with A quarantined and B excluded as the failed node, the rotation
-	// lands degraded — then let the degraded loop re-elect B once it
-	// answers again. The degraded state is observed via the transition
-	// counter rather than the (transient) empty wallet slot, which the
-	// degraded loop can re-fill within one polling interval; requiring a
-	// transition keeps the recovery check from passing vacuously on the
-	// pre-rotation state.
-	degradedBefore := degradedEntries.Load()
-	fB.KillConns()
-	waitFor(t, "degraded after successor death", func() bool {
-		return degradedEntries.Load() > degradedBefore
 	})
-	waitFor(t, "re-election after successor death", func() bool {
-		return net_.currentWalletAddr() == fB.addr().Addr && rotMtxFree()
-	})
-
 	select {
 	case <-net_.Done():
 		t.Fatal("network shut down during reorg promotion")
 	default:
+	}
+}
+
+// TestDivergencePatience: a verified loss must persist across two ticks
+// before the wallet server is rotated away from. The tie-breaking block
+// reaches observers and the wallet server seconds apart, and a tick landing
+// in that gap must not rotate away from a server about to catch up.
+func TestDivergencePatience(t *testing.T) {
+	resetServerHealth()
+
+	fA, params := newFakeServer(t, 15) // wallet server
+	fB, _ := newFakeServer(t, 15)      // observer on a heavier fork
+	fB.Fork(11, 3)
+	fB.MineBlocks(1)
+
+	chainCfg, err := NewChainConfig(bisonwire.ChainBTC, params)
+	if err != nil {
+		t.Fatalf("NewChainConfig: %v", err)
+	}
+	net_, err := NewNetwork(&Config{
+		Chain:   chainCfg,
+		Servers: []*ServerAddr{fA.addr(), fB.addr()},
+		DataDir: t.TempDir(),
+	})
+	if err != nil {
+		t.Fatalf("NewNetwork: %v", err)
+	}
+	o, tipA, tipB := installWalletAndObserver(t, net_, fA, fB, params)
+
+	st := &observerLoopState{lagBlocks: 2}
+	demoted := func() bool {
+		serverHealth.mtx.Lock()
+		defer serverHealth.mtx.Unlock()
+		return serverHealth.m[fA.addr().Addr] != nil
+	}
+
+	// First tick: the loss is recorded, nothing acts on it.
+	net_.observerTick(st)
+	if st.pendingLoss == nil {
+		t.Fatal("verified loss not recorded on the first tick")
+	}
+	if demoted() || net_.currentWalletAddr() != fA.addr().Addr {
+		t.Fatal("acted on a verified loss after a single tick")
+	}
+
+	// The conflict clears before the next tick (the observer now reports
+	// A's chain): the pending loss is dropped, nothing rotates.
+	o.setTip(tipA)
+	net_.observerTick(st)
+	if st.pendingLoss != nil {
+		t.Fatal("pending loss survived a tick without conflict")
+	}
+	if demoted() || net_.currentWalletAddr() != fA.addr().Addr {
+		t.Fatal("rotated on a transient divergence")
+	}
+
+	// The conflict returns and persists: the second consecutive tick acts.
+	o.setTip(tipB)
+	net_.observerTick(st)
+	if st.pendingLoss == nil {
+		t.Fatal("verified loss not re-recorded")
+	}
+	net_.observerTick(st)
+	waitFor(t, "rotation to the winning observer", func() bool {
+		return net_.currentWalletAddr() == fB.addr().Addr
+	})
+	if !demoted() {
+		t.Fatal("losing wallet server not demoted on a persisted loss")
+	}
+	if isQuarantined(fA.addr().Addr) {
+		t.Fatal("losing wallet server quarantined")
+	}
+}
+
+// installWalletAndObserver wires an unstarted network by hand for tests that
+// drive observerTick directly: fA takes the wallet slot with the store synced
+// to its chain, fB is installed as a live observer at its own tip. Returns
+// the observer and both subscription tips.
+func installWalletAndObserver(t *testing.T, net_ *Network, fA, fB *fakeServer,
+	params *netparams.ChainParams) (o *observer, tipA, tipB *HeadersTip) {
+
+	t.Helper()
+	net_.ctx, net_.cancel = context.WithCancel(t.Context())
+	net_.obsMtx.Lock()
+	net_.observers = make(map[string]*observer)
+	net_.obsMtx.Unlock()
+	t.Cleanup(func() {
+		net_.cancel()
+		net_.wg.Wait()
+		net_.pool.flush()
+	})
+	go func() {
+		for range net_.TipChangeChan() { //nolint:revive
+		}
+	}()
+
+	nodeA, err := NewNode(net_.ctx, fA.addr(), "", params.GenesisHash.String())
+	if err != nil {
+		t.Fatalf("NewNode(A): %v", err)
+	}
+	tipA, err = nodeA.SubscribeHeaders(net_.ctx)
+	if err != nil {
+		t.Fatalf("SubscribeHeaders(A): %v", err)
+	}
+	if err := net_.syncHeaders(net_.ctx, nodeA, tipA.Height); err != nil {
+		t.Fatalf("syncHeaders: %v", err)
+	}
+	net_.mu.Lock()
+	net_.node = nodeA
+	net_.mu.Unlock()
+
+	nodeB, err := NewNode(net_.ctx, fB.addr(), "", params.GenesisHash.String())
+	if err != nil {
+		t.Fatalf("NewNode(B): %v", err)
+	}
+	tipB, err = nodeB.SubscribeHeaders(net_.ctx)
+	if err != nil {
+		t.Fatalf("SubscribeHeaders(B): %v", err)
+	}
+	o = &observer{node: nodeB, stopDrain: make(chan struct{})}
+	o.setTip(tipB)
+	net_.obsMtx.Lock()
+	net_.observers[fB.addr().Addr] = o
+	net_.obsMtx.Unlock()
+	return o, tipA, tipB
+}
+
+// TestObserverTickSkipsStalledObserver: an observer one block ahead is probed
+// at the local tip every tick. One that accepts the request and never answers
+// (while still answering pings, so its socket stays alive) must not park the
+// tick — the same loop runs lag detection, observer replacement and peer
+// discovery — and is not a divergence.
+func TestObserverTickSkipsStalledObserver(t *testing.T) {
+	resetServerHealth()
+	oldTimeout := rpcTimeout
+	rpcTimeout = 200 * time.Millisecond
+	t.Cleanup(func() { rpcTimeout = oldTimeout })
+
+	fA, params := newFakeServer(t, 15) // wallet server
+	fB, _ := newFakeServer(t, 16)      // observer, same chain, one block ahead
+	fB.MuteMethod("blockchain.block.headers", true)
+
+	chainCfg, err := NewChainConfig(bisonwire.ChainBTC, params)
+	if err != nil {
+		t.Fatalf("NewChainConfig: %v", err)
+	}
+	net_, err := NewNetwork(&Config{
+		Chain:   chainCfg,
+		Servers: []*ServerAddr{fA.addr(), fB.addr()},
+		DataDir: t.TempDir(),
+	})
+	if err != nil {
+		t.Fatalf("NewNetwork: %v", err)
+	}
+	installWalletAndObserver(t, net_, fA, fB, params)
+
+	st := &observerLoopState{lagBlocks: 1}
+	start := time.Now()
+	net_.observerTick(st)
+	if elapsed := time.Since(start); elapsed > 5*time.Second {
+		t.Fatalf("observerTick took %v against a stalled observer; probe unbounded", elapsed)
+	}
+	if st.pendingLoss != nil {
+		t.Fatal("a stalled probe was recorded as a divergence")
+	}
+	if st.lagSince.IsZero() {
+		t.Fatal("lag bookkeeping did not advance on the same tick")
+	}
+	if net_.currentWalletAddr() != fA.addr().Addr {
+		t.Fatal("wallet slot changed on a stalled probe")
+	}
+	serverHealth.mtx.Lock()
+	demoted := serverHealth.m[fB.addr().Addr] != nil
+	serverHealth.mtx.Unlock()
+	if demoted {
+		t.Fatal("stalled observer demoted by a probe timeout")
+	}
+}
+
+// TestSameHeightReorg: the wallet server switching sides of a same-height
+// tie notifies a header at the store's own height with a different hash. The
+// store must follow at once, rewinding exactly the losing block, rather than
+// wait for the next block to fail to link.
+func TestSameHeightReorg(t *testing.T) {
+	f, params := newFakeServer(t, 15)
+	chainCfg, err := NewChainConfig(bisonwire.ChainBTC, params)
+	if err != nil {
+		t.Fatalf("NewChainConfig: %v", err)
+	}
+	net_, err := NewNetwork(&Config{
+		Chain:         chainCfg,
+		TrustedServer: f.addr(),
+		DataDir:       t.TempDir(),
+	})
+	if err != nil {
+		t.Fatalf("NewNetwork: %v", err)
+	}
+	if err := net_.Start(t.Context()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer stopAndWait(net_)
+	waitFor(t, "sync", func() bool { return net_.Synced() && net_.Tip() == 14 })
+
+	var discMtx sync.Mutex
+	var disc []DisconnectedBlock
+	go func() {
+		for tc := range net_.TipChangeChan() {
+			discMtx.Lock()
+			disc = append(disc, tc.Disconnected...)
+			discMtx.Unlock()
+		}
+	}()
+
+	oldTip := net_.TipHash()
+	f.Fork(13, 1) // same height, new hash
+	f.mtx.Lock()
+	wantTip := f.chain[14].BlockHash()
+	f.mtx.Unlock()
+	if wantTip == oldTip {
+		t.Fatal("fork setup: tip unchanged")
+	}
+	waitFor(t, "same-height reorg", func() bool {
+		return net_.Tip() == 14 && net_.TipHash() == wantTip
+	})
+	discMtx.Lock()
+	got := append([]DisconnectedBlock(nil), disc...)
+	discMtx.Unlock()
+	if len(got) != 1 || got[0].Height != 14 || got[0].Hash != oldTip {
+		t.Fatalf("disconnected = %+v, want exactly the old block 14", got)
+	}
+}
+
+// TestElectionPrefersWinningChain: with two live observers, one on the
+// wallet server's (losing) chain and one on the winning chain, the
+// divergence rotation lands on the winning observer even though the other
+// precedes it in election order. Landing on the loser would drag the store
+// back onto the losing chain and repeat the divergence next tick.
+func TestElectionPrefersWinningChain(t *testing.T) {
+	if maxObservers < 2 {
+		// The mobile build keeps one observer; the preference between
+		// two live observers cannot arise there.
+		t.Skipf("needs two observer slots, build has %d", maxObservers)
+	}
+	tightenObserverLoop(t)
+	resetServerHealth()
+
+	fA, params := newFakeServer(t, 15) // wallet server
+	fC, _ := newFakeServer(t, 15)      // same chain as A, first in election order
+	fB, _ := newFakeServer(t, 15)      // forks, then wins
+	fB.Fork(11, 3)
+
+	chainCfg, err := NewChainConfig(bisonwire.ChainBTC, params)
+	if err != nil {
+		t.Fatalf("NewChainConfig: %v", err)
+	}
+	net_, err := NewNetwork(&Config{
+		Chain:   chainCfg,
+		Servers: []*ServerAddr{fA.addr(), fC.addr(), fB.addr()},
+		DataDir: t.TempDir(),
+	})
+	if err != nil {
+		t.Fatalf("NewNetwork: %v", err)
+	}
+	if err := net_.Start(t.Context()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer stopAndWait(net_)
+	go func() {
+		for range net_.TipChangeChan() { //nolint:revive
+		}
+	}()
+	waitFor(t, "sync on A's chain", func() bool { return net_.Synced() && net_.Tip() == 14 })
+	waitFor(t, "observers on B and C", func() bool { return net_.ObserverCount() == 2 })
+
+	fB.MineBlocks(1)
+	fB.mtx.Lock()
+	wantTip := fB.chain[15].BlockHash()
+	fB.mtx.Unlock()
+	waitFor(t, "rotation to the winning observer", func() bool {
+		return net_.currentWalletAddr() == fB.addr().Addr && net_.TipHash() == wantTip
+	})
+	if isQuarantined(fC.addr().Addr) {
+		t.Fatal("bystander observer on the losing chain quarantined")
+	}
+}
+
+// TestTryElectSkipsLosingChain: under a divergence hint, a fresh-dialed
+// candidate serving the losing header at the conflict height is skipped even
+// though it precedes the winning server in election order, and the election
+// attaches to the winner, reorging the store onto its chain.
+func TestTryElectSkipsLosingChain(t *testing.T) {
+	resetServerHealth()
+
+	fC, params := newFakeServer(t, 15) // losing chain, first in election order
+	fB, _ := newFakeServer(t, 15)      // winning chain
+	fB.Fork(11, 3)
+	fB.MineBlocks(1)
+
+	chainCfg, err := NewChainConfig(bisonwire.ChainBTC, params)
+	if err != nil {
+		t.Fatalf("NewChainConfig: %v", err)
+	}
+	net_, err := NewNetwork(&Config{
+		Chain:   chainCfg,
+		Servers: []*ServerAddr{fC.addr(), fB.addr()},
+		DataDir: t.TempDir(),
+	})
+	if err != nil {
+		t.Fatalf("NewNetwork: %v", err)
+	}
+	net_.ctx, net_.cancel = context.WithCancel(t.Context())
+	net_.obsMtx.Lock()
+	net_.observers = make(map[string]*observer)
+	net_.obsMtx.Unlock()
+	t.Cleanup(func() {
+		net_.cancel()
+		net_.wg.Wait()
+		net_.pool.flush()
+	})
+	go func() {
+		for range net_.TipChangeChan() { //nolint:revive
+		}
+	}()
+
+	// Seed the store with the losing chain.
+	seed, err := NewNode(net_.ctx, fC.addr(), "", params.GenesisHash.String())
+	if err != nil {
+		t.Fatalf("NewNode: %v", err)
+	}
+	if err := net_.syncHeaders(net_.ctx, seed, 14); err != nil {
+		t.Fatalf("syncHeaders: %v", err)
+	}
+	seed.Close()
+
+	fB.mtx.Lock()
+	winner := fB.chain[14].BlockHash()
+	wantTip := fB.chain[15].BlockHash()
+	fB.mtx.Unlock()
+	hint := &electionHint{wantHeight: 14, wantHash: winner}
+
+	net_.rot.mtx.Lock()
+	ok := net_.tryElect("", hint)
+	net_.rot.mtx.Unlock()
+	if !ok {
+		t.Fatal("election found no successor")
+	}
+	if got := net_.currentWalletAddr(); got != fB.addr().Addr {
+		t.Fatalf("elected %s, want the winning server %s", got, fB.addr().Addr)
+	}
+	if net_.Tip() != 15 || net_.TipHash() != wantTip {
+		t.Fatalf("store at %d/%s, want 15/%s", net_.Tip(), net_.TipHash(), wantTip)
+	}
+	if isQuarantined(fC.addr().Addr) {
+		t.Fatal("skipped candidate quarantined")
+	}
+}
+
+// TestTryElectSkipsStalledCandidate: a candidate that completes the handshake
+// and answers pings but never answers the winning-chain probe must not hold
+// the election — and with it the rotation mutex — on the network context.
+// The election moves on to the next candidate within the probe budget.
+func TestTryElectSkipsStalledCandidate(t *testing.T) {
+	resetServerHealth()
+	oldTimeout := rpcTimeout
+	rpcTimeout = 200 * time.Millisecond
+	t.Cleanup(func() { rpcTimeout = oldTimeout })
+
+	fC, params := newFakeServer(t, 16) // stalled, first in election order
+	fB, _ := newFakeServer(t, 16)      // healthy, same chain
+	fC.MuteMethod("blockchain.block.headers", true)
+
+	chainCfg, err := NewChainConfig(bisonwire.ChainBTC, params)
+	if err != nil {
+		t.Fatalf("NewChainConfig: %v", err)
+	}
+	net_, err := NewNetwork(&Config{
+		Chain:   chainCfg,
+		Servers: []*ServerAddr{fC.addr(), fB.addr()},
+		DataDir: t.TempDir(),
+	})
+	if err != nil {
+		t.Fatalf("NewNetwork: %v", err)
+	}
+	net_.ctx, net_.cancel = context.WithCancel(t.Context())
+	net_.obsMtx.Lock()
+	net_.observers = make(map[string]*observer)
+	net_.obsMtx.Unlock()
+	t.Cleanup(func() {
+		net_.cancel()
+		net_.wg.Wait()
+		net_.pool.flush()
+	})
+	go func() {
+		for range net_.TipChangeChan() { //nolint:revive
+		}
+	}()
+
+	seed, err := NewNode(net_.ctx, fB.addr(), "", params.GenesisHash.String())
+	if err != nil {
+		t.Fatalf("NewNode: %v", err)
+	}
+	if err := net_.syncHeaders(net_.ctx, seed, 15); err != nil {
+		t.Fatalf("syncHeaders: %v", err)
+	}
+	seed.Close()
+
+	// Both tips sit above the conflict height, so the candidate is judged
+	// by fetching the header there — the request fC swallows.
+	fB.mtx.Lock()
+	winner := fB.chain[14].BlockHash()
+	fB.mtx.Unlock()
+	hint := &electionHint{wantHeight: 14, wantHash: winner}
+
+	start := time.Now()
+	net_.rot.mtx.Lock()
+	ok := net_.tryElect("", hint)
+	net_.rot.mtx.Unlock()
+	if elapsed := time.Since(start); elapsed > 5*time.Second {
+		t.Fatalf("election took %v against a stalled candidate; probe unbounded", elapsed)
+	}
+	if !ok {
+		t.Fatal("election found no successor")
+	}
+	if got := net_.currentWalletAddr(); got != fB.addr().Addr {
+		t.Fatalf("elected %s, want the healthy server %s", got, fB.addr().Addr)
 	}
 }
 

@@ -16,6 +16,7 @@ import (
 	"net"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/btcsuite/btcd/wire"
 )
@@ -33,6 +34,22 @@ const (
 	// userAgent identifies the client to the server in server.version.
 	userAgent = "Caribou"
 )
+
+// handshakeTimeout bounds the server.version and server.features round trips
+// of a fresh connection. Elections run under the rotation mutex, so a server
+// that accepts the socket but never answers must not hold rotations hostage
+// on the network context. A variable so tests can tighten it.
+var handshakeTimeout = 10 * time.Second
+
+// rpcTimeout bounds a single control-path round trip after the handshake:
+// the header subscription and winning-chain probe of an election candidate,
+// an observer's divergence probe and audit fetch, and peer discovery. These
+// run on the rotation and observer control loops, and a request only returns
+// on context cancellation or socket death — a server that keeps answering
+// pings but swallows one method would otherwise park the loop for the life
+// of the network. Every reply is small (a tip, one header, a short batch, a
+// peer list), so the bound is generous. A variable so tests can tighten it.
+var rpcTimeout = 15 * time.Second
 
 // Node is a single connected electrumx peer. It wraps a Server and exposes
 // the JSON-RPC methods we use.
@@ -77,7 +94,9 @@ func NewNode(ctx context.Context, addr *ServerAddr, torProxy string, expectedGen
 		server: srv,
 	}
 
-	vers, err := n.serverVersion(ctx)
+	hctx, cancel := context.WithTimeout(ctx, handshakeTimeout)
+	defer cancel()
+	vers, err := n.serverVersion(hctx)
 	if err != nil {
 		srv.Close()
 		return nil, fmt.Errorf("electrum: server.version: %w", err)
@@ -85,7 +104,7 @@ func NewNode(ctx context.Context, addr *ServerAddr, torProxy string, expectedGen
 	n.softwareVersion = vers[0]
 	n.protocolVersion = vers[1]
 
-	feats, err := n.serverFeatures(ctx)
+	feats, err := n.serverFeatures(hctx)
 	if err != nil {
 		srv.Close()
 		return nil, fmt.Errorf("electrum: server.features: %w", err)
