@@ -1,6 +1,7 @@
 package fiatrates
 
 import (
+	"bytes"
 	"context"
 	"encoding/hex"
 	"encoding/json"
@@ -8,6 +9,7 @@ import (
 	"io"
 	"math/big"
 	"net/http"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -222,18 +224,41 @@ func TestChainlinkLive(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	tickers := []string{"BTC", "ETH", "LTC", "BCH", "DOGE", "ZEC", "LINK", "XRP", "SOL", "BNB", "MATIC", "USDC", "USDT", "PAXG", "WBTC"}
+	// Request every configured feed, so an address added to the table without
+	// being exercised here is not possible.
+	tickers := make([]string, 0, len(chainlinkPolygonFeeds))
+	for ticker := range chainlinkPolygonFeeds {
+		tickers = append(tickers, ticker)
+	}
+	sort.Strings(tickers)
+
 	rates, err := getRates(ctx, tickers, log)
 	if err != nil {
 		t.Fatalf("failed to fetch rates: %v", err)
 	}
 
-	if len(rates) == 0 {
-		t.Fatal("failed to fetch any prices")
+	for _, ticker := range tickers {
+		if price, ok := rates[ticker]; ok {
+			t.Logf("  %s: $%.2f", ticker, price)
+		} else {
+			t.Logf("  %s: no rate", ticker)
+		}
 	}
 
-	for ticker, price := range rates {
-		t.Logf("  %s: $%.2f", ticker, price)
+	// A continuously updated feed is always inside its bound, so a missing
+	// rate means a wrong or transposed address rather than expected staleness.
+	// Feeds on a daily heartbeat are genuinely allowed to be absent, which is
+	// why only the fast ones are required. Asserting merely that some rate came
+	// back would pass on BTC alone and hide a bad address in every other entry.
+	for _, ticker := range tickers {
+		feed := chainlinkPolygonFeeds[ticker]
+		if feed.heartbeat > chainlinkGraceCutoff {
+			continue
+		}
+		if _, ok := rates[ticker]; !ok {
+			t.Errorf("no rate for %s, whose feed has a %v heartbeat and should always be fresh; check %s",
+				ticker, feed.heartbeat, feed.addr)
+		}
 	}
 
 	t.Logf("Successfully fetched %d/%d prices", len(rates), len(tickers))
@@ -241,12 +266,15 @@ func TestChainlinkLive(t *testing.T) {
 
 // TestChainlinkFeedsExist verifies all configured feeds have valid addresses.
 func TestChainlinkFeedsExist(t *testing.T) {
-	for ticker, addr := range chainlinkPolygonFeeds {
-		if addr == (common.Address{}) {
+	for ticker, feed := range chainlinkPolygonFeeds {
+		if feed.addr == (common.Address{}) {
 			t.Errorf("%s feed has zero address", ticker)
 		}
+		if feed.heartbeat <= 0 {
+			t.Errorf("%s feed has no heartbeat; staleness cannot be bounded without one", ticker)
+		}
 	}
-	t.Logf("verified %d feeds with valid addresses", len(chainlinkPolygonFeeds))
+	t.Logf("verified %d feeds with valid addresses and heartbeats", len(chainlinkPolygonFeeds))
 }
 
 // TestChainlinkMissingTicker tests handling of tickers with no configured feed.
@@ -375,6 +403,11 @@ func TestChainlinkRateFetcherEmptyProviders(t *testing.T) {
 // is keyed on this address.
 var mockFeedAddr = common.HexToAddress("0x1234567890abcdef1234567890abcdef12345678")
 
+// mockFastHeartbeat is the heartbeat of the continuously updated Polygon feeds
+// (BTC, ETH, SOL, XRP, BNB, MATIC), used wherever a test feed's own heartbeat
+// is not the subject of the test.
+const mockFastHeartbeat = 27 * time.Second
+
 // mockBatchContract is a test mock of chainlinkBatchContract.
 type mockBatchContract struct {
 	readings map[common.Address]MultiAggregatorReading
@@ -397,12 +430,19 @@ func (m *mockBatchContract) read(_ context.Context, addrs []common.Address) ([]M
 
 // newMockCoreFetch wires a single mock batch contract into chainlinkBatchFetcherCore
 // under the given ticker, so closure tests exercise the production code path.
+// The feed gets the 27s heartbeat of the continuously updated Polygon feeds,
+// the tightest staleness bound in the table.
 func newMockCoreFetch(ticker string, mock *mockBatchContract) func(context.Context, []string, util.Logger) (map[string]float64, error) {
+	return newMockCoreFetchWithFeed(chainlinkFeed{mockFeedAddr, mockFastHeartbeat}, ticker, mock)
+}
+
+// newMockCoreFetchWithFeed is newMockCoreFetch for a caller that needs a
+// specific heartbeat.
+func newMockCoreFetchWithFeed(feed chainlinkFeed, ticker string, mock *mockBatchContract) func(context.Context, []string, util.Logger) (map[string]float64, error) {
 	return chainlinkBatchFetcherCore(
-		map[string]common.Address{ticker: mockFeedAddr},
+		map[string]chainlinkFeed{ticker: feed},
 		func(context.Context) (chainRPCClient, error) { return newMockRPCClient(), nil },
 		func(_ chainRPCClient) chainlinkBatchContract { return mock },
-		chainlinkMaxAge,
 	)
 }
 
@@ -498,7 +538,7 @@ func TestChainlinkClosureDecimals(t *testing.T) {
 // TestChainlinkClosureMissingTicker tests that tickers absent from feeds are silently skipped.
 func TestChainlinkClosureMissingTicker(t *testing.T) {
 	fetch := chainlinkBatchFetcherCore(
-		map[string]common.Address{}, // no feeds configured
+		map[string]chainlinkFeed{}, // no feeds configured
 		func(context.Context) (chainRPCClient, error) {
 			t.Fatal("dial should not happen when no requested ticker has a feed")
 			return nil, nil
@@ -507,7 +547,6 @@ func TestChainlinkClosureMissingTicker(t *testing.T) {
 			t.Fatal("newBatchContract should not be called for unmatched tickers")
 			return nil
 		},
-		chainlinkMaxAge,
 	)
 
 	log := util.NewLogger("test", util.LevelDebug, io.Discard)
@@ -520,14 +559,15 @@ func TestChainlinkClosureMissingTicker(t *testing.T) {
 	}
 }
 
-// TestChainlinkClosureStaleness tests that prices older than chainlinkMaxAge
-// cause an error so the oracle preserves its last-known rates.
+// TestChainlinkClosureStaleness tests that a price older than its feed's
+// maxAge causes an error so the oracle preserves its last-known rates.
 func TestChainlinkClosureStaleness(t *testing.T) {
+	feed := chainlinkFeed{mockFeedAddr, mockFastHeartbeat}
 	mock := &mockBatchContract{readings: map[common.Address]MultiAggregatorReading{
 		mockFeedAddr: {
 			Answer:    big.NewInt(5000000000000),
 			Decimals:  8,
-			UpdatedAt: big.NewInt(time.Now().Add(-(chainlinkMaxAge + time.Minute)).Unix()),
+			UpdatedAt: big.NewInt(time.Now().Add(-(feed.maxAge() + time.Minute)).Unix()),
 			Ok:        true,
 		},
 	}}
@@ -537,6 +577,180 @@ func TestChainlinkClosureStaleness(t *testing.T) {
 	_, err := fetch(context.Background(), []string{"BTC"}, log)
 	if err == nil {
 		t.Fatal("expected error when all feeds are stale, got nil")
+	}
+}
+
+// TestChainlinkFeedMaxAge tests the grace applied to each class of heartbeat.
+func TestChainlinkFeedMaxAge(t *testing.T) {
+	tests := []struct {
+		name      string
+		heartbeat time.Duration
+		want      time.Duration
+	}{
+		{"continuous feed", 27 * time.Second, 27*time.Second + 5*time.Minute},
+		{"hourly feed", time.Hour, time.Hour + 5*time.Minute},
+		{"just over the cutoff", time.Hour + time.Second, time.Hour + time.Second + time.Hour},
+		{"daily feed", 24 * time.Hour, 25 * time.Hour},
+	}
+	for _, tt := range tests {
+		if got := (chainlinkFeed{heartbeat: tt.heartbeat}).maxAge(); got != tt.want {
+			t.Errorf("%s: maxAge = %v, want %v", tt.name, got, tt.want)
+		}
+	}
+}
+
+// TestChainlinkClosureHeartbeatBounds tests that the age a feed tolerates
+// follows its own heartbeat: a daily feed accepts a reading that a continuous
+// feed rejects.
+func TestChainlinkClosureHeartbeatBounds(t *testing.T) {
+	tests := []struct {
+		name      string
+		heartbeat time.Duration
+		age       time.Duration
+		wantRate  bool
+	}{
+		{"daily feed accepts a 5h reading", 24 * time.Hour, 5 * time.Hour, true},
+		{"daily feed rejects a 26h reading", 24 * time.Hour, 26 * time.Hour, false},
+		{"continuous feed rejects a 10m reading", 27 * time.Second, 10 * time.Minute, false},
+		{"continuous feed accepts a 1m reading", 27 * time.Second, time.Minute, true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			mock := &mockBatchContract{readings: map[common.Address]MultiAggregatorReading{
+				mockFeedAddr: {
+					Answer:    big.NewInt(5000000000000),
+					Decimals:  8,
+					UpdatedAt: big.NewInt(time.Now().Add(-tt.age).Unix()),
+					Ok:        true,
+				},
+			}}
+			const ticker = "TEST"
+			fetch := newMockCoreFetchWithFeed(chainlinkFeed{mockFeedAddr, tt.heartbeat}, ticker, mock)
+
+			log := util.NewLogger("test", util.LevelDebug, io.Discard)
+			rates, err := fetch(context.Background(), []string{ticker}, log)
+			if tt.wantRate {
+				if err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
+				if _, ok := rates[ticker]; !ok {
+					t.Fatalf("expected a rate for %s", ticker)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatal("expected an error for a stale reading, got nil")
+			}
+		})
+	}
+}
+
+// TestChainlinkStalenessRepeatInterval tests that the steady-state warning is
+// spaced by the tracker's interval rather than suppressed outright, so a feed
+// that has stopped reporting keeps saying so.
+func TestChainlinkStalenessRepeatInterval(t *testing.T) {
+	const (
+		ticker = "TEST"
+		maxAge = time.Hour
+		age    = 2 * time.Hour
+	)
+	tests := []struct {
+		name     string
+		interval time.Duration
+		cycles   int
+		wantWarn int
+	}{
+		{"long interval warns once", time.Hour, 4, 1},
+		{"zero interval warns every cycle", 0, 4, 4},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var buf bytes.Buffer
+			log := util.NewLogger("test", util.LevelDebug, &buf)
+			tracker := newStalenessTracker(tt.interval)
+			for i := 0; i < tt.cycles; i++ {
+				if !tracker.check(log, ticker, age, maxAge) {
+					t.Fatalf("cycle %d: expected stale", i)
+				}
+			}
+			if got := strings.Count(buf.String(), "stale price"); got != tt.wantWarn {
+				t.Errorf("got %d warnings over %d cycles, want %d:\n%s",
+					got, tt.cycles, tt.wantWarn, buf.String())
+			}
+		})
+	}
+}
+
+// TestChainlinkStalenessRoundsAgainstLimit tests that the age and the limit are
+// reported at the same precision, so a reading just past a sub-minute limit
+// does not print as though it were inside it.
+func TestChainlinkStalenessRoundsAgainstLimit(t *testing.T) {
+	var buf bytes.Buffer
+	log := util.NewLogger("test", util.LevelDebug, &buf)
+
+	// A 27s feed: maxAge is 5m27s, and 5m28s is one second past it.
+	feed := chainlinkFeed{mockFeedAddr, 27 * time.Second}
+	newStalenessTracker(time.Hour).check(log, "TEST", feed.maxAge()+time.Second, feed.maxAge())
+	if out := buf.String(); !strings.Contains(out, "updated 5m28s ago, limit 5m27s") {
+		t.Errorf("sub-hour limit should keep seconds on both values, got:\n%s", out)
+	}
+
+	// A daily feed: minutes are precision enough against a 25h limit.
+	buf.Reset()
+	daily := chainlinkFeed{mockFeedAddr, 24 * time.Hour}
+	newStalenessTracker(time.Hour).check(log, "TEST2", 26*time.Hour, daily.maxAge())
+	if out := buf.String(); !strings.Contains(out, "updated 26h0m0s ago, limit 25h0m0s") {
+		t.Errorf("hour-scale limit should round to the minute, got:\n%s", out)
+	}
+}
+
+// TestChainlinkStalenessLoggedOnTransition tests that a feed that stays stale
+// warns once rather than on every cycle, and that recovery is reported.
+func TestChainlinkStalenessLoggedOnTransition(t *testing.T) {
+	reading := func(age time.Duration) map[common.Address]MultiAggregatorReading {
+		return map[common.Address]MultiAggregatorReading{
+			mockFeedAddr: {
+				Answer:    big.NewInt(5000000000000),
+				Decimals:  8,
+				UpdatedAt: big.NewInt(time.Now().Add(-age).Unix()),
+				Ok:        true,
+			},
+		}
+	}
+	mock := &mockBatchContract{readings: reading(time.Hour)}
+	fetch := newMockCoreFetch("BTC", mock)
+
+	var buf bytes.Buffer
+	log := util.NewLogger("test", util.LevelDebug, &buf)
+	countStale := func() int {
+		return strings.Count(buf.String(), "stale price")
+	}
+
+	// Two cycles at the same stale age: one warning, not two.
+	for i := 0; i < 2; i++ {
+		if _, err := fetch(context.Background(), []string{"BTC"}, log); err == nil {
+			t.Fatalf("cycle %d: expected an error for a stale reading, got nil", i)
+		}
+	}
+	if n := countStale(); n != 1 {
+		t.Fatalf("expected 1 staleness warning across two stale cycles, got %d:\n%s", n, buf.String())
+	}
+
+	// A fresh reading reports recovery, and going stale again warns anew.
+	mock.readings = reading(time.Minute)
+	if _, err := fetch(context.Background(), []string{"BTC"}, log); err != nil {
+		t.Fatalf("unexpected error on fresh reading: %v", err)
+	}
+	if !strings.Contains(buf.String(), "fresh again") {
+		t.Fatalf("expected recovery to be logged:\n%s", buf.String())
+	}
+
+	mock.readings = reading(time.Hour)
+	if _, err := fetch(context.Background(), []string{"BTC"}, log); err == nil {
+		t.Fatal("expected an error for a stale reading, got nil")
+	}
+	if n := countStale(); n != 2 {
+		t.Fatalf("expected a second staleness warning after recovery, got %d:\n%s", n, buf.String())
 	}
 }
 
@@ -721,12 +935,11 @@ func TestChainlinkConnFailedReset(t *testing.T) {
 	}
 
 	fetch := chainlinkBatchFetcherCore(
-		map[string]common.Address{"BTC": mockFeedAddr},
+		map[string]chainlinkFeed{"BTC": {mockFeedAddr, mockFastHeartbeat}},
 		dialFn,
 		func(_ chainRPCClient) chainlinkBatchContract {
 			return &mockBatchContract{err: connErr}
 		},
-		chainlinkMaxAge,
 	)
 
 	log := util.NewLogger("test", util.LevelDebug, io.Discard)
@@ -758,13 +971,13 @@ func TestChainlinkConcurrentRates(t *testing.T) {
 		func(context.Context) (chainRPCClient, error) { return newMockRPCClient(), nil },
 		func(_ chainRPCClient) chainlinkBatchContract {
 			return &mockBatchContract{readings: map[common.Address]MultiAggregatorReading{
-				chainlinkPolygonFeeds["BTC"]: {
+				chainlinkPolygonFeeds["BTC"].addr: {
 					Answer:    big.NewInt(5000000000000),
 					Decimals:  8,
 					UpdatedAt: big.NewInt(time.Now().Add(-time.Minute).Unix()),
 					Ok:        true,
 				},
-				chainlinkPolygonFeeds["ETH"]: {
+				chainlinkPolygonFeeds["ETH"].addr: {
 					Answer:    big.NewInt(300000000000),
 					Decimals:  8,
 					UpdatedAt: big.NewInt(time.Now().Add(-time.Minute).Unix()),
@@ -772,7 +985,6 @@ func TestChainlinkConcurrentRates(t *testing.T) {
 				},
 			}}
 		},
-		chainlinkMaxAge,
 	)
 
 	log := util.NewLogger("test", util.LevelDebug, io.Discard)
