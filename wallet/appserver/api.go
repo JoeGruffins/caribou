@@ -1098,6 +1098,20 @@ func (s *AppServer) apiUser(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, response)
 }
 
+// apiFiatRates serves the cached USD exchange rates, keyed by asset ID.
+// It is deliberately unauthenticated: the rates are public market data,
+// and local tooling (the simnet Intents mock among it) prices against a
+// running wallet without holding credentials.
+func (s *AppServer) apiFiatRates(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, &struct {
+		OK        bool               `json:"ok"`
+		FiatRates map[uint32]float64 `json:"fiatRates"`
+	}{
+		OK:        true,
+		FiatRates: s.core.FiatRates(),
+	})
+}
+
 // apiToggleRateSource handles the /toggleratesource API request.
 func (s *AppServer) apiToggleRateSource(w http.ResponseWriter, r *http.Request) {
 	form := &struct {
@@ -1282,6 +1296,35 @@ func (s *AppServer) apiConfigureMixer(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, simpleAck())
+}
+
+// apiWalletTx is the handler for the '/wallettx' API request. It returns a
+// single transaction from the wallet's history, whether the wallet made it
+// or received funds in it.
+func (s *AppServer) apiWalletTx(w http.ResponseWriter, r *http.Request) {
+	var form struct {
+		AssetID uint32 `json:"assetID"`
+		TxID    string `json:"txID"`
+	}
+	if !readPost(w, r, &form) {
+		return
+	}
+	if form.TxID == "" {
+		s.writeAPIError(w, fmt.Errorf("missing txID"))
+		return
+	}
+	tx, err := s.core.WalletTransaction(form.AssetID, form.TxID)
+	if err != nil {
+		s.writeAPIError(w, err)
+		return
+	}
+	writeJSON(w, struct {
+		OK bool                    `json:"ok"`
+		Tx *txdb.WalletTransaction `json:"tx"`
+	}{
+		OK: true,
+		Tx: tx,
+	})
 }
 
 func (s *AppServer) apiTxHistory(w http.ResponseWriter, r *http.Request) {

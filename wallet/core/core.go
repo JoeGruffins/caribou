@@ -82,6 +82,14 @@ type Config struct {
 	// for running core in extension mode, which gives the caller options for
 	// e.g. limiting the ability to configure wallets.
 	ExtensionModeFile string
+	// IntentsBaseURL overrides the NEAR Intents 1Click API base URL, for
+	// dev servers such as the simnet mock (util/testing/near-intents).
+	// Ignored on mainnet: an injected base URL would bypass the pinned
+	// quote-signing key and redirect deposits.
+	IntentsBaseURL string
+	// IntentsSigningKey overrides the pinned 1Click quote-signing public
+	// key (base58, optional "ed25519:" prefix). Ignored on mainnet.
+	IntentsSigningKey string
 }
 
 // locale is data associated with the currently selected language.
@@ -1115,6 +1123,12 @@ func (c *Core) assetMap() map[uint32]*SupportedAsset {
 		}
 	}
 	return assets
+}
+
+// FiatRates is a thread-safe getter for the cached USD exchange rates,
+// keyed by asset ID. Assets whose sources have no fresh data are absent.
+func (c *Core) FiatRates() map[uint32]float64 {
+	return c.fiatConversions()
 }
 
 // User is a thread-safe getter for the User.

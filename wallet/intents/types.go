@@ -60,7 +60,9 @@ const DefaultAppFeeBps = 20
 // and N/2 plus the keyless surcharge to the protocol's account, with the
 // rewritten array echoed in the response. Recipient is an account identity
 // inside the intents.near verifier (NEAR named/implicit or 0x-style),
-// credited in the traded token.
+// credited in the origin asset's in-verifier token — the user's cost
+// surfaces as an amountOut haircut, but the accrual is origin-side
+// (observed live: an ETH-origin swap credits nep141:eth.omft.near).
 type AppFee struct {
 	Recipient string `json:"recipient"`
 	Fee       int    `json:"fee"`
@@ -188,9 +190,12 @@ func (t *TxHashRef) UnmarshalJSON(b []byte) error {
 type SwapDetails struct {
 	DepositedAmount     string      `json:"depositedAmount"`
 	AmountIn            string      `json:"amountIn"`
+	AmountInUsd         string      `json:"amountInUsd"`
 	AmountOut           string      `json:"amountOut"`
+	AmountOutUsd        string      `json:"amountOutUsd"`
 	Slippage            int         `json:"slippage"`
 	RefundedAmount      string      `json:"refundedAmount"`
+	RefundedAmountUsd   string      `json:"refundedAmountUsd"`
 	RefundReason        string      `json:"refundReason"`
 	RefundFee           string      `json:"refundFee"`
 	WithdrawFee         string      `json:"withdrawFee"`

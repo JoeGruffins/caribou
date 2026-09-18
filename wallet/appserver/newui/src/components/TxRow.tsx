@@ -1,17 +1,21 @@
+import { MouseEvent } from 'react'
 import t, { tvar } from '@caribou/shared/intl'
 import app from '@caribou/shared/application'
 import Doc from '@caribou/shared/doc'
 import { WalletTransaction } from '@caribou/shared/registry'
 import { TickerAsset, AssetVariant } from '@caribou/shared/assets'
 import { TxType, txTypeLabel, txIsIncoming, txShowsAmount, txAmountSign } from '@caribou/shared/tx'
+import { SwapRelation } from '../intents'
 
 // TxRowItem pairs a transaction with the ticker group and network variant it
 // belongs to, which carry the units, rate, and asset ID needed to render and
-// link it.
+// link it. swapRelation is set when the transaction is a leg of a
+// cross-chain swap (its deposit, payout, or refund).
 export interface TxRowItem {
   tx: WalletTransaction
   ta: TickerAsset
   variant: AssetVariant
+  swapRelation?: SwapRelation
 }
 
 // variantForTx maps a history transaction back to the network variant it
@@ -52,16 +56,32 @@ function txStatus (tx: WalletTransaction): string {
 // TxRow is the transaction row shared by the Activity feed and the Asset
 // view: type icon, title with recipient/status sub-line, and amount with a
 // USD sub-line when a rate is known. Clicking opens the transaction detail.
-export default function TxRow ({ item }: { item: TxRowItem }) {
-  const { tx, ta, variant } = item
-  const open = () => app.setForm({ form: 'txdetail', data: { assetID: variant.assetID, tx } })
+interface TxRowProps {
+  item: TxRowItem
+  // onSwapHover reports the deposit address of the hovered row's swap ('' on
+  // leave or for unrelated rows); swapHighlight lights the row up alongside
+  // a hovered sibling serving the same swap.
+  onSwapHover?: (depositAddress: string) => void
+  swapHighlight?: boolean
+}
 
+export default function TxRow ({ item, onSwapHover, swapHighlight }: TxRowProps) {
+  const { tx, ta, variant, swapRelation } = item
+  const open = () => app.setForm({ form: 'txdetail', data: { assetID: variant.assetID, tx } })
+  const openSwap = (e: MouseEvent) => {
+    e.stopPropagation()
+    if (swapRelation) app.setForm({ form: 'swap', data: { depositAddress: swapRelation.swap.depositAddress } })
+  }
+
+  // A rejected transaction was mined but had no effect (only fees were
+  // spent), so no amount moved in either direction.
+  const rejected = tx.rejected === true
   const sign = txAmountSign(tx.type)
-  const amountText = txShowsAmount(tx.type)
+  const amountText = !rejected && txShowsAmount(tx.type)
     ? `${sign}${Doc.formatCoinValue(tx.amount, variant.ui)} ${variant.ticker}`
     : '—'
   const rate = app.tickerRate(ta.ticker) ?? 0
-  const usdText = txShowsAmount(tx.type) && rate > 0
+  const usdText = !rejected && txShowsAmount(tx.type) && rate > 0
     ? Doc.usdString(tx.amount, variant.ui.conventional.conversionFactor, rate)
     : ''
   const parts: string[] = []
@@ -71,13 +91,37 @@ export default function TxRow ({ item }: { item: TxRowItem }) {
 
   return (
     <div
-      className={`activity-row d-flex align-items-center pointer mb-2 ${unconfirmed ? 'activity-row-unconfirmed' : ''}`}
+      className={`activity-row d-flex align-items-center pointer mb-2 ${unconfirmed ? 'activity-row-unconfirmed' : ''} ${swapHighlight ? 'swap-hover' : ''}`}
+      role="button"
+      tabIndex={0}
       onClick={open}
+      onKeyDown={(e) => {
+        // A key pressed on the nested swap-leg badge belongs to the badge:
+        // its keydown bubbles here, and preventing default would cancel the
+        // badge's own activation and open the transaction instead.
+        if (e.target !== e.currentTarget) return
+        if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); open() }
+      }}
+      onMouseEnter={() => onSwapHover?.(swapRelation?.swap.depositAddress ?? '')}
+      onMouseLeave={() => onSwapHover?.('')}
     >
       <span className={`tx-type-icon icon-32 fs14 flex-center me-3 ${txIcon(tx.type)}`} />
       <div className="flex-grow-1">
-        <div className="fs14 demi">{txTitle(tx, variant.ticker)}</div>
-        <div className="grey fs12 mono">{parts.join(' · ')}</div>
+        <div className="fs14 demi d-flex align-items-center">
+          {txTitle(tx, variant.ticker)}
+          {swapRelation && (
+            <button
+              type="button"
+              className="swap-leg-badge ico-swap fs10 ms-2 p-0 has-tip"
+              aria-label={t('Part of a cross-chain swap — click for details')}
+              onClick={openSwap}
+            />
+          )}
+        </div>
+        <div className="grey fs12 mono">
+          {rejected && <span className="errcolor">{t('failed')} · </span>}
+          {parts.join(' · ')}
+        </div>
       </div>
       <div className="text-right">
         <div className={`fs14 mono ${txIsIncoming(tx.type) ? 'tx-amt-pos' : ''}`}>{amountText}</div>

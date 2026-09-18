@@ -119,6 +119,7 @@ type clientCore interface {
 	WalletRestorationInfo(pw []byte, assetID uint32) ([]*asset.WalletRestoration, error)
 	ToggleRateSourceStatus(src string, disable bool) error
 	FiatRateSources() map[string]bool
+	FiatRates() map[uint32]float64
 	EstimateSendTxFee(address string, assetID uint32, value uint64, subtract, maxWithdraw bool) (*core.SendFeeEstimate, error)
 	ValidateAddress(address string, assetID uint32) (bool, error)
 	WalletPeers(assetID uint32) ([]*asset.WalletPeer, error)
@@ -134,8 +135,8 @@ type clientCore interface {
 	TxHistory(assetID uint32, req *txdb.TxHistoryRequest) (*txdb.TxHistoryResponse, error)
 	TxHistoryByTicker(ticker string, req *txdb.TxHistoryRequest) (*txdb.TxHistoryResponse, error)
 	IntentsAssets(ctx context.Context) ([]*core.IntentsAsset, error)
-	IntentsPreview(ctx context.Context, originAssetID, destAssetID uint32, atoms uint64, slippageBps int) (*core.IntentsPreview, error)
-	IntentsExecute(pw []byte, originAssetID, destAssetID uint32, atoms uint64, slippageBps int, minAtomsOut uint64) (*core.IntentsSwap, error)
+	IntentsPreview(ctx context.Context, originAssetID, destAssetID uint32, atoms uint64, slippageBps int, exactOutput bool) (*core.IntentsPreview, error)
+	IntentsExecute(pw []byte, originAssetID, destAssetID uint32, atoms uint64, slippageBps int, exactOutput bool, minAtomsOut, maxAtomsIn uint64) (*core.IntentsSwap, error)
 	IntentsSwaps() ([]*core.IntentsSwap, error)
 	IntentsRefresh(ctx context.Context, depositAddress string) (*core.IntentsSwap, error)
 	IntentsReconstruct(ctx context.Context) (int, error)
@@ -503,6 +504,7 @@ func New(cfg *Config) (*AppServer, error) {
 		r.Get("/isinitialized", s.apiIsInitialized)
 		r.Post("/resetapppassword", s.apiResetAppPassword)
 		r.Get("/user", s.apiUser)
+		r.Get("/fiatrates", s.apiFiatRates)
 		r.Post("/locale", s.apiLocale)
 		r.Post("/setlocale", s.apiSetLocale)
 		r.Get("/buildinfo", s.apiBuildInfo)
@@ -543,6 +545,7 @@ func New(cfg *Config) (*AppServer, error) {
 			apiAuth.Post("/addwalletpeer", s.apiAddWalletPeer)
 			apiAuth.Post("/removewalletpeer", s.apiRemoveWalletPeer)
 			apiAuth.Post("/txhistory", s.apiTxHistory)
+			apiAuth.Post("/wallettx", s.apiWalletTx)
 			apiAuth.Post("/txhistoryticker", s.apiTxHistoryByTicker)
 			apiAuth.Get("/intents/assets", s.apiIntentsAssets)
 			apiAuth.Post("/intents/preview", s.apiIntentsPreview)

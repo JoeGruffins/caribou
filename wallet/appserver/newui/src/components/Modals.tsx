@@ -2,6 +2,7 @@ import { MouseEvent, useEffect, useRef } from 'react'
 import Receive from './Receive'
 import Send from './Send'
 import Swap from './Swap'
+import RecoverSwaps from './RecoverSwaps'
 import ActivateAsset from './ActivateAsset'
 import ActivateNetwork from './ActivateNetwork'
 import TxDetail from './TxDetail'
@@ -48,7 +49,8 @@ export default function Modals ({ fd }: ModalsParams) {
     switch (fd.form) {
       case 'receive': return <Receive ticker={fd.data?.ticker} />
       case 'send': return <Send ticker={fd.data?.ticker} />
-      case 'swap': return <Swap />
+      case 'swap': return <Swap depositAddress={fd.data?.depositAddress} />
+      case 'recoverswaps': return <RecoverSwaps />
       case 'activateasset': return <ActivateAsset ticker={fd.data.ticker} />
       case 'activatenetwork': return <ActivateNetwork assetID={fd.data.assetID} />
       case 'txdetail': return <TxDetail assetID={fd.data.assetID} tx={fd.data.tx} />
@@ -57,7 +59,7 @@ export default function Modals ({ fd }: ModalsParams) {
   }
 
   return (
-    <div className={`fill-abs flex-center modals ${fd.form ? '' : 'd-none'}`}
+    <div className={`fill-abs d-flex py-3 modals ${fd.form ? '' : 'd-none'}`}
       onMouseDown={onBackgroundMouseDown}
       onClick={onBackgroundClick}>
       {fd.form && renderContent()}

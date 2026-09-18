@@ -1,1256 +1,1246 @@
-import { useCallback, useEffect, useRef, useState, FormEvent } from 'react'
+import { useEffect, useMemo, useRef, useState, ChangeEvent, ReactNode } from 'react'
 import t, { tvar } from '@caribou/shared/intl'
 import app from '@caribou/shared/application'
-import { postJSON, getJSON } from '@caribou/shared/http'
-import { CoreNote } from '@caribou/shared/registry'
+import { explorerTxURL } from '@caribou/shared/coinexplorers'
+import { useForceUpdate } from '@caribou/shared/hooks'
+import { getJSON, postJSON } from '@caribou/shared/http'
+import { CoreNote, UnitInfo, WalletTransaction } from '@caribou/shared/registry'
 import State from '@caribou/shared/state'
-import CoinLogo from '@caribou/shared/components/CoinLogo'
+import Doc from '@caribou/shared/doc'
+import AssetLogo from './AssetLogo'
 import Spinner from './Spinner'
 import PasswordInput from './PasswordInput'
+import { useModalBusy } from './modalBusy'
+import {
+  IntentsAsset, IntentsPreview, IntentsSwap,
+  StateProcessing, StateSuccess, StateRefunded, StateFailed, StateExpired, StateDepositFailed,
+  swapIsActive, stateLabel, stateColorClass,
+  conventionalToAtoms, assetTicker, assetName
+} from '../intents'
 
-// ---- Type definitions (mirroring Go structs) ----
+// localStorage keys for sticky swap-form preferences.
+const pairLK = 'intentsPair'
+const slippageLK = 'intentsSlippageBps'
 
-interface AppFee {
-  recipient: string
-  fee: number
+const slippagePresets = [50, 100, 200] // basis points
+
+// Preview quotes refresh on this cadence while the form or review view is
+// showing, so displayed pricing tracks the market.
+const previewRefreshMS = 10000
+const previewDebounceMS = 350
+
+function slippagePct (bps: number): string {
+  return `${(bps / 100).toLocaleString()}%`
 }
 
-interface IntentsAsset {
-  assetID: number
-  symbol: string
-  intentsID: string
-  // decimals is the Intents-side scale; NOT used for atoms conversion.
-  decimals: number
-  // atomDecimals is the wallet atomic-unit exponent, which the atoms
-  // fields (atomsIn/atomsOut/minAtomsOut, and the value sent to preview/
-  // execute) are expressed in. It can differ from decimals (e.g. NEAR: 8
-  // wallet drops vs 24 Intents decimals). All atoms conversions use this.
-  atomDecimals: number
-  priceUSD: number
-  walletReady: boolean
+// ---- Custody and bridge trust ----
+
+// bridgeTrustMap classifies settlement chains by the custody model of their
+// Intents bridge leg. Data-driven rather than baked copy because the
+// PoA→Omni migration is ongoing; an unlisted chain falls back to a generic
+// third-party label.
+const bridgeTrustOmni = t('bridge custody by a distributed MPC signing network (Omni)')
+const bridgeTrustHot = t('bridge custody by a distributed MPC signing network (HOT)')
+const bridgeTrustPoA = t('bridge custody by a validator federation operated for the service')
+const bridgeTrustMap: Record<string, string> = {
+  BTC: bridgeTrustOmni,
+  ETH: bridgeTrustOmni,
+  SOL: bridgeTrustOmni,
+  BNB: bridgeTrustOmni,
+  POL: bridgeTrustHot,
+  LTC: bridgeTrustPoA,
+  DOGE: bridgeTrustPoA,
+  XRP: bridgeTrustPoA,
+  ZEC: bridgeTrustPoA,
+  BCH: bridgeTrustPoA,
+  DASH: bridgeTrustPoA,
+  NEAR: t('settles natively on the NEAR network — no bridge leg')
 }
 
-interface IntentsPreview {
-  atomsIn: number
-  atomsOut: number
-  minAtomsOut: number
-  minAtomsIn: number
-  amountInUSD: string
-  amountOutUSD: string
-  timeEstimate: number
-  appFees: AppFee[]
-  refundFee: string
-  withdrawFee: string
+function bridgeTrust (chain: string): string {
+  return bridgeTrustMap[chain.toUpperCase()] ?? t('bridge custody by a third-party bridge operator')
 }
 
-interface IntentsSwap {
-  depositAddress: string
-  depositMemo?: string
-  state: string
-  originAssetID: number
-  destAssetID: number
-  originAsset: string
-  destAsset: string
-  atomsIn: number
-  amountIn: string
-  amountOut: string
-  atomsOut: number
-  recipient: string
-  refundTo: string
-  deadline: string
-  timeEstimate: number
-  depositTxID?: string
-  nearTxHashes?: string[]
-  destinationTxs?: string[]
-  refundTxs?: string[]
-  refundedAmount?: string
-  refundReason?: string
-  appFees?: AppFee[]
-  reconstructed?: boolean
-  createdAt: string
-  updatedAt: string
+// chainTicker resolves the settlement network's native ticker for an Intents
+// asset. Trust classification is per chain, not per token: a token's bridge
+// leg is custodied by its network's bridge.
+function chainTicker (a: IntentsAsset): string {
+  const wa = app.user?.assets[a.assetID]
+  const chainID = wa?.token ? wa.token.networkID : a.assetID
+  return app.user?.assets[chainID]?.unitInfo.conventional.unit ?? a.symbol
 }
 
-// ---- Bridge trust data (data-driven per plan requirement) ----
-
-// bridgeTrustMap classifies origin-chain symbols by their custody model.
-// PoA = validator federation; Omni = distributed MPC; HOT = MPC.
-// Updated here as the migration proceeds — the plan explicitly calls for
-// this to be data, not baked copy, because the PoA→Omni migration is ongoing.
-const bridgeTrustMap: Record<string, { model: string; description: string }> = {
-  BTC: { model: 'Omni MPC', description: t('BTC: bridge custody by a distributed MPC signing network (Omni).') },
-  ETH: { model: 'Omni MPC', description: t('ETH: bridge custody by a distributed MPC signing network (Omni).') },
-  SOL: { model: 'Omni MPC', description: t('SOL: bridge custody by a distributed MPC signing network (Omni).') },
-  BNB: { model: 'Omni MPC', description: t('BNB: bridge custody by a distributed MPC signing network (Omni).') },
-  BASE: { model: 'Omni MPC', description: t('BASE: bridge custody by a distributed MPC signing network (Omni).') },
-  POL: { model: 'HOT MPC', description: t('POL: bridge custody by a distributed MPC signing network (HOT).') },
-  LTC: { model: 'PoA Federation', description: t('LTC: bridge custody by a validator federation operated for the service.') },
-  DOGE: { model: 'PoA Federation', description: t('DOGE: bridge custody by a validator federation operated for the service.') },
-  XRP: { model: 'PoA Federation', description: t('XRP: bridge custody by a validator federation operated for the service.') },
-  ZEC: { model: 'PoA Federation', description: t('ZEC: bridge custody by a validator federation operated for the service.') },
-  BCH: { model: 'PoA Federation', description: t('BCH: bridge custody by a validator federation operated for the service.') },
-  DASH: { model: 'PoA Federation', description: t('DASH: bridge custody by a validator federation operated for the service.') }
-}
-
-function bridgeTrust (symbol: string): { model: string; description: string } {
-  return bridgeTrustMap[symbol.toUpperCase()] ?? {
-    model: t('Third-party bridge'),
-    description: tvar('{{ symbol }}: bridge custody by a third-party bridge operator.', { symbol })
+// unitInfoFor returns the wallet UnitInfo for a swappable asset, or a
+// minimal stand-in built from the catalog scale when the asset is unknown
+// to this build's wallet map (walletReady is false for those, so the
+// stand-in only ever formats display amounts).
+function unitInfoFor (a: IntentsAsset): UnitInfo {
+  const sa = app.user?.assets[a.assetID]
+  if (sa) return sa.unitInfo
+  const unit = a.symbol.toUpperCase()
+  return {
+    atomicUnit: unit,
+    conventional: { unit, conversionFactor: Math.pow(10, a.atomDecimals) },
+    denominations: [],
+    feeRateDenom: ''
   }
 }
 
-// ---- Helpers ----
-
-const languages = navigator.languages as string[]
-const usdFmt = new Intl.NumberFormat(languages, {
-  style: 'currency',
-  currency: 'USD',
-  minimumFractionDigits: 2,
-  maximumFractionDigits: 2
-})
-
-// atomsToConventional converts from atomic units (integer) to conventional
-// display units. Callers pass the wallet atomic-unit exponent
-// (IntentsAsset.atomDecimals), which the API's atoms fields use.
-function atomsToConventional (atoms: number, decimals: number): number {
-  return atoms / Math.pow(10, decimals)
+// usdRate is an asset's USD display rate, preferring the app's live rate
+// over the catalog price.
+function usdRate (a: IntentsAsset): number {
+  return app.idRate(a.assetID) || a.priceUSD
 }
 
-// conventionalToAtoms converts conventional display units to atoms.
-function conventionalToAtoms (conventional: number, decimals: number): number {
-  return Math.round(conventional * Math.pow(10, decimals))
+// usdValue prices conventional units of a swappable asset.
+function usdValue (a: IntentsAsset, conventional: number): number {
+  return conventional * usdRate(a)
 }
 
-// formatConventional displays a value with up to `decimals` decimal places.
-function formatConventional (atoms: number, decimals: number): string {
-  const v = atomsToConventional(atoms, decimals)
-  const fmt = new Intl.NumberFormat(languages, {
-    minimumFractionDigits: 2,
-    maximumFractionDigits: Math.min(decimals, 8)
-  })
-  return fmt.format(v)
+// plainAtoms renders atoms as a plain decimal string for use as an input
+// value — no locale grouping, which would fail the decimal validation on
+// the next keystroke.
+function plainAtoms (atoms: number, decimals: number): string {
+  if (atoms <= 0) return ''
+  return (atoms / Math.pow(10, decimals)).toFixed(decimals).replace(/\.?0+$/, '')
 }
 
-// formatIntentsAmount displays an Intents-side base-unit amount string — the
-// string amount/fee fields (amountIn/amountOut, refundFee/withdrawFee,
-// refundedAmount) as returned by the service — using the asset's Intents-side
-// `decimals`. The numeric atoms* fields use atomDecimals with
-// formatConventional instead. Returns the raw string if it does not parse.
-function formatIntentsAmount (baseUnits: string, decimals: number): string {
-  const n = Number(baseUnits)
-  if (!Number.isFinite(n)) return baseUnits
-  return formatConventional(n, decimals)
+// plainUSD renders a dollar value as a plain input string.
+function plainUSD (v: number): string {
+  if (v <= 0) return ''
+  return v.toFixed(2)
 }
 
-// formatDuration renders a duration in seconds as a human-friendly string.
-function formatDuration (secs: number): string {
-  if (secs <= 0) return t('a few minutes')
-  if (secs < 60) return tvar('~{{ n }} seconds', { n: String(secs) })
-  const mins = Math.round(secs / 60)
-  if (mins < 60) return tvar('~{{ n }} minutes', { n: String(mins) })
-  const hrs = Math.round(mins / 60)
-  return tvar('~{{ n }} hours', { n: String(hrs) })
+// displayBalance floors a conventional balance to four significant digits
+// (capped at eight decimals) so the line stays short and never overstates
+// holdings. Max still spends full precision.
+function displayBalance (v: number): string {
+  if (v <= 0) return '0'
+  const digits = Math.min(8, Math.max(0, 4 - Math.floor(Math.log10(v)) - 1))
+  const f = Math.pow(10, digits)
+  return (Math.floor(v * f) / f).toLocaleString(undefined, { maximumFractionDigits: digits })
 }
 
-// swapStatusLabel returns a plain-English status label for an IntentsSwap.
-function swapStatusLabel (state: string): string {
-  switch (state) {
-    case 'QUOTED':
-    case 'DEPOSIT_SENT':
-    case 'PENDING_DEPOSIT':
-    case 'KNOWN_DEPOSIT_TX':
-      return t('Waiting for deposit to confirm')
-    case 'PROCESSING':
-      return t('Swapping — funds with the service')
-    case 'SUCCESS':
-      return t('Complete')
-    case 'REFUNDED':
-      return t('Refunded — funds returned to your wallet')
-    case 'FAILED':
-    case 'INCOMPLETE_DEPOSIT':
-      return t('Needs attention')
-    case 'EXPIRED':
-      return t('Expired — no funds moved')
-    default:
-      return state
+interface SwapProps {
+  // depositAddress opens the dialog directly on an existing swap's progress
+  // view (e.g. from an Activity row).
+  depositAddress?: string
+}
+
+type View = 'form' | 'pick' | 'review' | 'progress'
+
+export default function Swap ({ depositAddress }: SwapProps) {
+  const close = () => app.setForm({ form: '', data: {} })
+  const redraw = useForceUpdate()
+
+  const [view, setView] = useState<View>(depositAddress ? 'progress' : 'form')
+  const [assets, setAssets] = useState<IntentsAsset[] | null>(null)
+  const [assetsErr, setAssetsErr] = useState('')
+  const [sellID, setSellID] = useState<number | null>(null)
+  const [buyID, setBuyID] = useState<number | null>(null)
+  const [amount, setAmount] = useState('')
+  // The side and unit the typed amount belongs to. 'buy' quotes
+  // exact-output: the service computes the required input for the
+  // requested output. A 'usd' unit converts to the side's asset amount at
+  // the display rate before quoting.
+  const [editSide, setEditSide] = useState<'sell' | 'buy'>('sell')
+  const [editUnit, setEditUnit] = useState<'asset' | 'usd'>('asset')
+  const [slippageBps, setSlippageBps] = useState<number>(State.fetchLocal(slippageLK) || 100)
+  const [showSlippage, setShowSlippage] = useState(false)
+  const [showCustody, setShowCustody] = useState(false)
+
+  // Asset picker.
+  const [pickSide, setPickSide] = useState<'sell' | 'buy'>('sell')
+  const [query, setQuery] = useState('')
+
+  // Preview state. previewSeq orders requests: a response is applied only if
+  // no newer request has been issued since, so a slow stale quote can never
+  // overwrite a fresher one.
+  const [preview, setPreview] = useState<IntentsPreview | null>(null)
+  const [previewErr, setPreviewErr] = useState('')
+  const [previewing, setPreviewing] = useState(false)
+  const previewSeq = useRef(0)
+  const amtInputRef = useRef<HTMLInputElement>(null)
+  const buyInputRef = useRef<HTMLInputElement>(null)
+
+  // Execution / progress.
+  const [pw, setPW] = useState('')
+  const [executing, setExecuting] = useState(false)
+  const [execErr, setExecErr] = useState('')
+  const [swap, setSwap] = useState<IntentsSwap | null>(null)
+
+  useModalBusy(executing)
+
+  const requirePW = app.appSettings.sendRequiresPassword
+
+  const assetMap = useMemo(() => {
+    const m = new Map<number, IntentsAsset>()
+    for (const a of assets ?? []) m.set(a.assetID, a)
+    return m
+  }, [assets])
+
+  const sellAsset = sellID === null ? null : assetMap.get(sellID) ?? null
+  const buyAsset = buyID === null ? null : assetMap.get(buyID) ?? null
+
+  const exactOutput = editSide === 'buy'
+  const editAsset = exactOutput ? buyAsset : sellAsset
+
+  // The typed amount in the edited side's wallet atoms — the preview and
+  // execute `value` for either direction. A USD entry converts at the
+  // display rate; the quote then prices the derived asset amount.
+  const editAtoms = useMemo(() => {
+    if (!editAsset) return 0
+    const v = parseFloat(amount)
+    if (!isFinite(v) || v <= 0) return 0
+    if (editUnit === 'usd') {
+      const rate = usdRate(editAsset)
+      if (rate <= 0) return 0
+      return conventionalToAtoms(v / rate, editAsset.atomDecimals)
+    }
+    return conventionalToAtoms(v, editAsset.atomDecimals)
+  }, [amount, editAsset, editUnit])
+
+  const sellAvail = sellID === null ? 0 : app.wallet(sellID)?.balance?.available ?? 0
+  const buyAvail = buyID === null ? 0 : app.wallet(buyID)?.balance?.available ?? 0
+
+  // Projected origin-chain network fee for the deposit transaction, in the
+  // fee asset's atoms (the parent chain's for tokens). Refreshed on the
+  // preview cadence while the form or review view is showing.
+  const [depositFee, setDepositFee] = useState(0)
+  const sellWalletAsset = sellID === null ? undefined : app.user?.assets[sellID]
+  const depositFeeAssetID = sellWalletAsset?.token ? sellWalletAsset.token.networkID : sellID
+  useEffect(() => {
+    setDepositFee(0)
+    if (sellID === null || (view !== 'form' && view !== 'review') || !app.wallet(sellID)) return
+    let stale = false
+    const fetchFee = async () => {
+      const r = await postJSON('/api/feestate', { assetID: sellID })
+      if (!stale && r.ok) setDepositFee(r.feeState?.send ?? 0)
+    }
+    fetchFee()
+    const ticker = window.setInterval(fetchFee, previewRefreshMS)
+    return () => { stale = true; window.clearInterval(ticker) }
+  }, [sellID, view])
+  const depositFeeAsset = depositFeeAssetID == null ? undefined : app.user?.assets[depositFeeAssetID]
+  const depositFeeUSD = depositFeeAsset && depositFeeAssetID != null
+    ? Doc.usdString(depositFee, depositFeeAsset.unitInfo.conventional.conversionFactor, app.idRate(depositFeeAssetID) ?? 0)
+    : ''
+  const depositFeeText = depositFee > 0 && depositFeeAsset
+    ? `${Doc.formatCoinValue(depositFee, depositFeeAsset.unitInfo)} ${depositFeeAsset.unitInfo.conventional.unit}${depositFeeUSD !== '' ? ` (${depositFeeUSD})` : ''}`
+    : ''
+
+  // ---- Data loading ----
+
+  useEffect(() => {
+    const loadAssets = async () => {
+      const r = await getJSON('/api/intents/assets')
+      if (!r.ok) {
+        setAssetsErr(r.msg || r.errMsg || t('Cross-chain swaps are unavailable.'))
+        return
+      }
+      const list: IntentsAsset[] = r.assets ?? []
+      setAssets(list)
+      // Restore the last-used pair, falling back to the two most valuable
+      // ready wallets.
+      const ready = list.filter(a => a.walletReady)
+      const byValue = [...ready].sort((a, b) => {
+        const bal = (x: IntentsAsset) => usdValue(x, (app.wallet(x.assetID)?.balance?.available ?? 0) / Math.pow(10, x.atomDecimals))
+        return bal(b) - bal(a)
+      })
+      const stored = State.fetchLocal(pairLK) as { sellID: number, buyID: number } | null
+      let sell = stored && list.some(a => a.assetID === stored.sellID) ? stored.sellID : null
+      let buy = stored && list.some(a => a.assetID === stored.buyID) ? stored.buyID : null
+      if (sell === null) sell = byValue[0]?.assetID ?? null
+      if (buy === null || buy === sell) buy = ready.find(a => a.assetID !== sell)?.assetID ?? null
+      setSellID(sell)
+      setBuyID(buy)
+    }
+    loadAssets()
+  }, [])
+
+  // Opened on an existing swap: pull the record by deposit address.
+  useEffect(() => {
+    if (!depositAddress) return
+    const load = async () => {
+      const r = await getJSON('/api/intents/swaps')
+      if (!r.ok) return
+      const s = (r.swaps as IntentsSwap[] ?? []).find(s => s.depositAddress === depositAddress)
+      if (s) setSwap(s)
+    }
+    load()
+  }, [depositAddress])
+
+  // Live swap updates ride the notification feed; apply any that match the
+  // record on display.
+  useEffect(() => {
+    const k = app.registerNoteFeed((n: CoreNote) => {
+      if (n.type !== 'intentsswap') return
+      const s = (n as CoreNote & { swap: IntentsSwap }).swap
+      if (!s) return
+      setSwap(prev => (prev && prev.depositAddress === s.depositAddress) ? s : prev)
+    })
+    return () => app.unregisterNoteFeed(k)
+  }, [])
+
+  // Balance and rate changes arrive as notes; the sell-card balance line
+  // and USD estimates read app state directly, so re-render on either.
+  useEffect(() => {
+    const balK = app.registerBalanceUpdater(redraw)
+    const rateK = app.registerFiatRateUpdater(redraw)
+    return () => {
+      app.unregisterBalanceUpdater(balK)
+      app.unregisterFiatRateUpdater(rateK)
+    }
+  }, [])
+
+  // Persist the pair and slippage choices.
+  useEffect(() => {
+    if (sellID !== null && buyID !== null) State.storeLocal(pairLK, { sellID, buyID })
+  }, [sellID, buyID])
+  useEffect(() => { State.storeLocal(slippageLK, slippageBps) }, [slippageBps])
+
+  // ---- Preview scheduling ----
+
+  const fetchPreview = async () => {
+    if (sellID === null || buyID === null || editAtoms === 0) return
+    const seq = ++previewSeq.current
+    setPreviewing(true)
+    const r = await postJSON('/api/intents/preview', {
+      originAssetID: sellID,
+      destAssetID: buyID,
+      value: editAtoms,
+      slippageBps,
+      exactOutput
+    })
+    if (seq !== previewSeq.current) return // superseded
+    setPreviewing(false)
+    if (!r.ok) {
+      setPreview(null)
+      setPreviewErr(r.msg || r.errMsg || t('quote failed'))
+      return
+    }
+    setPreviewErr('')
+    setPreview(r.preview)
   }
-}
 
-function swapStatusClass (state: string): string {
-  switch (state) {
-    case 'SUCCESS': return 'swap-status-success'
-    case 'REFUNDED': return 'swap-status-refunded'
-    case 'FAILED':
-    case 'INCOMPLETE_DEPOSIT': return 'swap-status-failed'
-    case 'EXPIRED': return 'swap-status-expired'
-    default: return 'swap-status-active'
+  // On any parameter change: invalidate the current quote immediately (it
+  // priced different terms), then fetch behind a short debounce. The cleanup
+  // seq bump also retires any in-flight response.
+  useEffect(() => {
+    setPreview(null)
+    setPreviewErr('')
+    if (sellID === null || buyID === null || editAtoms === 0) {
+      setPreviewing(false)
+      return
+    }
+    const timer = window.setTimeout(fetchPreview, previewDebounceMS)
+    return () => {
+      window.clearTimeout(timer)
+      previewSeq.current++
+    }
+  }, [sellID, buyID, editAtoms, slippageBps, exactOutput])
+
+  // Periodic refresh keeps the displayed quote current in the form and
+  // review views, including the review dialog's live totals.
+  useEffect(() => {
+    if (view !== 'form' && view !== 'review') return
+    if (sellID === null || buyID === null || editAtoms === 0) return
+    const ticker = window.setInterval(fetchPreview, previewRefreshMS)
+    return () => window.clearInterval(ticker)
+  }, [view, sellID, buyID, editAtoms, slippageBps, exactOutput])
+
+  // ---- Actions ----
+
+  const flip = () => {
+    setSellID(buyID)
+    setBuyID(sellID)
   }
-}
 
-// isTerminal returns true when a swap has reached a final state.
-function isTerminal (state: string): boolean {
-  return state === 'SUCCESS' || state === 'REFUNDED' || state === 'FAILED' || state === 'EXPIRED'
-}
+  const openPicker = (side: 'sell' | 'buy') => {
+    setPickSide(side)
+    setQuery('')
+    setView('pick')
+  }
 
-// isAttention returns true when a swap is in a state that needs user attention.
-function isAttention (state: string): boolean {
-  return state === 'FAILED' || state === 'INCOMPLETE_DEPOSIT' || state === 'REFUNDED'
-}
+  const pick = (a: IntentsAsset) => {
+    if (pickSide === 'sell') {
+      if (a.assetID === buyID) setBuyID(sellID) // selected the other side: swap
+      setSellID(a.assetID)
+    } else {
+      if (a.assetID === sellID) setSellID(buyID)
+      setBuyID(a.assetID)
+    }
+    setView('form')
+  }
 
-// nearExplorerURL returns the NEAR Intents explorer URL for a deposit address.
-function nearExplorerURL (depositAddress: string): string {
-  return `https://explorer.near-intents.org/swap/${encodeURIComponent(depositAddress)}`
-}
+  const setMax = () => {
+    if (!sellAsset || sellAvail === 0) return
+    const conv = sellAvail / Math.pow(10, sellAsset.atomDecimals)
+    setEditSide('sell')
+    setEditUnit('asset')
+    setAmount(conv.toFixed(sellAsset.atomDecimals).replace(/\.?0+$/, ''))
+  }
 
-// intentsAssetLabel returns a display label for a swap-side asset: the
-// wallet symbol when assetID resolves in the current asset catalog, else
-// the raw Intents-side asset ID string (e.g. "nep141:sol.omft.near"). A
-// destAssetID/originAssetID of 4294967295 (0xFFFFFFFF, ^uint32(0)) is the
-// unknown-chain sentinel used for reconstructed records whose destination
-// no longer resolves, but any unresolved assetID falls back the same way.
-// Mirrors intentsAssetLabel in wallet/core/near-intents.go.
-function intentsAssetLabel (assets: IntentsAsset[], assetID: number, intentsAssetID: string): string {
-  return assets.find(a => a.assetID === assetID)?.symbol ?? intentsAssetID
-}
+  // Typing in any of the four fields claims it: the typed field drives
+  // the quote and the other three display derived values.
+  const amountChanged = (side: 'sell' | 'buy', unit: 'asset' | 'usd') => (e: ChangeEvent<HTMLInputElement>) => {
+    const v = e.target.value.replace(',', '.')
+    if (!/^\d*\.?\d*$/.test(v)) return
+    setEditSide(side)
+    setEditUnit(unit)
+    setAmount(v)
+  }
 
-// ---- Local storage key for first-use disclosure ----
-const INTENTS_DISCLOSURE_SEEN_KEY = 'intentsDisclosureSeen'
+  // A synchronous re-entry latch alongside the `executing` render state:
+  // the state only takes effect on the next render, so a second click or
+  // Enter landing before the re-render would fire a second real
+  // execution — a second committed quote and a second deposit — for the
+  // same funds.
+  const executingRef = useRef(false)
+  const execute = async () => {
+    if (!preview || executingRef.current) return
+    executingRef.current = true
+    setExecuting(true)
+    setExecErr('')
+    const r = await postJSON('/api/intents/execute', {
+      originAssetID: sellID,
+      destAssetID: buyID,
+      value: editAtoms,
+      slippageBps,
+      exactOutput,
+      // The bound the user accepted: min received for exact-input, the
+      // previewed cost ceiling for exact-output.
+      minAtomsOut: exactOutput ? 0 : preview.minAtomsOut,
+      maxAtomsIn: exactOutput ? preview.atomsIn : 0,
+      pass: pw
+    })
+    executingRef.current = false
+    setExecuting(false)
+    if (!r.ok) {
+      setExecErr(r.msg || r.errMsg || t('swap failed'))
+      return
+    }
+    setPW('')
+    setSwap(r.swap)
+    setView('progress')
+  }
 
-// confirmPreviewRefreshMs is how often the confirm screen re-quotes the
-// pair to keep the displayed (and floor-enforced) terms current. Each
-// refresh is a dry quote that blocks service-side for solver collection
-// (~3s), so much shorter intervals just queue requests.
-const confirmPreviewRefreshMs = 10_000
+  const refreshSwap = async () => {
+    if (!swap) return
+    const r = await postJSON('/api/intents/refresh', { depositAddress: swap.depositAddress })
+    if (r.ok && r.swap) setSwap(r.swap)
+  }
 
-// ---- Sub-components ----
+  // ---- Unavailable / loading states ----
 
-// CustodyModal is the first-use disclosure shown before the first swap.
-function CustodyModal ({ onClose }: { onClose: () => void }) {
-  return (
-    <div className="swap-custody-modal-scrim flex-center">
-      <div className="swap-custody-modal">
-        <div className="p-3 border-bottom">
-          <span className="demi fs16">{t('How swaps work')}</span>
+  if (assetsErr && !swap) {
+    return (
+      <form className="modal swap-modal">
+        <header><span>{t('Swap')}</span></header>
+        <div className="px-3 pb-3 grey text-center">{assetsErr}</div>
+        <div className="flex-stretch-column p-3">
+          <button type="button" onClick={close}>{t('Close')}</button>
         </div>
-        <div className="swap-custody-modal-body fs13">
-          <ul className="swap-custody-list">
-            <li>{t('Swaps are executed by NEAR Intents, a third-party service operated by Defuse Labs Ltd (Gibraltar).')}</li>
-            <li>{t('A swap is NOT an atomic swap. While it completes — typically a few minutes — funds are held by the service and its bridge operators.')}</li>
-            <li>{t('You send to a single-use deposit address the service controls. Swapped coins arrive at your own wallet address derived from your seed.')}</li>
-            <li>{t("If a swap can't complete, funds are returned automatically to your wallet, less any network costs incurred.")}</li>
-            <li>{t('Trust during transit varies by chain: some chains use a distributed MPC signing network (stronger); others use a validator federation (weaker). Details are shown per pair.')}</li>
-            <li>{t('The service screens transactions for sanctions compliance. A deposit may rarely be delayed or refused.')}</li>
-            <li>{t('The quoted rate includes all fees. Caribou never holds your funds; your seed-derived addresses are always the refund and destination recipients.')}</li>
-          </ul>
+      </form>
+    )
+  }
+
+  if (assets === null && !swap) {
+    return (
+      <form className="modal swap-modal">
+        <header><span>{t('Swap')}</span></header>
+        <div className="flex-center py-5"><Spinner size={24} /></div>
+      </form>
+    )
+  }
+
+  // ---- Progress view ----
+
+  if (view === 'progress' && swap) {
+    return <SwapProgress swap={swap} onRefresh={refreshSwap} onClose={close} />
+  }
+  if (view === 'progress') { // opened by depositAddress, record still loading
+    return (
+      <form className="modal swap-modal">
+        <header><span>{t('Swap')}</span></header>
+        <div className="flex-center py-5"><Spinner size={24} /></div>
+      </form>
+    )
+  }
+
+  // ---- Asset picker view ----
+
+  if (view === 'pick') {
+    const q = query.trim().toLowerCase()
+    const list = (assets ?? []).filter(a => {
+      if (q === '') return true
+      return assetTicker(a).toLowerCase().includes(q) ||
+        assetName(a).toLowerCase().includes(q) ||
+        a.symbol.toLowerCase().includes(q)
+    })
+    // Ready wallets first, ordered by USD balance; inactive entries trail.
+    const balUSD = (a: IntentsAsset) =>
+      usdValue(a, (app.wallet(a.assetID)?.balance?.available ?? 0) / Math.pow(10, a.atomDecimals))
+    list.sort((a, b) => {
+      if (a.walletReady !== b.walletReady) return a.walletReady ? -1 : 1
+      return balUSD(b) - balUSD(a)
+    })
+    const selectedID = pickSide === 'sell' ? sellID : buyID
+    return (
+      <form className="modal swap-modal">
+        <header>
+          <span className="ico-arrow-left fs16 pointer me-2" onClick={() => setView('form')} />
+          <span>{pickSide === 'sell' ? t('Sell which asset?') : t('Buy which asset?')}</span>
+        </header>
+        <div className="px-3 pb-2">
+          <div className="d-flex align-items-center form-input-bg br5">
+            <span className="ico-search fs16 p-2" />
+            <input
+              type="text"
+              value={query}
+              placeholder={t('search')}
+              onChange={e => setQuery(e.target.value)}
+              autoFocus
+            />
+          </div>
         </div>
-        <div className="p-3">
-          <button type="button" className="feature w-100" onClick={onClose}>{t('I understand — continue')}</button>
+        <div className="swap-pick-list overflow-y-auto mb-2">
+          {list.map(a => {
+            const ticker = assetTicker(a)
+            const avail = app.wallet(a.assetID)?.balance?.available ?? 0
+            const conv = avail / Math.pow(10, a.atomDecimals)
+            const usd = usdValue(a, conv)
+            return (
+              <div
+                key={a.assetID}
+                className={`d-flex align-items-center px-3 py-2 ${a.walletReady ? 'hoverbg pointer' : 'swap-pick-inactive'}`}
+                onClick={() => { if (a.walletReady) pick(a) }}
+              >
+                <AssetLogo assetID={a.assetID} ticker={ticker} className="icon-24 me-2" />
+                <div className="flex-grow-1">
+                  <div className="fs14 demi">
+                    {ticker}
+                    {a.assetID === selectedID && <span className="ico-check fs11 ms-2 grey" />}
+                  </div>
+                  <div className="grey fs12">{assetName(a)}</div>
+                </div>
+                {a.walletReady
+                  ? (
+                    <div className="text-right">
+                      <div className="fs14 mono">{avail > 0 ? Doc.formatCoinValue(avail, unitInfoFor(a)) : ''}</div>
+                      <div className="grey fs12">{avail > 0 ? Doc.formatUSD(usd) : ''}</div>
+                    </div>
+                    )
+                  : <span className="grey fs12">{t('wallet inactive')}</span>}
+              </div>
+            )
+          })}
+          {list.length === 0 && (
+            <div className="px-3 py-2 grey fs14 text-center">{t('No matching assets.')}</div>
+          )}
         </div>
-      </div>
-    </div>
+      </form>
+    )
+  }
+
+  // ---- Shared quote-derived display values (form + review) ----
+
+  const buyUI = buyAsset ? unitInfoFor(buyAsset) : undefined
+  const sellUI = sellAsset ? unitInfoFor(sellAsset) : undefined
+  // Each side's amount in atoms: the typed side derives from the entry
+  // (asset or USD), the other from the quote.
+  const sellAtomsShown = editSide === 'sell' ? editAtoms : (preview?.atomsIn ?? 0)
+  const buyAtomsShown = editSide === 'buy' ? editAtoms : (preview?.atomsOut ?? 0)
+  const sellConv = sellAsset ? sellAtomsShown / Math.pow(10, sellAsset.atomDecimals) : 0
+  const buyConv = buyAsset ? buyAtomsShown / Math.pow(10, buyAsset.atomDecimals) : 0
+  const sellUSD = sellAsset && sellConv > 0 ? Doc.formatUSD(usdValue(sellAsset, sellConv)) : ''
+  const buyUSD = buyAsset && buyConv > 0 ? Doc.formatUSD(usdValue(buyAsset, buyConv)) : ''
+  // Form-field values. The field being typed in shows the raw entry; the
+  // other three show plain derived strings.
+  const sellAssetValue = editSide === 'sell' && editUnit === 'asset'
+    ? amount
+    : sellAsset ? plainAtoms(sellAtomsShown, sellAsset.atomDecimals) : ''
+  const buyAssetValue = editSide === 'buy' && editUnit === 'asset'
+    ? amount
+    : buyAsset ? plainAtoms(buyAtomsShown, buyAsset.atomDecimals) : ''
+  const sellUSDValue = editSide === 'sell' && editUnit === 'usd'
+    ? amount
+    : sellAsset ? plainUSD(usdValue(sellAsset, sellConv)) : ''
+  const buyUSDValue = editSide === 'buy' && editUnit === 'usd'
+    ? amount
+    : buyAsset ? plainUSD(usdValue(buyAsset, buyConv)) : ''
+  // Review-view amounts, straight from the quote.
+  const sellFieldText = preview && sellUI ? Doc.formatCoinValue(preview.atomsIn, sellUI) : ''
+  const buyFieldText = preview && buyUI ? Doc.formatCoinValue(preview.atomsOut, buyUI) : ''
+  const quoteRate = preview && sellConv > 0 && buyConv > 0 ? buyConv / sellConv : 0
+  const indicativeRate = sellAsset && buyAsset && usdRate(buyAsset) > 0
+    ? usdRate(sellAsset) / usdRate(buyAsset)
+    : 0
+  const rateShown = quoteRate || indicativeRate
+  const rateText = rateShown && sellAsset && buyAsset
+    ? `1 ${assetTicker(sellAsset)} = ${Doc.formatFourSigFigs(rateShown)} ${assetTicker(buyAsset)}`
+    : ''
+  const minOutText = preview && buyAsset && buyUI
+    ? `${Doc.formatCoinValue(preview.minAtomsOut, buyUI)} ${assetTicker(buyAsset)}`
+    : ''
+  const maxInText = preview && sellAsset && sellUI
+    ? `${Doc.formatCoinValue(preview.atomsIn, sellUI)} ${assetTicker(sellAsset)}`
+    : ''
+  const etaText = preview ? `~${Doc.formatDuration(preview.timeEstimate * 1000)}` : ''
+  const feeBps = preview ? preview.appFees.reduce((sum, f) => sum + f.fee, 0) : 0
+  const sellAtoms = exactOutput ? (preview?.atomsIn ?? 0) : editAtoms
+  const overBalance = sellAtoms > sellAvail
+
+  // ---- Review view ----
+
+  if (view === 'review' && sellAsset && buyAsset) {
+    const canSwap = Boolean(preview) && !executing && (!requirePW || pw !== '')
+    return (
+      <form className="modal swap-modal" onSubmit={e => { e.preventDefault(); execute() }}>
+        <header>
+          <span className="ico-arrow-left fs16 pointer me-2" onClick={() => { if (!executing) setView('form') }} />
+          <span>{t('Review swap')}</span>
+        </header>
+
+        <div className="px-3 pb-2">
+          <div className="d-flex align-items-center py-2">
+            <AssetLogo assetID={sellAsset.assetID} ticker={assetTicker(sellAsset)} className="icon-32 me-3" />
+            <div className="flex-grow-1">
+              <div className="grey fs12">{exactOutput ? t('Sell (estimated)') : t('Sell')}</div>
+              <div className="fs18 demi mono">
+                {preview ? `${sellFieldText} ${assetTicker(sellAsset)}` : <Spinner size={16} />}
+              </div>
+            </div>
+            <div className="grey fs13">{sellUSD}</div>
+          </div>
+          <div className="d-flex align-items-center py-2">
+            <AssetLogo assetID={buyAsset.assetID} ticker={assetTicker(buyAsset)} className="icon-32 me-3" />
+            <div className="flex-grow-1">
+              <div className="grey fs12">{exactOutput ? t('Buy') : t('Buy (estimated)')}</div>
+              <div className="fs18 demi mono">
+                {preview ? `${buyFieldText} ${assetTicker(buyAsset)}` : <Spinner size={16} />}
+              </div>
+            </div>
+            <div className="grey fs13">{buyUSD}</div>
+          </div>
+        </div>
+
+        <div className="px-3 pb-2 fs13">
+          <div className="d-flex justify-content-between py-1">
+            <span className="grey">{t('Rate')}</span>
+            <span className="mono">{rateText || '—'}</span>
+          </div>
+          {exactOutput
+            ? (
+              <div className="d-flex justify-content-between py-1">
+                <span className="grey has-tip" aria-label={t('The swap is rejected before any funds move if it would cost more than this.')}>
+                  {t('Maximum sent')}
+                </span>
+                <span className="mono">{maxInText || '—'}</span>
+              </div>
+              )
+            : (
+              <div className="d-flex justify-content-between py-1">
+                <span className="grey has-tip" aria-label={t('The swap is rejected before any funds move if it would deliver less than this.')}>
+                  {t('Minimum received')}
+                </span>
+                <span className="mono">{minOutText || '—'}</span>
+              </div>
+              )}
+          <div className="d-flex justify-content-between py-1">
+            <span className="grey">{t('Max slippage')}</span>
+            <span>{slippagePct(slippageBps)}</span>
+          </div>
+          <div className="d-flex justify-content-between py-1">
+            <span className="grey has-tip" aria-label={t('Estimated time from deposit to delivery.')}>{t('Settlement time')}</span>
+            <span>{etaText || '—'}</span>
+          </div>
+          <div className="d-flex justify-content-between py-1">
+            <span className="grey has-tip" aria-label={t('Projected fee for the deposit transaction, paid from the wallet in addition to the amount sold.')}>{t('Network fee')}</span>
+            <span className="mono">{depositFeeText || '—'}</span>
+          </div>
+          {feeBps > 0 && (
+            <div className="d-flex justify-content-between py-1">
+              <span className="grey has-tip" aria-label={t('Fee paid to the swap service, included in the quoted output.')}>{t('Service fee')}</span>
+              <span>{slippagePct(feeBps)}</span>
+            </div>
+          )}
+          <div className="d-flex justify-content-between py-1">
+            <span className="grey">{t('Custody')}</span>
+            <button
+              type="button"
+              className="d-flex align-items-center pointer p-0 border-0 fs13"
+              onClick={() => setShowCustody(!showCustody)}
+              aria-label={t('Custody and trust details')}
+              aria-expanded={showCustody}
+            >
+              {t('Service-held in transit')}
+              <span className="ico-info fs13 ms-1 grey" />
+            </button>
+          </div>
+          {showCustody && (
+            <div className="form-input-bg br5 p-2 my-1 fs12">
+              <div className="grey mb-2">
+                {t('Swaps are executed by NEAR Intents, operated by Defuse Labs Ltd (Gibraltar). This is not an atomic swap: while it completes — typically a few minutes — funds are held by the service and its bridge operators.')}
+              </div>
+              <div className="mb-1"><span className="demi">{chainTicker(sellAsset)}:</span> {bridgeTrust(chainTicker(sellAsset))}.</div>
+              <div className="mb-2"><span className="demi">{chainTicker(buyAsset)}:</span> {bridgeTrust(chainTicker(buyAsset))}.</div>
+              <div className="grey">
+                {t('Deposits are screened for sanctions compliance and may rarely be delayed or refused. If a swap cannot complete, funds are returned automatically. All refund and destination addresses are derived from the wallet seed, so funds at rest are never in third-party custody.')}
+              </div>
+            </div>
+          )}
+          <div className="grey fs11 py-1 d-flex align-items-center">
+            {previewing ? <Spinner size={10} className="me-1" /> : <span className="ico-check fs10 me-1" />}
+            {t('Quote refreshes automatically.')}
+          </div>
+        </div>
+
+        {requirePW && (
+          <div className="px-3 pb-2">
+            <label className="fs12 grey">{t('App password')}</label>
+            <PasswordInput value={pw} onChange={e => setPW(e.target.value)} disabled={executing} autoFocus />
+          </div>
+        )}
+
+        {previewErr && <div role="alert" className="warncolor fs12 px-3 pb-1 text-center">{previewErr}</div>}
+        {execErr && <div role="alert" className="errcolor fs12 px-3 pb-1 text-center">{execErr}</div>}
+
+        <div className="flex-stretch-column p-3">
+          <button type="submit" className="feature swap-cta" disabled={!canSwap}>
+            {executing
+              ? <span className="d-inline-flex align-items-center justify-content-center"><Spinner className="me-2" />{t('Swapping...')}</span>
+              : t('Swap')}
+          </button>
+          <button type="button" className="mt-2" onClick={() => setView('form')} disabled={executing}>{t('Back')}</button>
+        </div>
+      </form>
+    )
+  }
+
+  // ---- Form view ----
+
+  const actionButton = () => {
+    if (sellID === null || buyID === null) {
+      return <button type="button" className="feature swap-cta" disabled>{t('Select assets')}</button>
+    }
+    if (editAtoms === 0) {
+      return <button type="button" className="feature swap-cta" disabled>{t('Enter an amount')}</button>
+    }
+    if (overBalance) {
+      return (
+        <button type="button" className="feature swap-cta" disabled>
+          {tvar('Not enough {{ ticker }}', { ticker: sellAsset ? assetTicker(sellAsset) : '' })}
+        </button>
+      )
+    }
+    if (previewErr) {
+      return <button type="button" className="feature swap-cta" onClick={fetchPreview}>{t('Retry quote')}</button>
+    }
+    if (!preview) {
+      return (
+        <button type="button" className="feature swap-cta" disabled>
+          <span className="d-inline-flex align-items-center justify-content-center"><Spinner className="me-2" />{t('Fetching quote...')}</span>
+        </button>
+      )
+    }
+    return <button type="button" className="feature swap-cta" onClick={() => { setExecErr(''); setView('review') }}>{t('Review swap')}</button>
+  }
+
+  const assetChip = (a: IntentsAsset | null, side: 'sell' | 'buy') => (
+    <button type="button" className="swap-chip d-flex align-items-center pointer" onClick={() => openPicker(side)}>
+      {a
+        ? <><AssetLogo assetID={a.assetID} ticker={assetTicker(a)} className="icon-32 me-2" /><span className="fs18 demi">{assetTicker(a)}</span></>
+        : <span className="fs16">{t('Select asset')}</span>}
+      <span className="ico-arrow-down fs12 ms-2 grey" />
+    </button>
   )
-}
 
-// CustodyNotice is the persistent one-line notice shown on the swap form.
-function CustodyNotice ({ originAsset, destAsset, showDetails, onToggleDetails }: {
-  originAsset?: IntentsAsset
-  destAsset?: IntentsAsset
-  showDetails: boolean
-  onToggleDetails: () => void
-}) {
   return (
-    <div className="swap-custody-notice">
-      <div className="d-flex align-items-start">
-        <span className="flex-grow-1 fs12 grey">
-          {t('Executed by NEAR Intents (third party). Funds are in the service\'s custody while the swap completes — typically a few minutes.')}
-        </span>
+    <form className="modal swap-modal" onSubmit={e => e.preventDefault()}>
+      <header className="position-relative">
+        <span>{t('Swap')}</span>
         <button
           type="button"
-          className="swap-info-btn noborder ms-2 fs13"
-          onClick={onToggleDetails}
-          aria-label={t('Trust and custody details')}
+          className="swap-gear flex-center pointer"
+          onClick={() => setShowSlippage(!showSlippage)}
+          aria-label={t('Slippage settings')}
         >
-          ⓘ
+          <span className="ico-gear fs16" />
         </button>
-      </div>
-      {showDetails && originAsset && destAsset && (
-        <div className="swap-trust-popover mt-2">
-          <div className="d-flex align-items-center justify-content-between mb-2">
-            <span className="demi fs13">{t('Custody and trust details')}</span>
-            <button type="button" className="swap-info-close noborder fs11" onClick={onToggleDetails}>✕</button>
-          </div>
-          <div className="fs12 grey mb-2">
-            <span className="demi">{t('Operator:')}</span> {t('Defuse Labs Ltd, Gibraltar')}
-          </div>
-          <div className="fs12 mb-1">
-            <span className="demi">{originAsset.symbol}:</span> {bridgeTrust(originAsset.symbol).description}
-          </div>
-          <div className="fs12 mb-1">
-            <span className="demi">{destAsset.symbol}:</span> {bridgeTrust(destAsset.symbol).description}
-          </div>
-          <div className="fs12 grey mt-2">
-            {t('All refund and destination addresses are derived from your seed — funds at rest are never in third-party custody.')}
-          </div>
-          <div className="fs12 grey mt-1">
-            {t('Service status:')} <a
-              href="https://status.near-intents.org"
-              target="_blank"
-              rel="noopener noreferrer"
-              className="swap-link"
-            >status.near-intents.org</a>
-          </div>
-        </div>
-      )}
-    </div>
-  )
-}
-
-// ---- Fee breakdown display ----
-
-// intentsFeeRecipient is the identity of Caribou's fee-collection account,
-// as passed in the appFees list on quote requests. Mirrors
-// intentsFeeRecipient in wallet/core/near-intents.go. Compared
-// case-insensitively since it's an 0x-form identity and the Go side
-// lowercases it.
-const intentsFeeRecipient = '0x4bda081527f14e5ecb9a2fd7703759897c2860a6'
-
-// friendlyFeeName maps a fee recipient address to a human-readable label.
-// The app fee is split by the service: our configured recipient gets one
-// entry; the protocol surcharge (the keyless-service surcharge) goes to a
-// separate account. We show both, matched by recipient rather than
-// position — the service does not guarantee appFees order is preserved.
-function friendlyFeeName (recipient: string): string {
-  if (recipient.toLowerCase() === intentsFeeRecipient) return t('Caribou fee')
-  return t('Network service fee')
-}
-
-function FeeBreakdown ({ preview, originAsset, destAsset }: {
-  preview: IntentsPreview
-  originAsset: IntentsAsset
-  destAsset: IntentsAsset
-}) {
-  return (
-    <div className="border-top mt-1 pt-1">
-      <div className="fs12 grey demi mb-1">{t('Fee breakdown')}</div>
-      {preview.appFees && preview.appFees.map((af, i) => (
-        <div key={af.recipient + i} className="d-flex justify-content-between fs12 py-1">
-          <span className="grey">{friendlyFeeName(af.recipient)}</span>
-          <span>{af.fee} {t('bps')}</span>
-        </div>
-      ))}
-      {preview.refundFee && (
-        <div className="d-flex justify-content-between fs12 py-1">
-          <span className="grey">{t('Refund fee (if refund needed)')}</span>
-          <span>{formatIntentsAmount(preview.refundFee, originAsset.decimals)} {originAsset.symbol}</span>
-        </div>
-      )}
-      {preview.withdrawFee && (
-        <div className="d-flex justify-content-between fs12 py-1">
-          <span className="grey">{t('Withdrawal fee')}</span>
-          <span>{formatIntentsAmount(preview.withdrawFee, destAsset.decimals)} {destAsset.symbol}</span>
-        </div>
-      )}
-    </div>
-  )
-}
-
-// ---- Swap history item ----
-
-function SwapHistoryItem ({ swap, assets, onRefresh }: {
-  swap: IntentsSwap
-  assets: IntentsAsset[]
-  onRefresh: (depositAddress: string) => void
-}) {
-  const [refreshing, setRefreshing] = useState(false)
-  const [expanded, setExpanded] = useState(isAttention(swap.state))
-
-  const originAsset = assets.find(a => a.assetID === swap.originAssetID)
-  const destAsset = assets.find(a => a.assetID === swap.destAssetID)
-
-  const doRefresh = async () => {
-    setRefreshing(true)
-    await onRefresh(swap.depositAddress)
-    setRefreshing(false)
-  }
-
-  const statusCls = swapStatusClass(swap.state)
-  const needsAttention = isAttention(swap.state)
-  const label = swapStatusLabel(swap.state)
-  const createdDate = new Date(swap.createdAt).toLocaleString(languages)
-
-  return (
-    <div className={`swap-history-item ${needsAttention ? 'swap-history-attention' : ''}`}>
-      <div
-        className="d-flex align-items-center pointer"
-        onClick={() => setExpanded(e => !e)}
-      >
-        <div className="d-flex align-items-center flex-grow-1">
-          {originAsset && <CoinLogo ticker={originAsset.symbol} className="mini-icon me-1" />}
-          <span className="fs13 demi me-1">{originAsset ? formatConventional(swap.atomsIn, originAsset.atomDecimals) : swap.amountIn} {intentsAssetLabel(assets, swap.originAssetID, swap.originAsset)}</span>
-          <span className="grey fs12 me-1">→</span>
-          {destAsset && <CoinLogo ticker={destAsset.symbol} className="mini-icon me-1" />}
-          <span className="fs13 demi">{destAsset ? formatConventional(swap.atomsOut, destAsset.atomDecimals) : swap.amountOut} {intentsAssetLabel(assets, swap.destAssetID, swap.destAsset)}</span>
-          {swap.reconstructed && (
-            <span className="swap-recovered-badge ms-2 fs11">{t('recovered')}</span>
-          )}
-        </div>
-        <div className="d-flex flex-column align-items-end ms-2">
-          <span className={`fs12 ${statusCls}`}>{label}</span>
-          <span className="fs11 grey">{createdDate}</span>
-        </div>
-        <span className={`ms-2 fs12 grey ico-${expanded ? 'arrowup' : 'arrowdown'}`} />
-      </div>
-
-      {expanded && (
-        <div className="border-top pt-2 mt-2">
-          <div className="d-flex justify-content-between fs12 py-1">
-            <span className="grey">{t('Status')}</span>
-            <span className={statusCls}>{label}</span>
-          </div>
-          <div className="d-flex justify-content-between fs12 py-1">
-            <span className="grey">{t('Deposit address')}</span>
-            <span className="mono fs11 grey swap-addr-wrap">{swap.depositAddress}</span>
-          </div>
-          {swap.depositMemo && (
-            <div className="d-flex justify-content-between fs12 py-1">
-              <span className="grey">{t('Deposit memo')}</span>
-              <span className="mono">{swap.depositMemo}</span>
-            </div>
-          )}
-          <div className="d-flex justify-content-between fs12 py-1">
-            <span className="grey">{t('Recipient')}</span>
-            <span className="mono fs11 grey swap-addr-wrap">{swap.recipient}</span>
-          </div>
-          {swap.depositTxID && (
-            <div className="d-flex justify-content-between fs12 py-1">
-              <span className="grey">{t('Deposit TX')}</span>
-              <span className="mono fs11 grey swap-addr-wrap">{swap.depositTxID}</span>
-            </div>
-          )}
-          {swap.nearTxHashes && swap.nearTxHashes.length > 0 && (
-            <div className="fs12 py-1">
-              <div className="grey mb-1">{t('NEAR transactions')}</div>
-              {swap.nearTxHashes.map(h => (
-                <div key={h} className="mono fs11 grey swap-addr-wrap">{h}</div>
-              ))}
-            </div>
-          )}
-          {swap.destinationTxs && swap.destinationTxs.length > 0 && (
-            <div className="fs12 py-1">
-              <div className="grey mb-1">{t('Destination transactions')}</div>
-              {swap.destinationTxs.map(h => (
-                <div key={h} className="mono fs11 grey swap-addr-wrap">{h}</div>
-              ))}
-            </div>
-          )}
-          {swap.refundReason && (
-            <div className="d-flex justify-content-between fs12 py-1">
-              <span className="grey">{t('Refund reason')}</span>
-              <span>{swap.refundReason}</span>
-            </div>
-          )}
-          {swap.refundedAmount && originAsset && (
-            <div className="d-flex justify-content-between fs12 py-1">
-              <span className="grey">{t('Refunded amount')}</span>
-              <span>{formatIntentsAmount(swap.refundedAmount, originAsset.decimals)} {originAsset.symbol}</span>
-            </div>
-          )}
-          {swap.refundTxs && swap.refundTxs.length > 0 && (
-            <div className="fs12 py-1">
-              <div className="grey mb-1">{t('Refund transactions')}</div>
-              {swap.refundTxs.map(h => (
-                <div key={h} className="mono fs11 grey swap-addr-wrap">{h}</div>
-              ))}
-            </div>
-          )}
-          {(needsAttention || !isTerminal(swap.state)) && (
-            <div className="swap-escalation-links d-flex mt-2 fs12">
-              <a
-                href={nearExplorerURL(swap.depositAddress)}
-                target="_blank"
-                rel="noopener noreferrer"
-                className="swap-link me-3"
-              >
-                {t('View on NEAR Intents Explorer')}
-              </a>
-              <a
-                href="https://status.near-intents.org"
-                target="_blank"
-                rel="noopener noreferrer"
-                className="swap-link"
-              >
-                {t('Service status')}
-              </a>
-            </div>
-          )}
-          {!isTerminal(swap.state) && (
-            <div className="mt-2">
-              <button
-                type="button"
-                className="small"
-                onClick={doRefresh}
-                disabled={refreshing}
-              >
-                {refreshing
-                  ? <><Spinner size={11} className="me-1" />{t('Refreshing...')}</>
-                  : t('Refresh status')}
-              </button>
-            </div>
-          )}
-        </div>
-      )}
-    </div>
-  )
-}
-
-// ---- Confirmation step ----
-
-function ConfirmSwap ({
-  originAsset,
-  destAsset,
-  preview,
-  submitting,
-  err,
-  requirePW,
-  pw,
-  setPW,
-  onConfirm,
-  onBack
-}: {
-  originAsset: IntentsAsset
-  destAsset: IntentsAsset
-  preview: IntentsPreview
-  submitting: boolean
-  err: string
-  requirePW: boolean
-  pw: string
-  setPW: (pw: string) => void
-  onConfirm: () => void
-  onBack: () => void
-}) {
-  return (
-    <form
-      className="modal form-width-300"
-      onSubmit={(e: FormEvent) => { e.preventDefault(); onConfirm() }}
-    >
-      <header>
-        <span className="ico-swap me-2 fs18" />
-        <span>{t('Confirm swap')}</span>
       </header>
 
-      <div className="px-3 pb-2">
-        <div className="d-flex align-items-center justify-content-center mb-3">
-          <CoinLogo ticker={originAsset.symbol} className="mini-icon" />
-          <div className="ms-2 me-3">
-            <div className="fs16 demi">{formatConventional(preview.atomsIn, originAsset.atomDecimals)} {originAsset.symbol}</div>
-            <div className="fs12 grey">{preview.amountInUSD ? usdFmt.format(parseFloat(preview.amountInUSD)) : '—'}</div>
-          </div>
-          <span className="ico-arrowright fs18 grey me-3" />
-          <CoinLogo ticker={destAsset.symbol} className="mini-icon" />
-          <div className="ms-2">
-            <div className="fs16 demi">{formatConventional(preview.atomsOut, destAsset.atomDecimals)} {destAsset.symbol}</div>
-            <div className="fs12 grey">{preview.amountOutUSD ? usdFmt.format(parseFloat(preview.amountOutUSD)) : '—'}</div>
-          </div>
-        </div>
-
-        <div className="border-top pt-1 fs13">
-          <div className="d-flex justify-content-between py-1">
-            <span className="grey">{t('Min received')}</span>
-            <span>{formatConventional(preview.minAtomsOut, destAsset.atomDecimals)} {destAsset.symbol}</span>
-          </div>
-          <div className="d-flex justify-content-between py-1">
-            <span className="grey">{t('Estimated time')}</span>
-            <span>{formatDuration(preview.timeEstimate)}</span>
-          </div>
-          {preview.appFees && preview.appFees.map((af, i) => (
-            <div key={af.recipient + i} className="d-flex justify-content-between py-1">
-              <span className="grey">{friendlyFeeName(af.recipient)}</span>
-              <span>{af.fee} {t('bps')}</span>
-            </div>
-          ))}
-          {preview.refundFee && (
-            <div className="d-flex justify-content-between py-1">
-              <span className="grey">{t('Refund fee')}</span>
-              <span>{formatIntentsAmount(preview.refundFee, originAsset.decimals)} {originAsset.symbol}</span>
-            </div>
-          )}
-          {preview.withdrawFee && (
-            <div className="d-flex justify-content-between py-1">
-              <span className="grey">{t('Withdrawal fee')}</span>
-              <span>{formatIntentsAmount(preview.withdrawFee, destAsset.decimals)} {destAsset.symbol}</span>
-            </div>
-          )}
-        </div>
-
-        <div className="swap-custody-notice mt-2">
-          <span className="fs12 grey">
-            {t('Funds are in the custody of NEAR Intents while the swap completes. Your seed-derived addresses are always the refund and destination recipients.')}
+      {showSlippage && (
+        <div className="swap-slip-pop d-flex align-items-center fs13">
+          <span className="grey me-2">{t('Max slippage')}</span>
+          <span>
+            {slippagePresets.map(bps => (
+              <button
+                key={bps}
+                type="button"
+                className={`filter-pill fs12 grey ms-1 ${bps === slippageBps ? 'selected' : ''}`}
+                onClick={() => setSlippageBps(bps)}
+              >
+                {slippagePct(bps)}
+              </button>
+            ))}
           </span>
         </div>
+      )}
+
+      <div className="px-3">
+        <div>
+          {/* Sell card: value story on the left (label, amount, USD),
+              asset story on the right (chip with balance/Max beneath). */}
+          <div className="swap-card p-3 d-flex" onClick={() => amtInputRef.current?.focus()}>
+            <div className="swap-card-values flex-grow-1">
+              <div className="section-label fs11 grey demi pb-1">{t('Sell')}</div>
+              <input
+                ref={amtInputRef}
+                type="text"
+                inputMode="decimal"
+                className="swap-amt-input mono"
+                value={sellAssetValue}
+                placeholder="0.0"
+                onChange={amountChanged('sell', 'asset')}
+                autoFocus
+              />
+              <div className="swap-usd-line d-flex align-items-center grey fs12 pt-1">
+                <span>$</span>
+                <input
+                  type="text"
+                  inputMode="decimal"
+                  className="swap-usd-input"
+                  value={sellUSDValue}
+                  placeholder="0.00"
+                  onChange={amountChanged('sell', 'usd')}
+                  onClick={e => e.stopPropagation()}
+                />
+              </div>
+            </div>
+            <div className="d-flex flex-column align-items-end justify-content-between ms-2">
+              {assetChip(sellAsset, 'sell')}
+              {sellAsset && (
+                <span className={`swap-balance pointer fs12 pt-1 ${overBalance ? 'errcolor' : 'grey'}`} onClick={setMax}>
+                  {tvar('Balance: {{ amt }}', { amt: displayBalance(sellAvail / Math.pow(10, sellAsset.atomDecimals)) })}
+                  {sellAvail > 0 && <span className="swap-max-link ms-1">{t('Max')}</span>}
+                </span>
+              )}
+            </div>
+          </div>
+
+          {/* Direction-flip control, floating on the seam between the
+              cards; its body-bg border notches it out of both. */}
+          <div className="swap-flip-anchor flex-center">
+            <button type="button" className="swap-flip flex-center pointer" onClick={flip} aria-label={t('Swap direction')}>
+              <span className="ico-swap rot90 fs16" />
+            </button>
+          </div>
+
+          {/* Buy card, mirroring the sell card's two columns. */}
+          <div className="swap-card p-3 mt-1 d-flex" onClick={() => buyInputRef.current?.focus()}>
+            <div className="swap-card-values flex-grow-1">
+              <div className="section-label fs11 grey demi pb-1">{t('Buy')}</div>
+              <input
+                ref={buyInputRef}
+                type="text"
+                inputMode="decimal"
+                className="swap-amt-input mono"
+                value={buyAssetValue}
+                placeholder="0.0"
+                onChange={amountChanged('buy', 'asset')}
+              />
+              <div className="swap-usd-line d-flex align-items-center grey fs12 pt-1">
+                <span>$</span>
+                <input
+                  type="text"
+                  inputMode="decimal"
+                  className="swap-usd-input"
+                  value={buyUSDValue}
+                  placeholder="0.00"
+                  onChange={amountChanged('buy', 'usd')}
+                  onClick={e => e.stopPropagation()}
+                />
+              </div>
+            </div>
+            <div className="d-flex flex-column align-items-end justify-content-between ms-2">
+              {assetChip(buyAsset, 'buy')}
+              {buyAsset && (
+                <span className="swap-balance grey fs12 pt-1">
+                  {tvar('Balance: {{ amt }}', { amt: displayBalance(buyAvail / Math.pow(10, buyAsset.atomDecimals)) })}
+                </span>
+              )}
+            </div>
+          </div>
+        </div>
+
+        {/* Quote details, always visible: the rate rests on the
+            indicative display-rate ratio, everything else on em-dashes
+            until a quote fills them in. */}
+        <div className="fs13 pt-2">
+          <div className="d-flex align-items-center justify-content-between py-1">
+            <span className="grey">{t('Rate')}</span>
+            <span className="d-flex align-items-center">
+              {previewing && <Spinner size={10} className="me-2" />}
+              <span className="mono">{rateText || '—'}</span>
+            </span>
+          </div>
+          <div className="d-flex justify-content-between py-1">
+            <span className="grey has-tip" aria-label={t('Estimated time from deposit to delivery.')}>
+              {t('Settlement time')}
+            </span>
+            <span>{etaText || '—'}</span>
+          </div>
+          {exactOutput
+            ? (
+              <div className="d-flex justify-content-between py-1">
+                <span className="grey has-tip" aria-label={t('The swap is rejected before any funds move if it would cost more than this.')}>
+                  {t('Maximum sent')}
+                </span>
+                <span className="mono">{maxInText || '—'}</span>
+              </div>
+              )
+            : (
+              <div className="d-flex justify-content-between py-1">
+                <span className="grey has-tip" aria-label={t('The swap is rejected before any funds move if it would deliver less than this.')}>
+                  {t('Minimum received')}
+                </span>
+                <span className="mono">{minOutText || '—'}</span>
+              </div>
+              )}
+          <div className="d-flex justify-content-between py-1">
+            <span className="grey has-tip" aria-label={t('Projected fee for the deposit transaction, paid from the wallet in addition to the amount sold.')}>{t('Network fee')}</span>
+            <span className="mono">{depositFeeText || '—'}</span>
+          </div>
+          <div className="d-flex justify-content-between py-1">
+            <span className="grey has-tip" aria-label={t('Fee paid to the swap service, included in the quoted output.')}>{t('Service fee')}</span>
+            <span>{feeBps > 0 ? slippagePct(feeBps) : '—'}</span>
+          </div>
+        </div>
+        {previewErr && <div role="alert" className="warncolor fs12 pt-2 text-center">{previewErr}</div>}
       </div>
 
-      {requirePW && (
-        <div className="px-3 pb-2">
-          <label className="fs12 grey">{t('App password')}</label>
-          <PasswordInput
-            value={pw}
-            onChange={e => setPW(e.target.value)}
-            disabled={submitting}
-            autoFocus
-          />
-        </div>
-      )}
-
-      {err && (
-        <div key={err} className="form-err errcolor fs12 px-3 pb-1 text-center">{err}</div>
-      )}
-
-      <div className="flex-stretch-column p-3">
-        <button type="submit" className="feature" disabled={submitting || (requirePW && !pw)}>
-          {submitting
-            ? <span className="d-inline-flex align-items-center justify-content-center">
-                <Spinner className="me-2" />{t('Sending deposit...')}
-              </span>
-            : t('Confirm swap')}
-        </button>
-        <button type="button" className="mt-2" onClick={onBack} disabled={submitting}>{t('Back')}</button>
+      <div className="flex-stretch-column px-3 pb-3 pt-2">
+        {actionButton()}
       </div>
     </form>
   )
 }
 
-// ---- Swap-record recovery ----
+// ---- Progress subview ----
 
-// RecoverSwapsModal confirms and runs POST /api/intents/reconstruct, which
-// rebuilds swap records lost with local state (e.g. after a seed restore)
-// by probing the service for hits against recent outgoing-transaction
-// recipients. The privacy tradeoff is disclosed before the request fires.
-function RecoverSwapsModal ({ submitting, err, found, onConfirm, onClose }: {
-  submitting: boolean
-  err: string
-  found: number | null
-  onConfirm: () => void
-  onClose: () => void
-}) {
+// fetchWalletTx loads a single transaction from a wallet's history, or
+// null when the wallet has no record of it.
+async function fetchWalletTx (assetID: number, txID: string): Promise<WalletTransaction | null> {
+  const r = await postJSON('/api/wallettx', { assetID, txID })
+  return r.ok && r.tx ? r.tx as WalletTransaction : null
+}
+
+// Row is the bordered label/value row shared with the transaction detail
+// dialog.
+function Row ({ label, tip, children }: { label: string, tip?: string, children: ReactNode }) {
   return (
-    <div className="swap-custody-modal-scrim flex-center">
-      <div className="swap-custody-modal">
-        <div className="p-3 border-bottom">
-          <span className="demi fs16">{t('Recover swaps')}</span>
-        </div>
-        {found === null
-          ? (
-            <>
-              <div className="swap-custody-modal-body fs13">
-                <p className="grey mb-2">
-                  {t('If swap history was lost — for example after restoring the wallet from your seed — Caribou can attempt to rebuild it.')}
-                </p>
-                <ul className="swap-custody-list">
-                  <li>{t('Recovery sends the recipient addresses of recent outgoing transactions — up to 25 per wallet, across all connected wallets — to the swap service, 1click.chaindefuser.com, asking whether each was a swap deposit address.')}</li>
-                  <li>{t("Requests honor the wallet's Tor proxy, if one is configured.")}</li>
-                  <li>{t('This can take a while — the service is rate-limited.')}</li>
-                </ul>
-                {err && (
-                  <div key={err} className="form-err errcolor fs12 pt-2 text-center">{err}</div>
-                )}
-              </div>
-              <div className="flex-stretch-column p-3">
-                <button type="button" className="feature" onClick={onConfirm} disabled={submitting}>
-                  {submitting
-                    ? <span className="d-inline-flex align-items-center justify-content-center">
-                        <Spinner className="me-2" />{t('Recovering...')}
-                      </span>
-                    : t('Recover swaps')}
-                </button>
-                <button type="button" className="mt-2" onClick={onClose} disabled={submitting}>{t('Cancel')}</button>
-              </div>
-            </>
-            )
-          : (
-            <>
-              <div className="swap-custody-modal-body fs13 text-center">
-                {found > 0
-                  ? tvar('Recovered {{ n }} swap record(s).', { n: String(found) })
-                  : t('No additional swap records were found.')}
-              </div>
-              <div className="p-3">
-                <button type="button" className="feature w-100" onClick={onClose}>{t('Close')}</button>
-              </div>
-            </>
-            )}
-      </div>
+    <div className="network-stat d-flex justify-content-between align-items-center fs14 border-bottom">
+      {tip
+        ? <span className="grey fs13 has-tip" aria-label={tip}>{label}</span>
+        : <span className="grey fs13">{label}</span>}
+      <span className="text-right">{children}</span>
     </div>
   )
 }
 
-// ---- Main Swap component ----
+interface SwapProgressProps {
+  swap: IntentsSwap
+  onRefresh: () => void
+  onClose: () => void
+}
 
-type SwapStep = 'form' | 'confirm' | 'done'
+// Progress steps for an active swap. Every pre-PROCESSING state is the
+// deposit phase.
+function activeStep (state: string): number {
+  return state === StateProcessing ? 1 : 0
+}
 
-export default function Swap () {
-  const close = () => app.setForm({ form: '', data: {} })
+function SwapProgress ({ swap, onRefresh, onClose }: SwapProgressProps) {
+  const active = swapIsActive(swap)
+  // depositRejected: the record is still active (the engine has not yet
+  // polled), but the fetched deposit tx already proves an on-chain
+  // rejection. The header and step indicator show the failure rather than
+  // a healthy in-flight swap. Declared here, assigned after depositTx.
+  let depositRejected = false
+  const originAsset = app.user?.assets[swap.originAssetID]
+  const destAsset = app.user?.assets[swap.destAssetID]
+  const originTicker = originAsset?.unitInfo.conventional.unit ?? swap.originAsset
+  const destTicker = destAsset?.unitInfo.conventional.unit ?? swap.destAsset
+  const amountIn = originAsset ? Doc.formatCoinValue(swap.atomsIn, originAsset.unitInfo) : swap.amountIn
+  const amountOut = destAsset ? Doc.formatCoinValue(swap.atomsOut, destAsset.unitInfo) : swap.amountOut
 
-  // First-use disclosure state
-  const [showDisclosure, setShowDisclosure] = useState(
-    !State.fetchLocal(INTENTS_DISCLOSURE_SEEN_KEY)
+  const inFactor = originAsset?.unitInfo.conventional.conversionFactor ?? 0
+  const outFactor = destAsset?.unitInfo.conventional.conversionFactor ?? 0
+  const usdIn = inFactor ? Doc.usdString(swap.atomsIn, inFactor, app.idRate(swap.originAssetID) ?? 0) : ''
+  const usdOut = outFactor ? Doc.usdString(swap.atomsOut, outFactor, app.idRate(swap.destAssetID) ?? 0) : ''
+  const inConv = inFactor ? swap.atomsIn / inFactor : 0
+  const outConv = outFactor ? swap.atomsOut / outFactor : 0
+  const rateText = inConv > 0 && outConv > 0
+    ? `1 ${originTicker} = ${Doc.formatFourSigFigs(outConv / inConv)} ${destTicker}`
+    : ''
+  const feeBps = (swap.appFees ?? []).reduce((sum, f) => sum + f.fee, 0)
+  // The refund's origin-atoms conversion and USD pricing are captured on the
+  // record at refund time; an older or unresolvable record leaves them zero
+  // and the row is omitted.
+  const refundedAtoms = swap.refundedAtoms ?? 0
+  const refundedText = originAsset && refundedAtoms > 0
+    ? `${Doc.formatCoinValue(refundedAtoms, originAsset.unitInfo)} ${originTicker}`
+    : ''
+  const refundedUSD = Doc.formatUsd(swap.usdRefunded ?? 0)
+
+  // The deposit leg, for its network fee: undefined while loading, null
+  // when the wallet has no record of it.
+  const [depositTx, setDepositTx] = useState<WalletTransaction | null | undefined>(undefined)
+  useEffect(() => {
+    if (!swap.depositTxID) {
+      setDepositTx(null)
+      return
+    }
+    let stale = false
+    setDepositTx(undefined)
+    fetchWalletTx(swap.originAssetID, swap.depositTxID).then(tx => {
+      if (!stale) setDepositTx(tx)
+    })
+    return () => { stale = true }
+  }, [swap.originAssetID, swap.depositTxID])
+
+  depositRejected = active && depositTx?.rejected === true
+
+  // The deposit's network fee is paid in the origin chain's native asset.
+  const feeAssetID = originAsset?.token ? originAsset.token.networkID : swap.originAssetID
+  const feeAsset = app.user?.assets[feeAssetID]
+  const feeUSD = depositTx && feeAsset
+    ? Doc.usdString(depositTx.fees, feeAsset.unitInfo.conventional.conversionFactor, app.idRate(feeAssetID) ?? 0)
+    : ''
+
+  // One shared "Copied!" flash keyed by the copied string.
+  const [copiedID, setCopiedID] = useState('')
+  const copy = async (v: string) => {
+    try {
+      await navigator.clipboard.writeText(v)
+      setCopiedID(v)
+      window.setTimeout(() => setCopiedID(c => (c === v ? '' : c)), 1500)
+    } catch { /* clipboard unavailable */ }
+  }
+
+  const statusIcon = () => {
+    if (depositRejected) return <span className="ico-close fs16 errcolor" />
+    if (active) return <Spinner size={16} />
+    switch (swap.state) {
+      case StateSuccess: return <span className="ico-check fs16 tx-amt-pos" />
+      case StateFailed:
+      case StateDepositFailed: return <span className="ico-close fs16 errcolor" />
+      default: return <span className="ico-info fs16 grey" />
+    }
+  }
+
+  // openLeg swaps this dialog for the leg transaction's detail dialog.
+  const openLeg = async (assetID: number, txID: string) => {
+    const tx = await fetchWalletTx(assetID, txID)
+    if (tx) app.setForm({ form: 'txdetail', data: { assetID, tx } })
+  }
+
+  // idActions renders the copy control, and a block-explorer link when one
+  // exists for the asset.
+  const idActions = (id: string, assetID: number) => {
+    const explorer = explorerTxURL(assetID, id)
+    return (
+      <>
+        <span
+          className={`swap-id-action ms-2 pointer fs12 ${copiedID === id ? 'tx-amt-pos' : 'grey'}`}
+          onClick={e => { e.stopPropagation(); copy(id) }}
+        >
+          {copiedID === id ? t('Copied!') : <span className="ico-copy" />}
+        </span>
+        {explorer && (
+          <a
+            href={explorer} target="_blank" rel="noopener noreferrer"
+            className="swap-id-action ms-2 fs12" aria-label={t('View in block explorer')}
+            onClick={e => e.stopPropagation()}
+          >
+            <span className="ico-link" />
+          </a>
+        )}
+      </>
+    )
+  }
+
+  // A transaction-leg row: click opens the leg's own detail dialog.
+  const txRow = (label: string, id: string, assetID: number, failed?: boolean) => (
+    <Row key={label + id} label={label} tip={t('Click to view the transaction.')}>
+      <span className="d-flex align-items-center pointer" onClick={() => openLeg(assetID, id)}>
+        {failed && <span className="errcolor fs11 me-2">{t('failed')}</span>}
+        <span className="mono fs13 has-tip" aria-label={id}>{Doc.shortenAddress(id)}</span>
+        {idActions(id, assetID)}
+      </span>
+    </Row>
   )
 
-  const dismissDisclosure = () => {
-    State.storeLocal(INTENTS_DISCLOSURE_SEEN_KEY, true)
-    setShowDisclosure(false)
-  }
+  const steps = [t('Deposit'), t('Swapping'), t('Delivered')]
+  const step = activeStep(swap.state)
 
-  // Assets from /api/intents/assets
-  const [assets, setAssets] = useState<IntentsAsset[]>([])
-  const [assetsLoading, setAssetsLoading] = useState(true)
-  const [assetsErr, setAssetsErr] = useState('')
-
-  // Pair selection
-  const [originID, setOriginID] = useState<number | null>(null)
-  const [destID, setDestID] = useState<number | null>(null)
-
-  // Amount in conventional display units
-  const [amount, setAmount] = useState('')
-
-  // Preview (dry quote)
-  const [preview, setPreview] = useState<IntentsPreview | null>(null)
-  const [previewing, setPreviewing] = useState(false)
-  const [previewErr, setPreviewErr] = useState('')
-  // Bumped to force a fresh preview with unchanged inputs, e.g. after the
-  // server rejects an execute because the rate moved past the previewed
-  // minimum.
-  const [previewNonce, setPreviewNonce] = useState(0)
-
-  // Trust popover toggle
-  const [showTrust, setShowTrust] = useState(false)
-
-  // Swap step
-  const [step, setStep] = useState<SwapStep>('form')
-
-  // Execution state
-  const [submitting, setSubmitting] = useState(false)
-  const [execErr, setExecErr] = useState('')
-  const [doneSwap, setDoneSwap] = useState<IntentsSwap | null>(null)
-
-  // Password
-  const requirePW = app.appSettings.sendRequiresPassword
-  const [pw, setPW] = useState('')
-
-  // History
-  const [swaps, setSwaps] = useState<IntentsSwap[]>([])
-  const [swapsLoading, setSwapsLoading] = useState(true)
-
-  // Swap-record recovery
-  const [showRecover, setShowRecover] = useState(false)
-  const [recovering, setRecovering] = useState(false)
-  const [recoverErr, setRecoverErr] = useState('')
-  const [recoverFound, setRecoverFound] = useState<number | null>(null)
-
-  // Monotonic guard for debounced preview
-  const previewRef = useRef(0)
-
-  // Slippage — fixed at 100 bps (1%) matching the engine default
-  const slippageBps = 100
-
-  // Load assets on mount
-  useEffect(() => {
-    let cancelled = false
-    const load = async () => {
-      setAssetsLoading(true)
-      const r = await getJSON('/api/intents/assets')
-      if (cancelled) return
-      setAssetsLoading(false)
-      if (!r.ok) {
-        setAssetsErr(r.errMsg || r.msg || t('Failed to load swap assets.'))
-        return
-      }
-      setAssets(r.assets ?? [])
-    }
-    load()
-    return () => { cancelled = true }
-  }, [])
-
-  // Load swap history on mount
-  useEffect(() => {
-    let cancelled = false
-    const load = async () => {
-      const r = await getJSON('/api/intents/swaps')
-      if (cancelled) return
-      setSwapsLoading(false)
-      if (r.ok) setSwaps(r.swaps ?? [])
-    }
-    load()
-    return () => { cancelled = true }
-  }, [])
-
-  // Subscribe to intentsswap notifications
-  useEffect(() => {
-    const k = app.registerNoteFeed((note: CoreNote) => {
-      if (note.type !== 'intentsswap') return
-      const swap: IntentsSwap = (note as any).swap
-      if (!swap) return
-      setSwaps(prev => {
-        const idx = prev.findIndex(s => s.depositAddress === swap.depositAddress)
-        if (idx >= 0) {
-          const next = [...prev]
-          next[idx] = swap
-          return next
-        }
-        return [swap, ...prev]
-      })
-    })
-    return () => app.unregisterNoteFeed(k)
-  }, [])
-
-  // Debounced preview: fires when origin, dest, or amount changes
-  useEffect(() => {
-    setPreview(null)
-    setPreviewErr('')
-    if (originID === null || destID === null || originID === destID) return
-    const originAsset = assets.find(a => a.assetID === originID)
-    if (!originAsset) return
-    const v = parseFloat(amount)
-    if (!Number.isFinite(v) || v <= 0) return
-    const atoms = conventionalToAtoms(v, originAsset.atomDecimals)
-    if (atoms <= 0) return
-
-    const id = ++previewRef.current
-    setPreviewing(true)
-    const h = setTimeout(async () => {
-      const r = await postJSON('/api/intents/preview', {
-        originAssetID: originID,
-        destAssetID: destID,
-        value: atoms,
-        slippageBps
-      })
-      if (id !== previewRef.current) return
-      setPreviewing(false)
-      if (!r.ok) {
-        setPreviewErr(r.errMsg || r.msg || t('Could not get a quote. The pair may not be available or the amount may be too small.'))
-        return
-      }
-      setPreview(r.preview)
-    }, 500)
-    return () => { clearTimeout(h); setPreviewing(false) }
-  }, [originID, destID, amount, assets, slippageBps, previewNonce])
-
-  const originAsset = assets.find(a => a.assetID === originID) ?? null
-  const destAsset = assets.find(a => a.assetID === destID) ?? null
-
-  // atoms for the current amount (0 if invalid)
-  const atomsIn = (() => {
-    if (!originAsset) return 0
-    const v = parseFloat(amount)
-    if (!Number.isFinite(v) || v <= 0) return 0
-    return conventionalToAtoms(v, originAsset.atomDecimals)
-  })()
-
-  const canPreview = originID !== null && destID !== null && originID !== destID && atomsIn > 0
-  const canConfirm = canPreview && preview !== null && !previewing && !previewErr
-
-  // While the confirm screen is open, the previewed terms keep aging, and
-  // the execute floor rejects a committed quote below the previewed
-  // minimum however small the move — so a stale preview becomes a
-  // rejection loop on a volatile pair. Re-quote periodically and swap the
-  // fresh terms in quietly: the displayed numbers and the enforced floor
-  // stay anchored to what the user is currently looking at, leaving only
-  // the seconds around the confirm click as drift exposure. Failures keep
-  // the last good preview; the execute floor still guards the outcome.
-  useEffect(() => {
-    if (step !== 'confirm' || submitting) return
-    if (originID === null || destID === null || atomsIn <= 0) return
-    let cancelled = false
-    const h = setInterval(async () => {
-      const r = await postJSON('/api/intents/preview', {
-        originAssetID: originID,
-        destAssetID: destID,
-        value: atomsIn,
-        slippageBps
-      })
-      if (cancelled || !r.ok) return
-      setPreview(r.preview)
-    }, confirmPreviewRefreshMs)
-    return () => { cancelled = true; clearInterval(h) }
-  }, [step, submitting, originID, destID, atomsIn, slippageBps])
-
-  // Confirm → execute. The previewed minimum output is echoed so the
-  // server rejects a committed quote that pays less than the terms shown
-  // here. On failure, return to the form (not the confirm modal) with the
-  // error shown and a fresh preview requested, so a retry is a deliberate
-  // review-and-confirm against current numbers rather than a stray click on
-  // a modal that re-materializes when the refreshed quote arrives.
-  const executeSwap = async () => {
-    if (!originAsset || !destAsset || atomsIn <= 0 || submitting || !preview) return
-    setSubmitting(true)
-    setExecErr('')
-    const r = await postJSON('/api/intents/execute', {
-      originAssetID: originID,
-      destAssetID: destID,
-      value: atomsIn,
-      slippageBps,
-      minAtomsOut: preview.minAtomsOut,
-      pass: pw
-    })
-    setSubmitting(false)
-    if (!r.ok) {
-      setExecErr(r.errMsg || r.msg || t('Swap failed. Please try again.'))
-      setStep('form')
-      setPreviewNonce(n => n + 1)
-      return
-    }
-    const swap: IntentsSwap = r.swap
-    setDoneSwap(swap)
-    setSwaps(prev => {
-      const idx = prev.findIndex(s => s.depositAddress === swap.depositAddress)
-      if (idx >= 0) {
-        const next = [...prev]; next[idx] = swap; return next
-      }
-      return [swap, ...prev]
-    })
-    setStep('done')
-  }
-
-  // Refresh one swap
-  const refreshSwap = useCallback(async (depositAddress: string) => {
-    const r = await postJSON('/api/intents/refresh', { depositAddress })
-    if (r.ok && r.swap) {
-      setSwaps(prev => {
-        const idx = prev.findIndex(s => s.depositAddress === r.swap.depositAddress)
-        if (idx >= 0) {
-          const next = [...prev]; next[idx] = r.swap; return next
-        }
-        return [r.swap, ...prev]
-      })
-    }
-  }, [])
-
-  // Run swap-record recovery. The result (including zero) is surfaced by
-  // the modal, and the list is refreshed on success so any recovered
-  // records show up immediately.
-  const recoverSwaps = async () => {
-    setRecovering(true)
-    setRecoverErr('')
-    const r = await postJSON('/api/intents/reconstruct')
-    setRecovering(false)
-    if (!r.ok) {
-      setRecoverErr(r.errMsg || r.msg || t('Failed to recover swaps.'))
-      return
-    }
-    setRecoverFound(r.found)
-    const list = await getJSON('/api/intents/swaps')
-    if (list.ok) setSwaps(list.swaps ?? [])
-  }
-
-  // ---- Render: first-use disclosure ----
-  if (showDisclosure) {
-    return (
-      <form className="modal form-width-300" onSubmit={e => e.preventDefault()}>
-        <header>
-          <span className="ico-swap me-2 fs18" />
-          <span>{t('Swap')}</span>
-        </header>
-        <CustodyModal onClose={dismissDisclosure} />
-        <div className="flex-stretch-column p-3">
-          <button type="button" onClick={close}>{t('Cancel')}</button>
-        </div>
-      </form>
-    )
-  }
-
-  // ---- Render: confirmation step ----
-  if (step === 'confirm' && originAsset && destAsset && preview) {
-    return (
-      <ConfirmSwap
-        originAsset={originAsset}
-        destAsset={destAsset}
-        preview={preview}
-        submitting={submitting}
-        err={execErr}
-        requirePW={requirePW}
-        pw={pw}
-        setPW={setPW}
-        onConfirm={executeSwap}
-        onBack={() => { setStep('form'); setExecErr('') }}
-      />
-    )
-  }
-
-  // ---- Render: done step ----
-  if (step === 'done' && doneSwap) {
-    return (
-      <form className="modal form-width-300" onSubmit={e => e.preventDefault()}>
-        <header>
-          <span className="ico-swap me-2 fs18" />
-          <span>{t('Swap sent')}</span>
-        </header>
-        <div className="px-3 pb-3 text-center">
-          <div className="fs14 mb-3">
-            {tvar('Your {{ origin }} deposit has been sent. Swapped {{ dest }} will arrive at your wallet address when the swap completes.', {
-              origin: intentsAssetLabel(assets, doneSwap.originAssetID, doneSwap.originAsset),
-              dest: intentsAssetLabel(assets, doneSwap.destAssetID, doneSwap.destAsset)
-            })}
-          </div>
-          <div className="swap-custody-notice mb-3">
-            <span className="fs12 grey">
-              {t('Funds are in the custody of NEAR Intents during the swap — typically a few minutes. Your seed-derived address is always the recipient.')}
-            </span>
-          </div>
-          <div className="fs12 grey mb-2">
-            <span className="demi">{t('Deposit address:')}</span>
-            <div className="mono fs11 grey swap-addr-wrap mt-1">{doneSwap.depositAddress}</div>
-          </div>
-          <a
-            href={nearExplorerURL(doneSwap.depositAddress)}
-            target="_blank"
-            rel="noopener noreferrer"
-            className="swap-link fs12"
-          >
-            {t('Track on NEAR Intents Explorer')}
-          </a>
-        </div>
-        <div className="flex-stretch-column p-3">
-          <button type="button" className="feature" onClick={() => {
-            setStep('form')
-            setAmount('')
-            setPreview(null)
-            setPW('')
-            setDoneSwap(null)
-          }}>{t('New swap')}</button>
-          <button type="button" className="mt-2" onClick={close}>{t('Close')}</button>
-        </div>
-      </form>
-    )
-  }
-
-  // ---- Render: main swap form ----
-  const readyOriginAssets = assets.filter(a => a.walletReady)
-  const readyDestAssets = assets.filter(a => a.walletReady && a.assetID !== originID)
-  const unavailableDestAssets = assets.filter(a => !a.walletReady && a.assetID !== originID)
+  const started = new Date(swap.createdAt)
+  const updated = new Date(swap.updatedAt)
+  const deadline = new Date(swap.deadline)
 
   return (
-    <form
-      className="modal swap-modal"
-      onSubmit={e => e.preventDefault()}
-    >
-      <header>
-        <span className="ico-swap me-2 fs18" />
-        <span>{t('Swap')}</span>
-      </header>
+    <form className="modal swap-modal" onSubmit={e => e.preventDefault()}>
+      <header><span>{t('Swap details')}</span></header>
 
-      {assetsLoading && (
-        <div className="flex-center p-4">
-          <Spinner size={20} />
-        </div>
-      )}
+      <div className="flex-center px-3 pt-1">
+        {statusIcon()}
+        <span className={`fs16 demi ms-2 ${depositRejected ? 'errcolor' : stateColorClass(swap.state)}`}>
+          {depositRejected ? t('Deposit failed') : stateLabel(swap.state)}
+        </span>
+        {active && !depositRejected && swap.timeEstimate > 0 && (
+          <span className="grey fs12 ms-2">{tvar('usually ~{{ eta }}', { eta: Doc.formatDuration(swap.timeEstimate * 1000) })}</span>
+        )}
+        {swap.reconstructed && <span className="swap-recovered fs11 grey ms-2">{t('recovered')}</span>}
+      </div>
 
-      {assetsErr && (
-        <div className="errcolor fs13 px-3 pb-3 text-center">{assetsErr}</div>
-      )}
-
-      {!assetsLoading && !assetsErr && (
-        <>
-          {/* Custody notice */}
-          <div className="px-3 pb-2">
-            <CustodyNotice
-              originAsset={originAsset ?? undefined}
-              destAsset={destAsset ?? undefined}
-              showDetails={showTrust}
-              onToggleDetails={() => setShowTrust(s => !s)}
-            />
-          </div>
-
-          {/* Origin picker */}
-          <div className="px-3 pb-2">
-            <div className="fs12 grey mb-1">{t('From')}</div>
-            <div className="form-input-bg br5 d-flex align-items-center swap-asset-pick">
-              <select
-                value={originID ?? ''}
-                onChange={e => {
-                  const id = parseInt(e.target.value, 10)
-                  setOriginID(isNaN(id) ? null : id)
-                  setPreview(null)
-                  setPreviewErr('')
-                  setAmount('')
-                  if (destID === id) setDestID(null)
-                }}
-              >
-                <option value="">{t('Select asset')}</option>
-                {readyOriginAssets.map(a => (
-                  <option key={a.assetID} value={a.assetID}>{a.symbol}</option>
-                ))}
-                {assets.filter(a => !a.walletReady).map(a => (
-                  <option key={a.assetID} value={a.assetID} disabled>
-                    {a.symbol} — {t('wallet not available')}
-                  </option>
-                ))}
-              </select>
-              {originAsset && (
-                <CoinLogo
-                  ticker={originAsset.symbol}
-                  className="mini-icon ms-2"
-                  style={{ flexShrink: 0 }}
-                />
-              )}
-            </div>
-          </div>
-
-          {/* Amount input */}
-          {originAsset && (
-            <div className="px-3 pb-2">
-              <div className="fs12 grey mb-1">{t('Amount')}</div>
-              <div className="form-input-bg br5 d-flex align-items-center send-amt">
-                <input
-                  type="text"
-                  inputMode="decimal"
-                  value={amount}
-                  placeholder="0.00"
-                  onChange={e => {
-                    setAmount(e.target.value)
-                    setPreviewErr('')
-                    setPreview(null)
-                  }}
-                />
-                <span className="grey fs14 px-2">{originAsset.symbol}</span>
+      {active && !depositRejected && (
+        <div className="flex-center px-3 pt-3">
+          {steps.map((label, i) => (
+            <div key={label} className="d-flex align-items-center">
+              {i > 0 && <div className={`swap-step-bar ${i <= step ? 'done' : ''}`} />}
+              <div className="d-flex flex-column align-items-center">
+                <div className={`swap-step-dot ${i < step ? 'done' : i === step ? 'current' : ''}`} />
+                <div className={`fs11 pt-1 ${i === step ? '' : 'grey'}`}>{label}</div>
               </div>
-              {originAsset.priceUSD > 0 && atomsIn > 0 && (
-                <div className="fs12 grey pt-1">
-                  {usdFmt.format(atomsToConventional(atomsIn, originAsset.atomDecimals) * originAsset.priceUSD)}
-                </div>
-              )}
             </div>
-          )}
-
-          {/* Destination picker */}
-          <div className="px-3 pb-2">
-            <div className="fs12 grey mb-1">{t('To')}</div>
-            <div className="form-input-bg br5 d-flex align-items-center swap-asset-pick">
-              <select
-                value={destID ?? ''}
-                onChange={e => {
-                  const id = parseInt(e.target.value, 10)
-                  setDestID(isNaN(id) ? null : id)
-                  setPreview(null)
-                  setPreviewErr('')
-                }}
-              >
-                <option value="">{t('Select asset')}</option>
-                {readyDestAssets.map(a => (
-                  <option key={a.assetID} value={a.assetID}>{a.symbol}</option>
-                ))}
-                {unavailableDestAssets.map(a => (
-                  <option key={a.assetID} value={a.assetID} disabled>
-                    {a.symbol} — {t('wallet not available')}
-                  </option>
-                ))}
-              </select>
-              {destAsset && (
-                <CoinLogo
-                  ticker={destAsset.symbol}
-                  className="mini-icon ms-2"
-                  style={{ flexShrink: 0 }}
-                />
-              )}
-            </div>
-          </div>
-
-          {/* Preview panel */}
-          {canPreview && (
-            <div className="px-3 pb-2 border-top pt-2">
-              {previewing && (
-                <div className="d-flex align-items-center grey fs12">
-                  <Spinner size={12} className="me-2" />{t('Getting quote...')}
-                </div>
-              )}
-              {previewErr && (
-                <div className="errcolor fs12">{previewErr}</div>
-              )}
-              {preview && destAsset && originAsset && (
-                <>
-                  <div className="d-flex justify-content-between fs13 py-1">
-                    <span className="grey">{t('You receive')}</span>
-                    <span className="demi">
-                      {formatConventional(preview.atomsOut, destAsset.atomDecimals)} {destAsset.symbol}
-                    </span>
-                  </div>
-                  {preview.amountOutUSD && (
-                    <div className="d-flex justify-content-between fs12 py-1">
-                      <span className="grey">{t('Value')}</span>
-                      <span>{usdFmt.format(parseFloat(preview.amountOutUSD))}</span>
-                    </div>
-                  )}
-                  <div className="d-flex justify-content-between fs12 py-1">
-                    <span className="grey">{t('Min received (1% slippage)')}</span>
-                    <span>{formatConventional(preview.minAtomsOut, destAsset.atomDecimals)} {destAsset.symbol}</span>
-                  </div>
-                  <div className="d-flex justify-content-between fs12 py-1">
-                    <span className="grey">{t('Estimated time')}</span>
-                    <span>{formatDuration(preview.timeEstimate)}</span>
-                  </div>
-                  <FeeBreakdown preview={preview} originAsset={originAsset} destAsset={destAsset} />
-                </>
-              )}
-            </div>
-          )}
-
-          <div className="flex-stretch-column px-3 pb-3">
-            {execErr && (
-              <div className="errcolor fs12 text-center mb-2">{execErr}</div>
-            )}
-            <button
-              type="button"
-              className="feature"
-              disabled={!canConfirm}
-              onClick={() => { setStep('confirm'); setExecErr(''); setPW('') }}
-            >
-              {t('Review swap')}
-            </button>
-            <button type="button" className="mt-2" onClick={close}>{t('Cancel')}</button>
-          </div>
-        </>
-      )}
-
-      {/* Swap history */}
-      {!assetsLoading && (
-        <div className="swap-history">
-          <div className="swap-history-header d-flex align-items-center justify-content-between fs11 grey demi px-3 py-2">
-            <span>{t('SWAP HISTORY')}</span>
-            <button
-              type="button"
-              className="small"
-              disabled={recovering}
-              onClick={() => { setShowRecover(true); setRecoverErr(''); setRecoverFound(null) }}
-            >
-              {t('Recover swaps')}
-            </button>
-          </div>
-          {swapsLoading && (
-            <div className="flex-center py-3">
-              <Spinner size={14} />
-            </div>
-          )}
-          {!swapsLoading && swaps.length === 0 && (
-            <div className="fs12 grey text-center py-3">{t('No swaps yet.')}</div>
-          )}
-          {swaps.map(s => (
-            <SwapHistoryItem
-              key={s.depositAddress}
-              swap={s}
-              assets={assets}
-              onRefresh={refreshSwap}
-            />
           ))}
         </div>
       )}
 
-      {showRecover && (
-        <RecoverSwapsModal
-          submitting={recovering}
-          err={recoverErr}
-          found={recoverFound}
-          onConfirm={recoverSwaps}
-          onClose={() => setShowRecover(false)}
-        />
+      <div className="flex-center px-3 py-3">
+        <div className="d-flex align-items-center">
+          <AssetLogo assetID={swap.originAssetID} ticker={originTicker} className="icon-32 me-2" />
+          <div>
+            <div className="mono demi fs18">{amountIn} {originTicker}</div>
+            <div className="grey fs12">{usdIn}</div>
+          </div>
+        </div>
+        <span className="ico-arrow-right fs14 grey mx-3" />
+        <div className="d-flex align-items-center">
+          <AssetLogo assetID={swap.destAssetID} ticker={destTicker} className="icon-32 me-2" />
+          <div>
+            <div className="mono demi fs18">
+              {swap.state === StateSuccess ? '' : '~'}{amountOut} {destTicker}
+            </div>
+            <div className="grey fs12">{usdOut}</div>
+          </div>
+        </div>
+      </div>
+
+      {swap.state === StateRefunded && (
+        <div className="px-3 pb-2 fs13 grey text-center">
+          {swap.refundReason
+            ? tvar('Deposit refunded: {{ reason }}', { reason: swap.refundReason })
+            : t('The deposit was refunded to the origin wallet.')}
+        </div>
       )}
+      {swap.state === StateFailed && (
+        <div className="px-3 pb-2 fs13 grey text-center">
+          {swap.refundReason
+            ? tvar('The swap did not complete: {{ reason }}.', { reason: swap.refundReason })
+            : t('The swap did not complete.')}{' '}
+          {t('If funds left the origin wallet and no refund arrives, contact support with the deposit address below.')}
+        </div>
+      )}
+      {swap.state === StateExpired && (
+        <div className="px-3 pb-2 fs13 grey text-center">{t('The quote expired before the deposit was sent. No funds moved.')}</div>
+      )}
+      {/* The engine marks the record DEPOSIT_FAILED on its next poll, but the
+          deposit tx fetched for the fee row can prove the rejection first —
+          say so immediately rather than showing a healthy in-flight swap. */}
+      {(swap.state === StateDepositFailed || depositRejected) && (
+        <div className="px-3 pb-2 fs13 errcolor text-center">
+          {t('The deposit transaction was rejected on-chain. The deposited funds never left the wallet, though the network fee was spent.')}
+        </div>
+      )}
+
+      <div className="px-3">
+        {rateText !== '' && <Row label={t('Rate')}><span className="mono fs13">{rateText}</span></Row>}
+        {swap.depositTxID && (
+          <Row label={t('Network fee')} tip={t("The deposit transaction's fee on the origin chain.")}>
+            {depositTx === undefined
+              ? <Spinner size={12} />
+              : depositTx === null || !feeAsset || depositTx.fees === 0
+                // A zero fee means the wallet did not record one (the UTXO
+                // wallets' history omits fees today), not a free ride.
+                ? '—'
+                : (
+                  <>
+                    <span className="mono">{Doc.formatCoinValue(depositTx.fees, feeAsset.unitInfo)} {feeAsset.unitInfo.conventional.unit}</span>
+                    {feeUSD !== '' && <span className="grey fs12 ms-1">({feeUSD})</span>}
+                  </>
+                  )}
+          </Row>
+        )}
+        {feeBps > 0 && (
+          <Row label={t('Service fee')} tip={t('Fee paid to the swap service, included in the quoted output.')}>
+            {slippagePct(feeBps)}
+          </Row>
+        )}
+        {swap.state === StateRefunded && refundedText !== '' && (
+          <Row label={t('Refunded')} tip={t("The amount returned to the origin wallet, net of the service's refund fee.")}>
+            <span className="mono">{refundedText}</span>
+            {refundedUSD !== '' && <span className="grey fs12 ms-1">({refundedUSD})</span>}
+          </Row>
+        )}
+        <Row label={t('Started')}>{isNaN(started.getTime()) ? '—' : started.toLocaleString()}</Row>
+        {!active && (
+          <Row label={t('Last update')}>{isNaN(updated.getTime()) ? '—' : updated.toLocaleString()}</Row>
+        )}
+        {active && !isNaN(deadline.getTime()) && (
+          <Row label={t('Refund deadline')} tip={t('If the swap has not completed by the deadline, the deposit is refunded automatically.')}>
+            {deadline.toLocaleString()}
+          </Row>
+        )}
+        <Row label={t('Receiving address')} tip={t('The destination-wallet address receiving the funds.')}>
+          <span className="d-flex align-items-center">
+            <span className="mono fs13 has-tip" aria-label={swap.recipient}>{Doc.shortenAddress(swap.recipient)}</span>
+            <span
+              className={`swap-id-action ms-2 pointer fs12 ${copiedID === swap.recipient ? 'tx-amt-pos' : 'grey'}`}
+              onClick={() => copy(swap.recipient)}
+            >
+              {copiedID === swap.recipient ? t('Copied!') : <span className="ico-copy" />}
+            </span>
+          </span>
+        </Row>
+        <Row label={t('Deposit address')}>
+          <span className="d-flex align-items-center">
+            <span className="mono fs13 has-tip" aria-label={swap.depositAddress}>{Doc.shortenAddress(swap.depositAddress)}</span>
+            <span
+              className={`swap-id-action ms-2 pointer fs12 ${copiedID === swap.depositAddress ? 'tx-amt-pos' : 'grey'}`}
+              onClick={() => copy(swap.depositAddress)}
+            >
+              {copiedID === swap.depositAddress ? t('Copied!') : <span className="ico-copy" />}
+            </span>
+          </span>
+        </Row>
+        {swap.depositTxID && txRow(t('Deposit tx'), swap.depositTxID, swap.originAssetID,
+          swap.state === StateDepositFailed || depositTx?.rejected)}
+        {(swap.destinationTxs ?? []).map(id => txRow(t('Received tx'), id, swap.destAssetID))}
+        {(swap.refundTxs ?? []).map(id => txRow(t('Refund tx'), id, swap.originAssetID))}
+      </div>
+
+      {active && (
+        <div className="grey fs11 px-3 pt-2 text-center">
+          {t('Safe to close — the swap continues in the background and shows under Activity.')}
+        </div>
+      )}
+
+      <div className="flex-stretch-column px-3 pb-3 pt-2">
+        {active && <button type="button" onClick={onRefresh}>{t('Refresh status')}</button>}
+        <button type="button" className={active ? 'mt-2' : ''} onClick={onClose}>{t('Close')}</button>
+      </div>
     </form>
   )
 }

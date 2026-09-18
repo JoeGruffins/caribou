@@ -4,12 +4,13 @@ import app from '@caribou/shared/application'
 import Doc from '@caribou/shared/doc'
 import { postJSON } from '@caribou/shared/http'
 import { useForceUpdate, useCoreSubscriptions } from '@caribou/shared/hooks'
-import { WalletNote, WalletTransaction } from '@caribou/shared/registry'
+import { CoreNote, WalletNote, WalletTransaction } from '@caribou/shared/registry'
 import { AssetVariant, networkAsset, networkID } from '@caribou/shared/assets'
 import CoinLogo from '@caribou/shared/components/CoinLogo'
 import NetworkedTokenLogo from '@caribou/shared/components/NetworkedTokenLogo'
 import Spinner from './Spinner'
 import TxRow, { TxRowItem, variantForTx } from './TxRow'
+import { IntentsSwap, fetchIntentsAssets, fetchSwaps, relateTxToSwaps } from '../intents'
 
 interface AssetParams {
   ticker: string
@@ -114,6 +115,28 @@ export default function Asset ({ ticker }: AssetParams) {
     fetchTxnsRef.current?.()
   }, [assetIDsKey])
 
+  // Cross-chain swap records, for marking transactions that serve as swap
+  // legs.
+  const [swaps, setSwaps] = useState<IntentsSwap[]>([])
+  useEffect(() => {
+    // Merge rather than replace: a live intentsswap upsert (the note
+    // handler below) can land before this initial fetch resolves, and
+    // the note's record is newer than the fetch's snapshot.
+    fetchSwaps().then(fetched => setSwaps(prev => {
+      const have = new Set(prev.map(s => s.depositAddress))
+      return [...prev, ...fetched.filter(s => !have.has(s.depositAddress))]
+    }))
+  }, [])
+
+  // Asset IDs with a cross-chain swap route, for gating the hero's swap
+  // button. null (loading or engine unavailable) stays optimistic.
+  const [swappableIDs, setSwappableIDs] = useState<Set<number> | null>(null)
+  useEffect(() => {
+    fetchIntentsAssets().then(list => {
+      if (list) setSwappableIDs(new Set(list.map(a => a.assetID)))
+    })
+  }, [])
+
   useCoreSubscriptions({
     onBalance: redraw,
     onRate: redraw,
@@ -130,6 +153,11 @@ export default function Asset ({ ticker }: AssetParams) {
             redraw()
             fetchTxnsRef.current?.()
           }
+          break
+        }
+        case 'intentsswap': {
+          const s = (note as CoreNote & { swap: IntentsSwap }).swap
+          if (s) setSwaps(prev => [s, ...prev.filter(x => x.depositAddress !== s.depositAddress)])
           break
         }
       }
@@ -152,6 +180,8 @@ export default function Asset ({ ticker }: AssetParams) {
   }
 
   const rate = ta.xcRate ?? 0
+  // Whether any of the group's deployments has a cross-chain swap route.
+  const swapAvailable = swappableIDs === null || ta.variants.some(v => swappableIDs.has(v.assetID))
   const hasUnavailable = ta.immature > 0 || ta.locked > 0
   const isMultiNet = ta.variants.length > 1
 
@@ -166,7 +196,7 @@ export default function Asset ({ ticker }: AssetParams) {
     const items: TxRowItem[] = []
     for (const tx of txSrcRef.current.txs) {
       const variant = variantForTx(ta, tx)
-      if (variant) items.push({ tx, ta, variant })
+      if (variant) items.push({ tx, ta, variant, swapRelation: relateTxToSwaps(swaps, tx) })
     }
     return items
   }
@@ -243,7 +273,9 @@ export default function Asset ({ ticker }: AssetParams) {
               <span className="ico-send fs16" />
             </button>
             <button
-              type="button" className="round-btn p-0 border-0 icon-40 flex-center has-tip ms-2" aria-label={t('Swap')}
+              type="button" className="round-btn p-0 border-0 icon-40 flex-center has-tip ms-2"
+              aria-label={swapAvailable ? t('Swap') : tvar('No swap route is available for {{ ticker }}.', { ticker: ta.ticker })}
+              disabled={!swapAvailable}
               onClick={() => app.setForm({ form: 'swap', data: {} })}
             >
               <span className="ico-swap fs16" />

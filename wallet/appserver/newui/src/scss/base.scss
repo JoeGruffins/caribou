@@ -156,6 +156,7 @@ button {
 .break-all             { word-break: break-all; }
 .no-select             { user-select: none; }
 .mirror-x              { display: inline-block; transform: scaleX(-1); }
+.rot90                 { display: inline-block; transform: rotate(90deg); }
 .overflow-y-auto       { overflow-y: auto; }
 .o-0                   { opacity: 0; }
 .o-70                  { opacity: 0.7; }
@@ -193,6 +194,10 @@ button {
     border-radius: 4px;
     font-size: 12px;
     line-height: 1;
+    // Shrink-to-fit sizes an absolutely-positioned box against its
+    // containing block — a small icon anchor would wrap the tip one word
+    // per line without the max-content floor.
+    width: max-content;
     max-width: 260px;
     text-align: center;
     // Short single-word labels (Receive, Send, ...) sit on one line
