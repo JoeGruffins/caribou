@@ -77,6 +77,12 @@ var (
 	// errNoCachedPW is returned when attempting to retrieve a cached password, but the
 	// cookie that should contain the cached password is not populated.
 	errNoCachedPW = errors.New("no cached password")
+	// shutdownTimeout bounds how long graceful shutdown waits for in-flight
+	// requests before forcibly closing listeners and connections. Without a
+	// bound, one wedged handler (a slow chain RPC, for example) can hang
+	// shutdown indefinitely and keep core.Run from ever reaching its DB
+	// teardown. A var, not a const, so tests can shrink it.
+	shutdownTimeout = 10 * time.Second
 )
 
 var (
@@ -151,6 +157,7 @@ type clientCore interface {
 	APIToken() (string, error)
 	SetSendRequiresPassword(require bool) error
 	SendRequiresPassword() (bool, error)
+	VerifyPassword(pw []byte) error
 	TakeAction(assetID uint32, actionID string, actionB json.RawMessage) error
 	BridgeFeesAndLimits(fromAssetID, toAssetID uint32, bridgeName string) (*core.BridgeFeesAndLimits, error)
 	AllBridgePaths() (map[uint32]map[uint32][]string, error)
@@ -709,9 +716,14 @@ func (s *AppServer) Connect(ctx context.Context) (*sync.WaitGroup, error) {
 	go func() {
 		defer wg.Done()
 		<-ctx.Done()
-		err := s.srv.Shutdown(context.Background())
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
+		defer cancel()
+		err := s.srv.Shutdown(shutdownCtx)
 		if err != nil {
-			log.Errorf("Problem shutting down rpc: %v", err)
+			log.Errorf("Problem shutting down rpc gracefully, forcing closed: %v", err)
+			if err := s.srv.Close(); err != nil {
+				log.Errorf("Problem forcing rpc closed: %v", err)
+			}
 		}
 		s.wsServer.Shutdown()
 		log.Infof("Web server off")
@@ -1151,8 +1163,10 @@ func (s *AppServer) getCachedPassword(key []byte, authToken string) ([]byte, err
 	cachedPassword, ok := s.cachedPasswords[authToken]
 	s.authMtx.Unlock()
 	if !ok {
-		return nil, fmt.Errorf("cached encrypted password not found for"+
-			" auth token: %v", authToken)
+		// Do not include authToken here: it is a live session credential and
+		// this error can reach the HTTP response body and the exportable
+		// app log (see writeAPIError).
+		return nil, errNoCachedPW
 	}
 
 	crypter, err := encrypt.Deserialize(key, cachedPassword.SerializedCrypter)
@@ -1251,8 +1265,10 @@ func readPost(w http.ResponseWriter, r *http.Request, thing any) bool {
 	}
 	err = json.Unmarshal(body, thing)
 	if err != nil {
-		log.Debugf("failed to unmarshal JSON request: %v", err)
-		log.Debugf("raw request: %s", string(body))
+		// Do not log the raw body: request payloads can carry the app
+		// password or a mnemonic seed, and this log is user-exportable via
+		// /api/exportapplog. err already names the offending field/type.
+		log.Debugf("failed to unmarshal JSON request (%d bytes): %v", len(body), err)
 		http.Error(w, "failed to unmarshal JSON request", http.StatusBadRequest)
 		return false
 	}

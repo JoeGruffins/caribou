@@ -16,6 +16,7 @@ import (
 	"os"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/bisoncraft/caribou/util"
 	"github.com/bisoncraft/caribou/util/encode"
@@ -78,6 +79,7 @@ type TCore struct {
 	sendRequiresPW       bool
 	sendRequiresPWErr    error
 	setSendRequiresPWErr error
+	verifyPasswordErr    error
 	notHas               bool
 	notRunning           bool
 	notOpen              bool
@@ -91,6 +93,14 @@ type TCore struct {
 	notes                []*db.Notification
 	notesErr             error
 	resetAppPassErr      error
+	bridgeErr            error
+	bridgeCalls          int
+	approveBridgeErr     error
+	approveBridgeCalls   int
+	unapproveBridgeErr   error
+	unapproveBridgeCalls int
+	intentsExecuteErr    error
+	intentsExecuteCalls  int
 }
 
 func (c *TCore) Network() util.Network { return util.Mainnet }
@@ -254,6 +264,24 @@ func (*TCore) SetAPIToken(token string) error        { return nil }
 func (*TCore) APIToken() (string, error)             { return "", nil }
 func (c *TCore) SetSendRequiresPassword(bool) error  { return c.setSendRequiresPWErr }
 func (c *TCore) SendRequiresPassword() (bool, error) { return c.sendRequiresPW, c.sendRequiresPWErr }
+func (c *TCore) VerifyPassword(pw []byte) error      { return c.verifyPasswordErr }
+
+func (c *TCore) Bridge(fromAssetID, toAssetID uint32, amt uint64, bridgeName string) (string, error) {
+	c.bridgeCalls++
+	return "txid", c.bridgeErr
+}
+func (c *TCore) ApproveBridgeContract(assetID uint32, bridgeName string) (string, error) {
+	c.approveBridgeCalls++
+	return "txid", c.approveBridgeErr
+}
+func (c *TCore) UnapproveBridgeContract(assetID uint32, bridgeName string) (string, error) {
+	c.unapproveBridgeCalls++
+	return "txid", c.unapproveBridgeErr
+}
+func (c *TCore) IntentsExecute(pw []byte, originAssetID, destAssetID uint32, atoms uint64, slippageBps int, exactOutput bool, minAtomsOut, maxAtomsIn uint64) (*core.IntentsSwap, error) {
+	c.intentsExecuteCalls++
+	return &core.IntentsSwap{}, c.intentsExecuteErr
+}
 
 func (*TCore) TakeAction(assetID uint32, actionID string, actionB json.RawMessage) error { return nil }
 
@@ -560,6 +588,50 @@ func TestConnectStart(t *testing.T) {
 	defer shutdown()
 }
 
+// TestShutdownBounded confirms that a handler wedged indefinitely (e.g. on a
+// stuck chain RPC) cannot hang graceful shutdown forever: Shutdown is bounded
+// by shutdownTimeout, after which the server is forced closed.
+func TestShutdownBounded(t *testing.T) {
+	origTimeout := shutdownTimeout
+	shutdownTimeout = 200 * time.Millisecond
+	defer func() { shutdownTimeout = origTimeout }()
+
+	s, _, _ := newTServer(t, false)
+
+	handlerStarted := make(chan struct{})
+	s.mux.Get("/hang", func(w http.ResponseWriter, r *http.Request) {
+		close(handlerStarted)
+		<-r.Context().Done() // never returns on its own
+	})
+
+	cm := util.NewConnectionMaster(s)
+	if err := cm.Connect(tCtx); err != nil {
+		t.Fatalf("error starting AppServer: %v", err)
+	}
+
+	// Fire the wedged request and wait for the handler to actually be
+	// in-flight before triggering shutdown.
+	go func() {
+		resp, err := http.Get(fmt.Sprintf("http://%s/hang", s.addr))
+		if resp != nil {
+			resp.Body.Close()
+		}
+		_ = err // the client just sees the connection close on forced shutdown
+	}()
+	select {
+	case <-handlerStarted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("hanging handler never started")
+	}
+
+	start := time.Now()
+	cm.Disconnect()
+	elapsed := time.Since(start)
+	if elapsed > 5*shutdownTimeout {
+		t.Fatalf("shutdown took %v, want bounded by shutdownTimeout (%v)", elapsed, shutdownTimeout)
+	}
+}
+
 func TestConnectBindError(t *testing.T) {
 	s0, _, shutdown := newTServer(t, true)
 	defer shutdown()
@@ -721,6 +793,161 @@ func TestSend(t *testing.T) {
 	tCore.sendRequiresPW = false
 }
 
+// TestDeferredPassClearClosure guards the fix in apiBridge,
+// apiApproveBridgeContract and apiUnapproveBridgeContract: a bare
+// "defer form.Pass.Clear()" captures encode.PassBytes.Clear's value receiver
+// at the defer statement, which runs before readPost populates form.Pass, so
+// it clears a copy of the pre-populate (nil) slice and leaves the real
+// password unzeroed. Deferring a closure instead reads form.Pass at return
+// time and clears the right backing array.
+func TestDeferredPassClearClosure(t *testing.T) {
+	form := &struct {
+		Pass encode.PassBytes
+	}{}
+	func() {
+		defer func() { form.Pass.Clear() }()
+		form.Pass = encode.PassBytes("hunter2") // stands in for readPost
+	}()
+	for i, b := range form.Pass {
+		if b != 0 {
+			t.Fatalf("password byte %d not cleared: %q", i, form.Pass)
+		}
+	}
+}
+
+// TestAPIBridgeRequiresPassword confirms that '/bridge', '/approvebridgecontract',
+// '/unapprovebridgecontract' and '/intents/execute' honor the
+// send-requires-password setting the same way '/send' does: with the setting
+// enabled and no password supplied, the request is rejected before the
+// underlying Core method is ever called.
+func TestAPIBridgeRequiresPassword(t *testing.T) {
+	writer := new(TWriter)
+	reader := new(TReader)
+	s, tCore, shutdown := newTServer(t, false)
+	defer shutdown()
+
+	isOK := func(f func(w http.ResponseWriter, r *http.Request), body any) bool {
+		t.Helper()
+		reader.msg, _ = json.Marshal(body)
+		req, err := http.NewRequest("GET", "/", reader)
+		if err != nil {
+			t.Fatalf("error creating request: %v", err)
+		}
+		f(writer, req)
+		if len(writer.b) == 0 {
+			t.Fatalf("no response")
+		}
+		resp := &standardResponse{}
+		if err := json.Unmarshal(writer.b, resp); err != nil {
+			t.Fatalf("json unmarshal error: %v", err)
+		}
+		return resp.OK
+	}
+
+	tCore.sendRequiresPW = true
+
+	// /bridge
+	bridgeBody := &struct {
+		FromAssetID uint32           `json:"fromAssetID"`
+		ToAssetID   uint32           `json:"toAssetID"`
+		Amount      uint64           `json:"amount"`
+		BridgeName  string           `json:"bridgeName"`
+		Pass        encode.PassBytes `json:"pass"`
+	}{Amount: 1}
+	if isOK(s.apiBridge, bridgeBody) {
+		t.Fatalf("no error for /bridge when password required but none supplied")
+	}
+	if tCore.bridgeCalls != 0 {
+		t.Fatalf("Core.Bridge called despite missing required password")
+	}
+	bridgeBody.Pass = encode.PassBytes("dummyAppPass")
+	if !isOK(s.apiBridge, bridgeBody) {
+		t.Fatalf("not ok for /bridge with explicit pass: %s", string(writer.b))
+	}
+	if tCore.bridgeCalls != 1 {
+		t.Fatalf("Core.Bridge call count = %d, want 1", tCore.bridgeCalls)
+	}
+
+	// /approvebridgecontract
+	approveBody := &struct {
+		AssetID    uint32           `json:"assetID"`
+		BridgeName string           `json:"bridgeName"`
+		Pass       encode.PassBytes `json:"pass"`
+	}{}
+	if isOK(s.apiApproveBridgeContract, approveBody) {
+		t.Fatalf("no error for /approvebridgecontract when password required but none supplied")
+	}
+	if tCore.approveBridgeCalls != 0 {
+		t.Fatalf("Core.ApproveBridgeContract called despite missing required password")
+	}
+	approveBody.Pass = encode.PassBytes("dummyAppPass")
+	if !isOK(s.apiApproveBridgeContract, approveBody) {
+		t.Fatalf("not ok for /approvebridgecontract with explicit pass: %s", string(writer.b))
+	}
+	if tCore.approveBridgeCalls != 1 {
+		t.Fatalf("Core.ApproveBridgeContract call count = %d, want 1", tCore.approveBridgeCalls)
+	}
+
+	// /unapprovebridgecontract
+	unapproveBody := &struct {
+		AssetID    uint32           `json:"assetID"`
+		BridgeName string           `json:"bridgeName"`
+		Pass       encode.PassBytes `json:"pass"`
+	}{}
+	if isOK(s.apiUnapproveBridgeContract, unapproveBody) {
+		t.Fatalf("no error for /unapprovebridgecontract when password required but none supplied")
+	}
+	if tCore.unapproveBridgeCalls != 0 {
+		t.Fatalf("Core.UnapproveBridgeContract called despite missing required password")
+	}
+	unapproveBody.Pass = encode.PassBytes("dummyAppPass")
+	if !isOK(s.apiUnapproveBridgeContract, unapproveBody) {
+		t.Fatalf("not ok for /unapprovebridgecontract with explicit pass: %s", string(writer.b))
+	}
+	if tCore.unapproveBridgeCalls != 1 {
+		t.Fatalf("Core.UnapproveBridgeContract call count = %d, want 1", tCore.unapproveBridgeCalls)
+	}
+
+	// A wrong password is rejected too, not just an empty one.
+	tCore.verifyPasswordErr = errTest
+	bridgeBody.Pass = encode.PassBytes("wrongPass")
+	if isOK(s.apiBridge, bridgeBody) {
+		t.Fatalf("no error for /bridge with an incorrect password")
+	}
+	if tCore.bridgeCalls != 1 {
+		t.Fatalf("Core.Bridge called with an incorrect password")
+	}
+	tCore.verifyPasswordErr = nil
+
+	// /intents/execute
+	origin, dest := uint32(0), uint32(2)
+	intentsBody := &struct {
+		OriginAssetID *uint32          `json:"originAssetID"`
+		DestAssetID   *uint32          `json:"destAssetID"`
+		Value         uint64           `json:"value"`
+		SlippageBps   int              `json:"slippageBps"`
+		ExactOutput   bool             `json:"exactOutput"`
+		MinAtomsOut   uint64           `json:"minAtomsOut"`
+		MaxAtomsIn    uint64           `json:"maxAtomsIn"`
+		Pass          encode.PassBytes `json:"pass"`
+	}{OriginAssetID: &origin, DestAssetID: &dest, MinAtomsOut: 1}
+	if isOK(s.apiIntentsExecute, intentsBody) {
+		t.Fatalf("no error for /intents/execute when password required but none supplied")
+	}
+	if tCore.intentsExecuteCalls != 0 {
+		t.Fatalf("Core.IntentsExecute called despite missing required password")
+	}
+	intentsBody.Pass = encode.PassBytes("dummyAppPass")
+	if !isOK(s.apiIntentsExecute, intentsBody) {
+		t.Fatalf("not ok for /intents/execute with explicit pass: %s", string(writer.b))
+	}
+	if tCore.intentsExecuteCalls != 1 {
+		t.Fatalf("Core.IntentsExecute call count = %d, want 1", tCore.intentsExecuteCalls)
+	}
+
+	tCore.sendRequiresPW = false
+}
+
 func TestAPISetSendRequirePassword(t *testing.T) {
 	writer := new(TWriter)
 	reader := new(TReader)
@@ -871,6 +1098,18 @@ func TestPasswordCache(t *testing.T) {
 	}
 	if !bytes.Equal(password, retrievedPW) {
 		t.Fatalf("retrieved PW not same: %v - %v", password, retrievedPW)
+	}
+
+	// An unknown auth token must not be echoed into the error: it is a live
+	// session credential and this error can reach the HTTP response and the
+	// exportable app log.
+	const unknownToken = "unknown-auth-token"
+	_, err = s.getCachedPassword(key1, unknownToken)
+	if !errors.Is(err, errNoCachedPW) {
+		t.Fatalf("wrong error for unknown auth token: %v, want errNoCachedPW", err)
+	}
+	if strings.Contains(err.Error(), unknownToken) {
+		t.Fatalf("auth token leaked into error: %v", err)
 	}
 
 	// test new wallet request first without the cookies populated, then with
@@ -1046,14 +1285,6 @@ func TestAPIToggleWalletStatus(t *testing.T) {
 	if tCore.walletDisabled {
 		t.Fatal("Expected wallet to be enabled")
 	}
-}
-
-func TestAPITrade(t *testing.T) {
-	t.Skip("removed: DEX trading functionality")
-}
-
-func TestAPITradeAsync(t *testing.T) {
-	t.Skip("removed: DEX trading functionality")
 }
 
 func Test_prepareAddr(t *testing.T) {
