@@ -659,9 +659,10 @@ func (w *ExchangeWallet) monitorBlocks() {
 			}
 
 		case <-ctx.Done():
-			// Pause the background refresh thread FIRST to stop any ongoing
-			// rescan/refresh operations. This must happen before saveWallet()
-			// because Store() can block if a refresh is in progress.
+			// Pause the background refresh thread before saveWallet(). Store()
+			// stops a running refresh itself while it writes, but it restarts
+			// the refresh afterward if refresh was enabled, so without this the
+			// wallet would resume syncing after its final save.
 			//
 			// Take the lock and nil-check as every other w.wallet access does:
 			// a concurrent Close() nils the handle, which would panic here.
@@ -836,9 +837,8 @@ func (w *ExchangeWallet) dustTotal() uint64 {
 // This matches the behavior of the previous RPC-based implementation.
 func (w *ExchangeWallet) DepositAddress() (string, error) {
 	w.walletMtx.Lock()
-	defer w.walletMtx.Unlock()
-
 	if w.wallet == nil {
+		w.walletMtx.Unlock()
 		return "", errors.New("wallet not connected")
 	}
 
@@ -849,6 +849,19 @@ func (w *ExchangeWallet) DepositAddress() (string, error) {
 
 	addr := w.wallet.Address(0, numAddrs)
 	w.log.Debugf("Created new deposit subaddress %d: %s", numAddrs, addr)
+	w.walletMtx.Unlock()
+
+	// Persist the new subaddress count now. Otherwise it only reaches disk on
+	// the next save (sync completion, disconnect or Close), and a process
+	// killed before then reopens without it: OwnsDepositAddress rejects the
+	// stored address and this index gets handed out again. Store interrupts
+	// the background refresh and holds it off while it writes, so it cannot
+	// race a refresh, then restarts it. Waiting for the refresh to wind down
+	// plus the write itself is why this runs after the write lock is released
+	// rather than stalling every other wallet call behind it. A failure is
+	// not fatal: the subaddress exists in memory, and wallet2's subaddress
+	// lookahead still detects funds sent to it.
+	w.saveWallet()
 
 	return addr, nil
 }
