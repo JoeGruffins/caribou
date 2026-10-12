@@ -1,6 +1,8 @@
 // This code is available on the terms of the project LICENSE.md file,
 // also available online at https://blueoakcouncil.org/license/1.0.0.
 
+//go:build cgo
+
 /*
 caribou-desktop is the Desktop version of Caribou. There are a number of
 differences that make this version more suitable for less tech-savvy users.

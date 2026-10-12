@@ -1,6 +1,8 @@
 // This code is available on the terms of the project LICENSE.md file,
 // also available online at https://blueoakcouncil.org/license/1.0.0.
 
+//go:build cgo
+
 //go:generate go run github.com/tc-hib/go-winres@v0.3.1 make --in winres.json --arch "386,amd64"
 
 package main

@@ -1,16 +1,10 @@
 {
   "RT_GROUP_ICON": {
     "#32512": {
-      "0000": "./src/caribou-256.png"
+      "0000": "./src/caribou.ico"
     },
     "#1": {
-      "0000": "./src/caribou-256.png"
-    },
-    "#2": {
-      "0000": "./src/caribou-dark-256.png"
-    },
-    "#3": {
-      "0000": "./src/caribou-light-256.png"
+      "0000": "./src/caribou.ico"
     }
   },
   "RT_VERSION": {
@@ -23,11 +17,11 @@
         "info": {
           "0409": {
             "Comments": "",
-            "CompanyName": "Decred",
-            "FileDescription": "Caribou (WebView version)",
+            "CompanyName": "The Caribou Developers",
+            "FileDescription": "Caribou desktop wallet",
             "FileVersion": "1.1.0.0-rc2",
             "InternalName": "caribou",
-            "LegalCopyright": "© The Decred Developers. Blue Oak Model License 1.0.0",
+            "LegalCopyright": "© The Caribou Developers. Blue Oak Model License 1.0.0",
             "LegalTrademarks": "",
             "OriginalFilename": "caribou-desktop.exe",
             "PrivateBuild": "",
