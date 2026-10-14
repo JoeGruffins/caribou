@@ -20,30 +20,27 @@ import (
 )
 
 const (
-	// incomingScanTick is how often the wallet checks for incoming native and
-	// ERC20 transfers.
+	// incomingScanTick is how often the wallet checks for incoming ERC20
+	// transfers.
 	incomingScanTick = 15 * time.Second
 	// maxScanBlocks caps the block range covered by a single ERC20 log-filter
-	// call, or considered by the native scan, per tick, so a wallet that
-	// falls behind (e.g. after being offline) catches up gradually instead
-	// of issuing one enormous RPC request.
+	// call per tick, and is also the outer bound on how far behind tip a
+	// scan will ever look: a wallet that falls further behind than this
+	// (e.g. after being offline) gives up on the gap and only scans the most
+	// recent maxScanBlocks blocks (see scanERC20Tick) rather than backfilling
+	// it, since RPC providers cannot be relied on to serve older history.
 	maxScanBlocks = 128
-	// maxScanBodies caps how many block bodies are fetched per tick when
-	// checking for native-value transfers. Only the most recent blocks in the
-	// scan range are checked when the range exceeds this cap.
-	maxScanBodies = 16
 
-	// scanBackoffMin and scanBackoffMax bound the cooldown applied after a
-	// scan sub-loop (native or ERC20) fails, so a provider that will never
-	// succeed at a given call (e.g. eth_getLogs disabled entirely on a free
-	// public endpoint) doesn't get hammered - and doesn't spam the log -
-	// every incomingScanTick forever.
+	// scanBackoffMin and scanBackoffMax bound the cooldown applied after the
+	// ERC20 scan fails, so a provider that will never succeed at a given call
+	// (e.g. eth_getLogs disabled entirely on a free public endpoint) doesn't
+	// get hammered - and doesn't spam the log - every incomingScanTick
+	// forever.
 	scanBackoffMin = 30 * time.Second
 	scanBackoffMax = 30 * time.Minute
 
-	scanMetaTableName           = "meta"
-	lastScannedNativeBlockField = "lastScannedBlock"
-	lastScannedERC20BlockField  = "lastScannedERC20Block"
+	scanMetaTableName          = "meta"
+	lastScannedERC20BlockField = "lastScannedERC20Block"
 )
 
 // scanBackoff is the cooldown applied after a scan sub-loop fails. Zero value
@@ -60,6 +57,7 @@ func (b *scanBackoff) blocked(now time.Time) bool {
 	return now.Before(b.until)
 }
 
+// failed records a scan failure and applies the exponential backoff.
 func (b *scanBackoff) failed(now time.Time) {
 	b.mtx.Lock()
 	defer b.mtx.Unlock()
@@ -79,9 +77,9 @@ func (b *scanBackoff) succeeded() {
 }
 
 // scanMetaKey is the meta-table key for one field scoped to a base chain.
-// Every asset on the chain (native + tokens) is scanned by one loop that
-// shares this cursor pair, so the key is scoped by baseChainID rather than by
-// individual asset ID.
+// Every token wallet on the chain is scanned by one loop that shares this
+// cursor, so the key is scoped by baseChainID rather than by individual
+// asset ID.
 func scanMetaKey(baseChainID uint32, field string) []byte {
 	k := make([]byte, 4+len(field))
 	binary.BigEndian.PutUint32(k, baseChainID)
@@ -115,14 +113,6 @@ func (w *baseWallet) setScanCursor(field string, n uint64) error {
 	return w.metaTable.Set(scanMetaKey(w.baseChainID, field), b, txdb.WithReplace())
 }
 
-func (w *baseWallet) getLastScannedBlock() (uint64, error) {
-	return w.getScanCursor(lastScannedNativeBlockField)
-}
-
-func (w *baseWallet) setLastScannedBlock(n uint64) error {
-	return w.setScanCursor(lastScannedNativeBlockField, n)
-}
-
 func (w *baseWallet) getLastScannedERC20Block() (uint64, error) {
 	return w.getScanCursor(lastScannedERC20BlockField)
 }
@@ -131,10 +121,10 @@ func (w *baseWallet) setLastScannedERC20Block(n uint64) error {
 	return w.setScanCursor(lastScannedERC20BlockField, n)
 }
 
-// scanIncomingTransfers runs the incoming-transfer scan loop for native and
-// ERC20 transfers on this chain until ctx is canceled. There is one loop per
-// chain (started from ETHWallet.Connect), covering the native asset and every
-// currently-connected token wallet.
+// scanIncomingTransfers runs the incoming-transfer scan loop for ERC20
+// transfers on this chain until ctx is canceled. There is one loop per chain
+// (started from ETHWallet.Connect), covering every currently-connected token
+// wallet.
 func (w *ETHWallet) scanIncomingTransfers(ctx context.Context) {
 	ticker := time.NewTicker(incomingScanTick)
 	defer ticker.Stop()
@@ -148,13 +138,10 @@ func (w *ETHWallet) scanIncomingTransfers(ctx context.Context) {
 	}
 }
 
-// scanIncomingTransfersTick runs a single pass of the incoming-transfer scan.
-// Native and ERC20 detection each keep their own persisted cursor and
-// failure backoff (see scanNativeTick/scanERC20Tick), so a failure or
-// permanently-unsupported RPC method in one (e.g. a free public provider
-// that doesn't serve eth_getLogs at all) can never block or slow the other.
+// scanIncomingTransfersTick runs a single pass of the incoming ERC20 transfer
+// scan.
 //
-// The scan never looks past tip - finalizeConfs: both store paths mark a
+// The scan never looks past tip - finalizeConfs: storeTokenReceive marks a
 // detected receive Confirmed immediately, and nothing later reconciles a
 // confirmed record, so scanning any closer to the tip would leave a phantom
 // Receive behind if a reorg drops the block it came from.
@@ -169,8 +156,6 @@ func (w *ETHWallet) scanIncomingTransfersTick(ctx context.Context) {
 	}
 	tipNum -= w.finalizeConfs
 
-	w.scanNativeTick(ctx, tipNum)
-
 	tokenWallets := make([]*assetWallet, 0, len(w.connectedWallets()))
 	for _, aw := range w.connectedWallets() {
 		if aw.tokenAddr != (common.Address{}) {
@@ -182,59 +167,8 @@ func (w *ETHWallet) scanIncomingTransfersTick(ctx context.Context) {
 	}
 }
 
-// scanNativeTick runs one pass of native-transfer detection against its own
-// cursor and backoff.
-func (w *ETHWallet) scanNativeTick(ctx context.Context, tipNum uint64) {
-	if w.nativeScanBackoff.blocked(time.Now()) {
-		return
-	}
-
-	last, err := w.getLastScannedBlock()
-	if err != nil {
-		w.log.Errorf("incoming transfer scan: error reading native scan cursor: %v", err)
-		return
-	}
-
-	// First run: seed the cursor at the current tip. Pre-existing history is
-	// not backfilled.
-	if last == 0 {
-		if err := w.setLastScannedBlock(tipNum); err != nil {
-			w.log.Errorf("incoming transfer scan: error seeding native scan cursor: %v", err)
-		}
-		return
-	}
-
-	if tipNum <= last {
-		return
-	}
-
-	from := last + 1
-	to := tipNum
-	if to-from+1 > maxScanBlocks {
-		to = from + maxScanBlocks - 1
-	}
-
-	covered, err := w.scanNativeReceives(ctx, from, to)
-	if err != nil {
-		w.log.Errorf("incoming transfer scan: error scanning native transfers %d-%d: %v", from, to, err)
-		w.nativeScanBackoff.failed(time.Now())
-	} else {
-		w.nativeScanBackoff.succeeded()
-	}
-
-	// Persist whatever was genuinely covered even on a partial failure -
-	// covered is only ever last (no progress) or higher, never a range that
-	// was skipped. Persisting the full requested "to" regardless of what was
-	// actually scanned is what silently drops blocks.
-	if covered > last {
-		if serr := w.setLastScannedBlock(covered); serr != nil {
-			w.log.Errorf("incoming transfer scan: error persisting native scan cursor: %v", serr)
-		}
-	}
-}
-
 // scanERC20Tick runs one pass of ERC20-transfer detection against its own
-// cursor and backoff, independent of the native scan.
+// cursor and backoff.
 func (w *ETHWallet) scanERC20Tick(ctx context.Context, tipNum uint64, tokenWallets []*assetWallet) {
 	if w.erc20ScanBackoff.blocked(time.Now()) {
 		return
@@ -260,10 +194,27 @@ func (w *ETHWallet) scanERC20Tick(ctx context.Context, tipNum uint64, tokenWalle
 	}
 
 	from := last + 1
-	to := tipNum
-	if to-from+1 > maxScanBlocks {
-		to = from + maxScanBlocks - 1
+	// RPC providers phrase "can't serve this range" in too many ways to
+	// classify reliably, so rather than trying to detect an unscannable
+	// range from its error, every tick unconditionally clamps to the most
+	// recent maxScanBlocks blocks. A wallet that fell further behind than
+	// that (offline for a while, or stuck failing) has that gap silently
+	// given up on instead of retried forever against a provider that will
+	// never serve it.
+	oldest := uint64(1)
+	if tipNum >= maxScanBlocks {
+		oldest = tipNum - maxScanBlocks + 1
 	}
+	if from < oldest {
+		w.log.Warnf("incoming transfer scan: erc20 scan cursor %d is more than %d blocks behind tip %d; "+
+			"abandoning the backlog - transfers in %d-%d will not be detected", last, maxScanBlocks, tipNum, from, oldest-1)
+		from = oldest
+	}
+	// The clamp above already guarantees to-from+1 <= maxScanBlocks: from is
+	// never more than maxScanBlocks-1 below tipNum once raised to oldest, so
+	// no further width cap is needed here (unlike the old narrowing design,
+	// where from could still be far behind a variable-width window).
+	to := tipNum
 
 	if err := w.scanERC20Receives(ctx, from, to, tokenWallets); err != nil {
 		w.log.Errorf("incoming transfer scan: error scanning erc20 transfers %d-%d: %v", from, to, err)
@@ -393,110 +344,6 @@ func (w *ETHWallet) storeTokenReceive(aw *assetWallet, lg *types.Log, id common.
 	w.emitTransactionNote(wt.WalletTransaction, true)
 	if bal, err := aw.balance(); err == nil {
 		aw.emit.BalanceChange(bal)
-	}
-	return nil
-}
-
-// scanNativeReceives checks for incoming native-value transfers to this
-// wallet's address over the given block range, returning the highest block
-// number actually covered - which can be less than to (down to from-1,
-// meaning no progress at all) if the balance check or a body fetch failed
-// partway through, or if the range was capped by maxScanBodies. Callers must
-// persist the cursor at the returned value, not at the requested to, or
-// blocks between the two are silently skipped forever.
-//
-// Block bodies are only fetched when the confirmed balance has changed since
-// the last tick, since a native transfer is the only thing that can change
-// it. The unchanged check reads the balance pinned to to - the requested
-// range end - since an unchanged balance there proves nothing arrived
-// anywhere in from..to, letting the whole range (even one wider than
-// maxScanBodies) be retired without fetching a single body. Once a change is
-// found, though, only from..scanTo (the range actually covered when capped
-// by maxScanBodies) is scanned, so the baseline persisted for the next tick
-// must be read again pinned to scanTo rather than to - pinning it to to
-// would let it silently absorb a balance change from a block this call
-// never looked at, so a later tick sees "unchanged" and skips the block
-// containing the receive forever instead of converging onto it on a
-// following tick.
-func (w *ETHWallet) scanNativeReceives(ctx context.Context, from, to uint64) (uint64, error) {
-	scanTo := to
-	if to-from+1 > maxScanBodies {
-		scanTo = from + maxScanBodies - 1
-	}
-
-	bal, err := w.node.addressBalanceAt(ctx, w.addr, new(big.Int).SetUint64(to))
-	if err != nil {
-		return from - 1, err
-	}
-	if w.lastScanBalance != nil && bal.Cmp(w.lastScanBalance) == 0 {
-		return to, nil
-	}
-
-	if scanTo != to {
-		bal, err = w.node.addressBalanceAt(ctx, w.addr, new(big.Int).SetUint64(scanTo))
-		if err != nil {
-			return from - 1, err
-		}
-	}
-
-	for n := from; n <= scanTo; n++ {
-		block, err := w.node.blockByNumber(ctx, new(big.Int).SetUint64(n))
-		if err != nil {
-			// lastScanBalance is left unset rather than advanced to bal:
-			// the cursor is about to rewind to n-1, but bal describes
-			// scanTo, so pinning it here would let a later tick compare
-			// blocks n..scanTo against a baseline that already accounts
-			// for them and skip a receive among them as "unchanged".
-			w.lastScanBalance = nil
-			return n - 1, err
-		}
-		for _, tx := range block.Transactions() {
-			recipient := tx.To()
-			if recipient == nil || *recipient != w.addr || tx.Value().Sign() <= 0 {
-				continue
-			}
-			if err := w.storeNativeReceive(tx, block.NumberU64(), block.Time()); err != nil {
-				w.log.Errorf("incoming transfer scan: error storing native receive %s: %v", tx.Hash(), err)
-				w.lastScanBalance = nil
-				return n - 1, err
-			}
-		}
-	}
-	w.lastScanBalance = bal
-	return scanTo, nil
-}
-
-// storeNativeReceive builds and stores a Receive transaction for a discovered
-// native-value transfer, mirroring ETHWallet.getReceivingTransaction's shape.
-func (w *ETHWallet) storeNativeReceive(tx *types.Transaction, blockNumber, blockTime uint64) error {
-	if existing, err := w.txDB.getTx(tx.Hash()); err != nil {
-		return err
-	} else if existing != nil {
-		return nil
-	}
-
-	addr := w.addr.String()
-	wt := &extendedWalletTx{
-		WalletTransaction: &txdb.WalletTransaction{
-			Type:        txdb.Receive,
-			ID:          tx.Hash().String(),
-			NetworkID:   w.baseChainID,
-			AssetID:     w.assetID,
-			BlockNumber: blockNumber,
-			Timestamp:   blockTime,
-			Amount:      w.atomize(tx.Value()),
-			Recipient:   &addr,
-			Confirmed:   true,
-		},
-	}
-	if err := w.txDB.storeTx(wt); err != nil {
-		return err
-	}
-	w.log.Infof("Detected incoming %s transfer %s: %d %s", w.ui.Conventional.Unit, tx.Hash(), wt.Amount, w.ui.AtomicUnit)
-
-	w.emitTransactionNote(wt.WalletTransaction, true)
-	if bal, err := w.balance(); err == nil {
-		w.emit.BalanceChange(bal)
 	}
 	return nil
 }

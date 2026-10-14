@@ -4,6 +4,7 @@ package eth
 
 import (
 	"context"
+	"errors"
 	"math/big"
 	"testing"
 	"time"
@@ -142,22 +143,15 @@ func TestScanERC20Dedup(t *testing.T) {
 	}
 }
 
-// TestScanERC20FailureDoesNotAdvanceCursorOrBlockNative is the regression
-// test for the cascading-failure bug: an ERC20 scan error must not advance
-// the ERC20 cursor, and — critically — must not prevent the independent
-// native scan from running and progressing on its own cursor. Before the
-// native/ERC20 cursors and backoffs were split, a permanently-failing ERC20
-// scan (e.g. a free public RPC provider that doesn't serve eth_getLogs at
-// all) silently blocked native-transfer detection forever too.
-func TestScanERC20FailureDoesNotAdvanceCursorOrBlockNative(t *testing.T) {
+// TestScanERC20FailureDoesNotAdvanceCursor is the regression test for the
+// cascading-failure bug: an ERC20 scan error must not advance the ERC20
+// cursor.
+func TestScanERC20FailureDoesNotAdvanceCursor(t *testing.T) {
 	t.Parallel()
 	eth, tokenAw, cancel := newScanTestWallets(t)
 	defer cancel()
 
 	eth.metaTable = newTestMetaTable(t)
-	// Seed only the ERC20 cursor so its tick doesn't take the first-run
-	// seeding path; the native cursor is deliberately left unseeded so its
-	// own first run is what proves it wasn't blocked by the ERC20 failure.
 	if err := eth.setLastScannedERC20Block(50); err != nil {
 		t.Fatalf("setLastScannedERC20Block: %v", err)
 	}
@@ -173,17 +167,6 @@ func TestScanERC20FailureDoesNotAdvanceCursorOrBlockNative(t *testing.T) {
 	}
 	if erc20Last != 50 {
 		t.Fatalf("expected erc20 cursor to stay at 50 after a scan error, got %d", erc20Last)
-	}
-
-	// Cursors seed at tip - finalizeConfs, not the raw tip: scanning any
-	// closer to the tip would let a reorg leave a phantom Receive behind.
-	safeTip := uint64(60) - eth.finalizeConfs
-	nativeLast, err := eth.getLastScannedBlock()
-	if err != nil {
-		t.Fatalf("getLastScannedBlock: %v", err)
-	}
-	if nativeLast != safeTip {
-		t.Fatalf("expected native cursor to seed at tip-finalizeConfs %d despite the erc20 failure, got %d", safeTip, nativeLast)
 	}
 }
 
@@ -245,15 +228,8 @@ func TestScanFirstRunSeedsCursorAtTip(t *testing.T) {
 
 	eth.scanIncomingTransfersTick(context.Background())
 
-	// Cursors seed at tip - finalizeConfs, not the raw tip.
+	// Cursor seeds at tip - finalizeConfs, not the raw tip.
 	safeTip := uint64(1000) - eth.finalizeConfs
-	last, err := eth.getLastScannedBlock()
-	if err != nil {
-		t.Fatalf("getLastScannedBlock: %v", err)
-	}
-	if last != safeTip {
-		t.Fatalf("expected native cursor to seed at tip-finalizeConfs %d, got %d", safeTip, last)
-	}
 	erc20Last, err := eth.getLastScannedERC20Block()
 	if err != nil {
 		t.Fatalf("getLastScannedERC20Block: %v", err)
@@ -262,198 +238,8 @@ func TestScanFirstRunSeedsCursorAtTip(t *testing.T) {
 		t.Fatalf("expected erc20 cursor to seed at tip-finalizeConfs %d, got %d", safeTip, erc20Last)
 	}
 	node := eth.node.(*tMempoolNode)
-	if node.filterLogsCalls != 0 || node.blockByNumCalls != 0 {
-		t.Fatalf("expected no scanning on first run, got %d filter calls and %d block calls",
-			node.filterLogsCalls, node.blockByNumCalls)
-	}
-}
-
-func TestScanNativeReceive(t *testing.T) {
-	t.Parallel()
-	eth, _, cancel := newScanTestWallets(t)
-	defer cancel()
-
-	toAddr := eth.addr
-	// newTransaction (used elsewhere in this test suite) always sends to a
-	// random address, so build a tx targeting our own address directly.
-	tx, err := types.SignTx(types.NewTx(&types.DynamicFeeTx{
-		Nonce:   1,
-		Value:   big.NewInt(1000),
-		Gas:     50_000,
-		To:      &toAddr,
-		ChainID: eth.node.chainConfig().ChainID,
-	}), signer, eth.node.(*tMempoolNode).privKey)
-	if err != nil {
-		t.Fatalf("SignTx: %v", err)
-	}
-
-	header := &types.Header{Number: big.NewInt(5)}
-	block := types.NewBlockWithHeader(header).WithBody(types.Body{Transactions: []*types.Transaction{tx}})
-	eth.node.(*tMempoolNode).blocks = map[uint64]*types.Block{5: block}
-	eth.node.(*tMempoolNode).bal = big.NewInt(9999)
-
-	if covered, err := eth.scanNativeReceives(context.Background(), 5, 5); err != nil {
-		t.Fatalf("scanNativeReceives: %v", err)
-	} else if covered != 5 {
-		t.Fatalf("expected covered = 5, got %d", covered)
-	}
-
-	db := eth.txDB.(*tTxDB)
-	if !db.storeTxCalled {
-		t.Fatalf("expected a tx to be stored")
-	}
-	if db.storedTx.ID != tx.Hash().String() {
-		t.Fatalf("wrong ID: %s", db.storedTx.ID)
-	}
-	if db.storedTx.AssetID != BipID {
-		t.Fatalf("expected the base chain's AssetID for a native receive, got %d", db.storedTx.AssetID)
-	}
-}
-
-func TestScanNativeBalanceUnchangedSkipsBodies(t *testing.T) {
-	t.Parallel()
-	eth, _, cancel := newScanTestWallets(t)
-	defer cancel()
-
-	node := eth.node.(*tMempoolNode)
-	node.bal = big.NewInt(1000) // constant, so addressBalanceAt returns 1000 for any block via the fallback
-	node.blocks = map[uint64]*types.Block{
-		1: types.NewBlockWithHeader(&types.Header{Number: big.NewInt(1)}),
-	}
-
-	// First call: no prior balance recorded, so this always proceeds and
-	// fetches the block body even though there happens to be no transfer.
-	if _, err := eth.scanNativeReceives(context.Background(), 1, 1); err != nil {
-		t.Fatalf("scanNativeReceives (first): %v", err)
-	}
-	if node.blockByNumCalls != 1 {
-		t.Fatalf("expected 1 block fetch on first call, got %d", node.blockByNumCalls)
-	}
-
-	if covered, err := eth.scanNativeReceives(context.Background(), 2, 2); err != nil {
-		t.Fatalf("scanNativeReceives (second): %v", err)
-	} else if covered != 2 {
-		t.Fatalf("expected covered = 2 (balance-unchanged range is fully covered), got %d", covered)
-	}
-	if node.blockByNumCalls != 1 {
-		t.Fatalf("expected no additional block fetch when balance is unchanged, got %d total", node.blockByNumCalls)
-	}
-}
-
-func TestScanNativeRangeCap(t *testing.T) {
-	t.Parallel()
-	eth, _, cancel := newScanTestWallets(t)
-	defer cancel()
-
-	node := eth.node.(*tMempoolNode)
-	node.bal = big.NewInt(1000)
-	eth.currentTip = &types.Header{Number: big.NewInt(1000)}
-
-	// The truncated range is head-biased (oldest blocks of [from,to] first,
-	// leaving the newest for a following tick) so that a wallet catching up
-	// makes steady, non-skipping progress across ticks - see scan.go's
-	// scanNativeReceives doc comment.
-	node.blocks = make(map[uint64]*types.Block)
-	for n := uint64(1); n <= maxScanBodies; n++ {
-		node.blocks[n] = types.NewBlockWithHeader(&types.Header{Number: new(big.Int).SetUint64(n)})
-	}
-
-	covered, err := eth.scanNativeReceives(context.Background(), 1, 1000)
-	if err != nil {
-		t.Fatalf("scanNativeReceives: %v", err)
-	}
-	if covered != maxScanBodies {
-		t.Fatalf("expected covered = %d (range capped, oldest-first), got %d", maxScanBodies, covered)
-	}
-	if node.blockByNumCalls != maxScanBodies {
-		t.Fatalf("expected %d block fetches (range capped), got %d", maxScanBodies, node.blockByNumCalls)
-	}
-}
-
-// TestScanNativeBalancePinnedToRangeEnd is the regression test for a real
-// bug: the balance-diff prefilter used to read the node's "latest" balance,
-// which can already reflect blocks past the range about to be scanned on a
-// fast chain - making an in-range receive look like it happened before the
-// comparison baseline and get silently skipped. The balance must be read
-// pinned to the range's own end (to), not "latest".
-func TestScanNativeBalancePinnedToRangeEnd(t *testing.T) {
-	t.Parallel()
-	eth, _, cancel := newScanTestWallets(t)
-	defer cancel()
-
-	toAddr := eth.addr
-	tx, err := types.SignTx(types.NewTx(&types.DynamicFeeTx{
-		Nonce: 1, Value: big.NewInt(500), Gas: 50_000, To: &toAddr,
-		ChainID: eth.node.chainConfig().ChainID,
-	}), signer, eth.node.(*tMempoolNode).privKey)
-	if err != nil {
-		t.Fatalf("SignTx: %v", err)
-	}
-	block := types.NewBlockWithHeader(&types.Header{Number: big.NewInt(5)}).
-		WithBody(types.Body{Transactions: []*types.Transaction{tx}})
-
-	node := eth.node.(*tMempoolNode)
-	node.blocks = map[uint64]*types.Block{5: block}
-	// "latest" (the fallback used when balAt has no entry for the queried
-	// block) is way ahead, as if the node's tip has already moved past the
-	// range being scanned - a live possibility on a fast chain. If the scan
-	// used "latest" instead of the balance at block 5, it would look
-	// unchanged relative to a later observation and skip fetching block 5's
-	// body entirely, missing the receive.
-	node.bal = big.NewInt(999_999)
-	node.balAt = map[uint64]*big.Int{5: big.NewInt(500)}
-	eth.lastScanBalance = big.NewInt(0)
-
-	covered, err := eth.scanNativeReceives(context.Background(), 5, 5)
-	if err != nil {
-		t.Fatalf("scanNativeReceives: %v", err)
-	}
-	if covered != 5 {
-		t.Fatalf("expected covered = 5, got %d", covered)
-	}
-	if node.blockByNumCalls != 1 {
-		t.Fatalf("expected the block to be fetched (balance pinned to block 5 differs from lastScanBalance), got %d fetches", node.blockByNumCalls)
-	}
-	db := eth.txDB.(*tTxDB)
-	if !db.storeTxCalled {
-		t.Fatal("expected the receive to be stored")
-	}
-}
-
-// TestScanNativeTickWithholdsCursorOnFailure is the regression test for a
-// real bug: scanNativeTick used to persist the cursor at the full requested
-// range end regardless of what scanNativeReceives actually covered, so a
-// failure partway through a range silently and permanently dropped the
-// unscanned tail.
-func TestScanNativeTickWithholdsCursorOnFailure(t *testing.T) {
-	t.Parallel()
-	eth, _, cancel := newScanTestWallets(t)
-	defer cancel()
-
-	eth.metaTable = newTestMetaTable(t)
-	if err := eth.setLastScannedBlock(10); err != nil {
-		t.Fatalf("setLastScannedBlock: %v", err)
-	}
-	eth.currentTip = &types.Header{Number: big.NewInt(20)}
-
-	node := eth.node.(*tMempoolNode)
-	node.bal = big.NewInt(1000)
-	eth.lastScanBalance = big.NewInt(0) // force the "changed" path so blocks are actually fetched
-	// Blocks 11..13 exist; 14 does not, so the fetch loop fails there.
-	node.blocks = map[uint64]*types.Block{
-		11: types.NewBlockWithHeader(&types.Header{Number: big.NewInt(11)}),
-		12: types.NewBlockWithHeader(&types.Header{Number: big.NewInt(12)}),
-		13: types.NewBlockWithHeader(&types.Header{Number: big.NewInt(13)}),
-	}
-
-	eth.scanNativeTick(context.Background(), 20)
-
-	last, err := eth.getLastScannedBlock()
-	if err != nil {
-		t.Fatalf("getLastScannedBlock: %v", err)
-	}
-	if last != 13 {
-		t.Fatalf("expected cursor to persist at 13 (the last fully-scanned block), got %d", last)
+	if node.filterLogsCalls != 0 {
+		t.Fatalf("expected no scanning on first run, got %d filter calls", node.filterLogsCalls)
 	}
 }
 
@@ -550,214 +336,203 @@ func TestScanERC20MultiTokenSameTxNotDropped(t *testing.T) {
 	}
 }
 
-// TestScanNativeBaselinePinnedToScanTo is the regression test for a real bug:
-// the balance-diff baseline used to be read at the requested range end (to),
-// but when the range is capped by maxScanBodies only blocks up to scanTo are
-// actually looked at. Pinning the baseline to to let it silently absorb a
-// balance change from a block this call never scanned.
-func TestScanNativeBaselinePinnedToScanTo(t *testing.T) {
+// TestScanERC20TickCatchesUpNormallyWithinWindow is the baseline case: a
+// wallet that fell behind by less than maxScanBlocks must advance its cursor
+// from right where it left off, requesting only up to tip.
+func TestScanERC20TickCatchesUpNormallyWithinWindow(t *testing.T) {
 	t.Parallel()
-	eth, _, cancel := newScanTestWallets(t)
+	eth, tokenAw, cancel := newScanTestWallets(t)
 	defer cancel()
 
-	node := eth.node.(*tMempoolNode)
-	node.blocks = make(map[uint64]*types.Block)
-	for n := uint64(1); n <= maxScanBodies; n++ {
-		node.blocks[n] = types.NewBlockWithHeader(&types.Header{Number: new(big.Int).SetUint64(n)})
+	eth.metaTable = newTestMetaTable(t)
+	if err := eth.setLastScannedERC20Block(10); err != nil {
+		t.Fatalf("setLastScannedERC20Block: %v", err)
 	}
-	node.balAt = map[uint64]*big.Int{
-		maxScanBodies: big.NewInt(1000), // scanTo: the block actually covered
-		1000:          big.NewInt(1500), // to: the requested (uncovered) range end
-	}
+	const tip = 10 + maxScanBlocks/2
+	eth.currentTip = &types.Header{Number: big.NewInt(tip)}
 
-	covered, err := eth.scanNativeReceives(context.Background(), 1, 1000)
+	node := eth.node.(*tMempoolNode)
+	eth.scanERC20Tick(context.Background(), tip, []*assetWallet{tokenAw})
+
+	if node.filterLogsQuery.FromBlock.Uint64() != 11 {
+		t.Fatalf("expected the scan to resume right after the cursor at 11, got %d", node.filterLogsQuery.FromBlock.Uint64())
+	}
+	if node.filterLogsQuery.ToBlock.Uint64() != tip {
+		t.Fatalf("expected the scan to request up to tip %d, got %d", tip, node.filterLogsQuery.ToBlock.Uint64())
+	}
+	last, err := eth.getLastScannedERC20Block()
 	if err != nil {
-		t.Fatalf("scanNativeReceives: %v", err)
+		t.Fatalf("getLastScannedERC20Block: %v", err)
 	}
-	if covered != maxScanBodies {
-		t.Fatalf("expected covered = %d, got %d", maxScanBodies, covered)
-	}
-	if eth.lastScanBalance == nil || eth.lastScanBalance.Cmp(big.NewInt(1000)) != 0 {
-		t.Fatalf("expected baseline pinned to the balance at scanTo (1000), got %v", eth.lastScanBalance)
+	if last != tip {
+		t.Fatalf("expected the cursor to advance to tip %d, got %d", tip, last)
 	}
 }
 
-// TestScanNativeUnchangedCoversFullRequestedRange is the regression test for
-// a real bug introduced while fixing the baseline-pinning issue above: the
-// unchanged-balance fast path was accidentally capped to scanTo (at most
-// maxScanBodies blocks) instead of covering the full requested range - an
-// unchanged balance at to proves nothing arrived anywhere in from..to, so
-// the whole range should be retired in one tick without fetching any
-// bodies, even when it's wider than maxScanBodies.
-func TestScanNativeUnchangedCoversFullRequestedRange(t *testing.T) {
+// TestScanERC20TickYoungChainWithinWindow covers a tip below maxScanBlocks
+// (e.g. simnet, or a chain shortly after genesis): the oldest-scannable-block
+// floor stays pinned at the block-1 sentinel rather than computing
+// tipNum-maxScanBlocks+1 (which would go negative), so the cursor still
+// resumes normally instead of clamping.
+func TestScanERC20TickYoungChainWithinWindow(t *testing.T) {
 	t.Parallel()
-	eth, _, cancel := newScanTestWallets(t)
+	eth, tokenAw, cancel := newScanTestWallets(t)
 	defer cancel()
 
-	node := eth.node.(*tMempoolNode)
-	node.bal = big.NewInt(1000) // constant, so addressBalanceAt returns 1000 for any block
-	eth.lastScanBalance = big.NewInt(1000)
+	eth.metaTable = newTestMetaTable(t)
+	if err := eth.setLastScannedERC20Block(1); err != nil {
+		t.Fatalf("setLastScannedERC20Block: %v", err)
+	}
+	const tip = 50 // well below maxScanBlocks
+	eth.currentTip = &types.Header{Number: big.NewInt(tip)}
 
-	const to = 1000 // far wider than maxScanBodies
-	covered, err := eth.scanNativeReceives(context.Background(), 1, to)
-	if err != nil {
-		t.Fatalf("scanNativeReceives: %v", err)
+	node := eth.node.(*tMempoolNode)
+	eth.scanERC20Tick(context.Background(), tip, []*assetWallet{tokenAw})
+
+	if node.filterLogsQuery.FromBlock.Uint64() != 2 {
+		t.Fatalf("expected the scan to resume right after the cursor at 2, got %d", node.filterLogsQuery.FromBlock.Uint64())
 	}
-	if covered != to {
-		t.Fatalf("expected the unchanged range to be fully retired at %d, got %d", to, covered)
-	}
-	if node.blockByNumCalls != 0 {
-		t.Fatalf("expected no block fetches on the unchanged path, got %d", node.blockByNumCalls)
+	if node.filterLogsQuery.ToBlock.Uint64() != tip {
+		t.Fatalf("expected the scan to request up to tip %d, got %d", tip, node.filterLogsQuery.ToBlock.Uint64())
 	}
 }
 
-// TestScanNativeConvergesAcrossTicks is the regression test for the
-// permanent-loss bug: with the baseline pinned to the uncovered range end, a
-// receive in the truncated tail would look "unchanged" on the following tick
-// (since the tip balance had already been absorbed into the first tick's
-// baseline) and be skipped forever instead of being picked up once the
-// cursor reaches it.
-func TestScanNativeConvergesAcrossTicks(t *testing.T) {
+// TestScanERC20TickClampsToRecentWindow is the regression test for the
+// unscannable-backlog wedge Buck reported against real providers (PR #173):
+// providers phrase "this range can no longer be served" in too many ways to
+// classify reliably, so rather than trying to detect that from the error, a
+// wallet that fell further behind than maxScanBlocks must have that gap
+// silently given up on every tick - clamping to the most recent
+// maxScanBlocks blocks - instead of retrying the same unreachable range
+// forever.
+func TestScanERC20TickClampsToRecentWindow(t *testing.T) {
 	t.Parallel()
-	eth, _, cancel := newScanTestWallets(t)
+	eth, tokenAw, cancel := newScanTestWallets(t)
 	defer cancel()
 
-	toAddr := eth.addr
-	tx, err := types.SignTx(types.NewTx(&types.DynamicFeeTx{
-		Nonce: 1, Value: big.NewInt(500), Gas: 50_000, To: &toAddr,
-		ChainID: eth.node.chainConfig().ChainID,
-	}), signer, eth.node.(*tMempoolNode).privKey)
-	if err != nil {
-		t.Fatalf("SignTx: %v", err)
+	eth.metaTable = newTestMetaTable(t)
+	if err := eth.setLastScannedERC20Block(10); err != nil {
+		t.Fatalf("setLastScannedERC20Block: %v", err)
 	}
+	const farTip = 10 + 100*maxScanBlocks
+	eth.currentTip = &types.Header{Number: big.NewInt(farTip)}
 
 	node := eth.node.(*tMempoolNode)
-	node.blocks = make(map[uint64]*types.Block)
-	for n := uint64(1); n <= 2*maxScanBodies; n++ {
-		node.blocks[n] = types.NewBlockWithHeader(&types.Header{Number: new(big.Int).SetUint64(n)})
-	}
-	// The receive lands in the second tick's range (17-32), not the first
-	// (1-16).
-	const receiveBlock = 20
-	node.blocks[receiveBlock] = types.NewBlockWithHeader(&types.Header{Number: big.NewInt(receiveBlock)}).
-		WithBody(types.Body{Transactions: []*types.Transaction{tx}})
-	node.balAt = map[uint64]*big.Int{
-		maxScanBodies:     big.NewInt(1000), // scanTo of tick 1: balance before the receive
-		2 * maxScanBodies: big.NewInt(1500), // scanTo of tick 2: balance after the receive
-	}
-	node.bal = big.NewInt(1500) // fallback used by w.balance() after storing a receive
+	eth.scanERC20Tick(context.Background(), farTip, []*assetWallet{tokenAw})
 
-	// Tick 1: covers 1-16, no receive there.
-	covered, err := eth.scanNativeReceives(context.Background(), 1, 1000)
+	wantFrom := uint64(farTip - maxScanBlocks + 1)
+	if node.filterLogsQuery.FromBlock.Uint64() != wantFrom {
+		t.Fatalf("expected the scan to clamp its from-block to %d, got %d", wantFrom, node.filterLogsQuery.FromBlock.Uint64())
+	}
+	if node.filterLogsQuery.ToBlock.Uint64() != farTip {
+		t.Fatalf("expected the scan to request up to tip %d, got %d", farTip, node.filterLogsQuery.ToBlock.Uint64())
+	}
+	last, err := eth.getLastScannedERC20Block()
 	if err != nil {
-		t.Fatalf("scanNativeReceives (tick 1): %v", err)
+		t.Fatalf("getLastScannedERC20Block: %v", err)
 	}
-	if covered != maxScanBodies {
-		t.Fatalf("expected tick 1 to cover %d, got %d", maxScanBodies, covered)
-	}
-
-	// Tick 2: covers 17-32, where the receive is.
-	covered, err = eth.scanNativeReceives(context.Background(), covered+1, 1000)
-	if err != nil {
-		t.Fatalf("scanNativeReceives (tick 2): %v", err)
-	}
-	if covered != 2*maxScanBodies {
-		t.Fatalf("expected tick 2 to cover %d, got %d", 2*maxScanBodies, covered)
-	}
-
-	db := eth.txDB.(*tTxDB)
-	if !db.storeTxCalled {
-		t.Fatal("expected the receive in the truncated tail to be found on the following tick")
-	}
-	if db.storedTx.ID != tx.Hash().String() {
-		t.Fatalf("wrong ID: %s", db.storedTx.ID)
+	if last != farTip {
+		t.Fatalf("expected the cursor to advance straight to tip %d, got %d", farTip, last)
 	}
 }
 
-// TestScanNativeBodyFetchFailureClearsBaseline is the regression test for a
-// real bug: on a body-fetch failure partway through a range, the baseline had
-// already been advanced to the balance at scanTo even though the cursor
-// rewinds to before it - so a later tick could compare against a baseline
-// that already accounts for blocks it hasn't actually scanned yet.
-func TestScanNativeBodyFetchFailureClearsBaseline(t *testing.T) {
+// TestScanERC20TickAtExactWindowBoundaryDoesNotClamp pins the clamp
+// threshold from the non-clamping side: a cursor exactly maxScanBlocks
+// behind tip must still scan the full window normally, not trigger the
+// abandon-the-backlog path.
+func TestScanERC20TickAtExactWindowBoundaryDoesNotClamp(t *testing.T) {
 	t.Parallel()
-	eth, _, cancel := newScanTestWallets(t)
+	eth, tokenAw, cancel := newScanTestWallets(t)
 	defer cancel()
 
-	node := eth.node.(*tMempoolNode)
-	node.bal = big.NewInt(1000)
-	eth.lastScanBalance = big.NewInt(0) // force the "changed" path
-	// Blocks 11..13 exist; 14 does not, so the fetch loop fails there.
-	node.blocks = map[uint64]*types.Block{
-		11: types.NewBlockWithHeader(&types.Header{Number: big.NewInt(11)}),
-		12: types.NewBlockWithHeader(&types.Header{Number: big.NewInt(12)}),
-		13: types.NewBlockWithHeader(&types.Header{Number: big.NewInt(13)}),
+	eth.metaTable = newTestMetaTable(t)
+	const tip = 1000
+	last := uint64(tip - maxScanBlocks) // exactly maxScanBlocks behind
+	if err := eth.setLastScannedERC20Block(last); err != nil {
+		t.Fatalf("setLastScannedERC20Block: %v", err)
 	}
+	eth.currentTip = &types.Header{Number: big.NewInt(tip)}
 
-	covered, err := eth.scanNativeReceives(context.Background(), 11, 20)
-	if err == nil {
-		t.Fatal("expected an error from the missing block")
+	node := eth.node.(*tMempoolNode)
+	eth.scanERC20Tick(context.Background(), tip, []*assetWallet{tokenAw})
+
+	wantFrom := last + 1
+	if node.filterLogsQuery.FromBlock.Uint64() != wantFrom {
+		t.Fatalf("expected no clamp at exactly maxScanBlocks behind, from-block %d, got %d", wantFrom, node.filterLogsQuery.FromBlock.Uint64())
 	}
-	if covered != 13 {
-		t.Fatalf("expected covered = 13, got %d", covered)
-	}
-	if eth.lastScanBalance != nil {
-		t.Fatalf("expected the baseline to be cleared on a body-fetch failure, got %v", eth.lastScanBalance)
+	if node.filterLogsQuery.ToBlock.Uint64() != tip {
+		t.Fatalf("expected the scan to request up to tip %d, got %d", tip, node.filterLogsQuery.ToBlock.Uint64())
 	}
 }
 
-// TestScanNativeReceiveSetsTimestampAndNote covers two real bugs together:
-// a detected receive was stored with Timestamp 0 (a sentinel the frontend
+// TestScanERC20TickOneBlockBeyondWindowClamps is the counterpart of
+// TestScanERC20TickAtExactWindowBoundaryDoesNotClamp from the clamping side:
+// a cursor just one block further behind must abandon exactly that one
+// block, not the whole window nor none of it - pinning the clamp threshold
+// against an off-by-one in either direction.
+func TestScanERC20TickOneBlockBeyondWindowClamps(t *testing.T) {
+	t.Parallel()
+	eth, tokenAw, cancel := newScanTestWallets(t)
+	defer cancel()
+
+	eth.metaTable = newTestMetaTable(t)
+	const tip = 1000
+	last := uint64(tip - maxScanBlocks - 1) // one block past the boundary
+	if err := eth.setLastScannedERC20Block(last); err != nil {
+		t.Fatalf("setLastScannedERC20Block: %v", err)
+	}
+	eth.currentTip = &types.Header{Number: big.NewInt(tip)}
+
+	node := eth.node.(*tMempoolNode)
+	eth.scanERC20Tick(context.Background(), tip, []*assetWallet{tokenAw})
+
+	wantFrom := uint64(tip - maxScanBlocks + 1)
+	if node.filterLogsQuery.FromBlock.Uint64() != wantFrom {
+		t.Fatalf("expected the clamp to abandon exactly one block, from-block %d, got %d", wantFrom, node.filterLogsQuery.FromBlock.Uint64())
+	}
+	if node.filterLogsQuery.ToBlock.Uint64() != tip {
+		t.Fatalf("expected the scan to request up to tip %d, got %d", tip, node.filterLogsQuery.ToBlock.Uint64())
+	}
+}
+
+// TestScanERC20TickOnErrorDoesNotAdvanceOrSkip is the counterpart to
+// TestScanERC20FailureDoesNotAdvanceCursor for a wallet that has fallen far
+// behind: a scan error must not silently advance the cursor - only a
+// successful scan does that. On error the cursor stays put and the ordinary
+// backoff applies, so the next tick retries.
+func TestScanERC20TickOnErrorDoesNotAdvanceOrSkip(t *testing.T) {
+	t.Parallel()
+	eth, tokenAw, cancel := newScanTestWallets(t)
+	defer cancel()
+
+	eth.metaTable = newTestMetaTable(t)
+	if err := eth.setLastScannedERC20Block(10); err != nil {
+		t.Fatalf("setLastScannedERC20Block: %v", err)
+	}
+	const farTip = 10 + 200*maxScanBlocks
+	eth.currentTip = &types.Header{Number: big.NewInt(farTip)}
+
+	node := eth.node.(*tMempoolNode)
+	node.filterLogsErr = errors.New("archive requests require a personal token")
+
+	eth.scanERC20Tick(context.Background(), farTip, []*assetWallet{tokenAw})
+
+	last, err := eth.getLastScannedERC20Block()
+	if err != nil {
+		t.Fatalf("getLastScannedERC20Block: %v", err)
+	}
+	if last != 10 {
+		t.Fatalf("expected the cursor to stay at 10 after a scan error, got %d", last)
+	}
+	if !eth.erc20ScanBackoff.blocked(time.Now()) {
+		t.Fatal("expected the erc20 backoff to engage after the error")
+	}
+}
+
+// TestScanERC20ReceiveSetsTimestampAndNote covers two real bugs together: a
+// detected receive was stored with Timestamp 0 (a sentinel the frontend
 // treats as "pending, sort to top"), and no transaction note was emitted, so
 // the receive didn't show in the activity list until reload.
-func TestScanNativeReceiveSetsTimestampAndNote(t *testing.T) {
-	t.Parallel()
-	eth, _, cancel := newScanTestWallets(t)
-	defer cancel()
-
-	notes := make(chan asset.WalletNotification, 4)
-	eth.emit = asset.NewWalletEmitter(notes, BipID, tLogger)
-	eth.wallets[BipID] = eth.assetWallet
-
-	toAddr := eth.addr
-	const blockTime = 1_700_000_000
-	tx, err := types.SignTx(types.NewTx(&types.DynamicFeeTx{
-		Nonce: 1, Value: big.NewInt(1000), Gas: 50_000, To: &toAddr,
-		ChainID: eth.node.chainConfig().ChainID,
-	}), signer, eth.node.(*tMempoolNode).privKey)
-	if err != nil {
-		t.Fatalf("SignTx: %v", err)
-	}
-	header := &types.Header{Number: big.NewInt(5), Time: blockTime}
-	block := types.NewBlockWithHeader(header).WithBody(types.Body{Transactions: []*types.Transaction{tx}})
-	node := eth.node.(*tMempoolNode)
-	node.blocks = map[uint64]*types.Block{5: block}
-	node.bal = big.NewInt(9999)
-
-	if _, err := eth.scanNativeReceives(context.Background(), 5, 5); err != nil {
-		t.Fatalf("scanNativeReceives: %v", err)
-	}
-
-	db := eth.txDB.(*tTxDB)
-	if !db.storeTxCalled {
-		t.Fatal("expected a tx to be stored")
-	}
-	if db.storedTx.Timestamp != blockTime {
-		t.Fatalf("expected Timestamp %d, got %d", uint64(blockTime), db.storedTx.Timestamp)
-	}
-
-	select {
-	case n := <-notes:
-		if _, ok := n.(*asset.TransactionNote); !ok {
-			t.Fatalf("expected a TransactionNote, got %T", n)
-		}
-	default:
-		t.Fatal("expected a transaction note to be emitted")
-	}
-}
-
-// TestScanERC20ReceiveSetsTimestampAndNote is the token-path counterpart of
-// TestScanNativeReceiveSetsTimestampAndNote.
 func TestScanERC20ReceiveSetsTimestampAndNote(t *testing.T) {
 	t.Parallel()
 	eth, tokenAw, cancel := newScanTestWallets(t)
