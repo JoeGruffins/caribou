@@ -203,7 +203,7 @@ Requirements:
 ### Web UI
 
 The desktop and mobile UIs are React and TypeScript bundles in one npm
-workspace under `wallet/appserver` (`shared`, `newui` and `mobile`). The Go
+workspace under `wallet/appserver` (`shared`, `desktop` and `mobile`). The Go
 binaries embed the built bundle with `go:embed`, so build it before building
 a binary:
 
@@ -287,7 +287,7 @@ markdownlint-cli2 "*.md" "docs/**/*.md"
   interface and registering a driver under `wallet/asset/`;
   `wallet/asset/importall` sets which assets a build includes.
 - **Embedded UI.** The appserver serves the desktop bundle
-  (`wallet/appserver/newui`) by default and the mobile bundle
+  (`wallet/appserver/desktop`) by default and the mobile bundle
   (`wallet/appserver/mobile`) under the `mobile` tag. Both build on
   `wallet/appserver/shared`.
 

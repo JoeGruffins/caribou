@@ -1,6 +1,6 @@
 // Package locales holds the translations of the removed site UI. Nothing
 // serves them anymore. They are kept as a source for
-// wallet/appserver/newui/locales/cmd/importlocales.
+// wallet/appserver/desktop/locales/cmd/importlocales.
 package locales
 
 import (
