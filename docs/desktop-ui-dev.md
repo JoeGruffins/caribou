@@ -6,9 +6,10 @@ This guide is for contributors who want to develop the desktop wallet UI.
 
 The wallet binary (`caribou`) interacts with the browser via an HTTP server (`wallet/appserver`)
 that serves a single-page React app. The web assets are built using a node script
-that runs Webpack and TypeScript, compiling the .tsx and .scss files into the `/desktop/dist/` folder.
-The web assets from `/desktop/dist/`, as well as fonts and images from `/desktop/src/`, are embedded
-(`go:embed`) into the `caribou` binary (see `wallet/appserver/embed.go`).
+that runs Webpack and TypeScript, compiling the .tsx and .scss files into the `desktop/dist/` folder.
+The build output in `desktop/dist/` is embedded (`go:embed`) into the `caribou` binary by
+`wallet/appserver/embed_desktop.go`, and the fonts and images in `shared/` by
+`wallet/appserver/embed.go`.
 
 The React app communicates with the wallet core through the HTTP server via two mechanisms:
 
@@ -22,32 +23,27 @@ The React app communicates with the wallet core through the HTTP server via two 
 wallet/appserver/
 ├── appserver.go        # chi router, TLS, CSRF, cookies, session keys
 ├── api.go              # REST handlers — /api/* surface
-├── embed.go            # //go:embed desktop/dist desktop/src/img desktop/src/font
-├── jsintl.go           # registers Go-side locale strings with intl package
-├── locales/            # Go-side translation maps (en-us, de-de, …)
-└── desktop/              # the React app
+├── embed.go            # //go:embed shared/img shared/font
+├── embed_desktop.go    # //go:embed desktop/dist (the mobile tag uses embed_mobile.go)
+├── jsintl.go           # registers the UI locale strings with the intl package
+├── locales/            # old site UI translations, a source for importlocales only
+├── package.json        # npm workspace root: shared, desktop, mobile
+├── shared/             # code and assets common to the desktop and mobile UIs
+│   ├── src/            # application.ts, registry.ts, http.ts, ws.ts, intl.ts, …
+│   ├── img/            # images served at /img/ (embedded)
+│   └── font/           # web fonts served at /font/ (embedded)
+├── mobile/             # the mobile React app
+└── desktop/            # the desktop React app
     ├── package.json
     ├── webpack.config.js
     ├── tsconfig.json
-    ├── .eslintrc.js
-    ├── locales/        # Go file (locales.go) that aggregates locale maps
-    │                   # used by the SPA via POST /api/locale
+    ├── eslint.config.js
+    ├── locales/        # Go locale maps, served to the SPA via POST /api/locale
     └── src/
         ├── index.tsx           # ReactDOM root, mounts <App/>
         ├── App.tsx             # top-level state machine
         ├── components/         # one .tsx per screen / widget
-        ├── js/                 # non-React helpers
-        │   ├── application.ts  # singleton: lifecycle, ws, fiat, loggers
-        │   ├── registry.ts     # all the shared TypeScript types
-        │   ├── http.ts         # postJSON / getJSON wrappers
-        │   ├── ws.ts           # WebSocket client
-        │   ├── intl.ts         # t(slug), tvar, tdom + lazy locale loader
-        │   ├── doc.ts          # DOM helpers used by legacy code paths
-        │   ├── state.ts        # localStorage wrappers (typed keys)
-        │   └── assets.ts       # ticker / unit-info helpers
-        ├── scss/               # Sass entry: application.scss + partials
-        ├── img/                # asset logos and icons (also embedded)
-        └── font/               # web fonts (also embedded)
+        └── scss/               # Sass entry: application.scss + partials
 ```
 
 ## Build pipeline
