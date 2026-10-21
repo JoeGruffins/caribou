@@ -78,10 +78,6 @@ type Config struct {
 	// start Core again and wish to avoid the time to unlock a locked wallet on
 	// startup.
 	NoAutoWalletLock bool // zero value is legacy behavior
-	// ExtensionModeFile is the path to a file that specifies configuration
-	// for running core in extension mode, which gives the caller options for
-	// e.g. limiting the ability to configure wallets.
-	ExtensionModeFile string
 	// IntentsBaseURL overrides the NEAR Intents 1Click API base URL, for
 	// dev servers such as the simnet mock (util/testing/near-intents).
 	// Ignored on mainnet: an injected base URL would bypass the pinned
@@ -111,8 +107,6 @@ type Core struct {
 	txDB  *txdb.TxDB
 	net   util.Network
 	intl  atomic.Value // *locale
-
-	extensionModeConfig *ExtensionModeConfig
 
 	// construction or init sets credentials
 	credMtx     sync.RWMutex
@@ -325,17 +319,6 @@ func New(cfg *Config) (*Core, error) {
 		seedGenerationTime = uint64(creds.Birthday.Unix())
 	}
 
-	var xCfg *ExtensionModeConfig
-	if cfg.ExtensionModeFile != "" {
-		b, err := os.ReadFile(cfg.ExtensionModeFile)
-		if err != nil {
-			return nil, fmt.Errorf("error reading extension mode file at %q: %w", cfg.ExtensionModeFile, err)
-		}
-		if err := json.Unmarshal(b, &xCfg); err != nil {
-			return nil, fmt.Errorf("error unmarshalling extension mode file: %w", err)
-		}
-	}
-
 	c := &Core{
 		cfg:         cfg,
 		credentials: creds,
@@ -354,8 +337,7 @@ func New(cfg *Config) (*Core, error) {
 		reCrypter:   encrypt.Deserialize,
 		noteChans:   make(map[uint64]chan Notification),
 
-		extensionModeConfig: xCfg,
-		seedGenerationTime:  seedGenerationTime,
+		seedGenerationTime: seedGenerationTime,
 
 		fiatRateSources: make(map[string]*commonRateSource),
 
@@ -1153,7 +1135,6 @@ func (c *Core) User() *User {
 		FiatRates:          fiatRates,
 		TickerRates:        c.tickerConversions(fiatRates),
 		Net:                c.net,
-		ExtensionConfig:    c.extensionModeConfig,
 		Actions:            c.requestedActionsList(),
 	}
 }
@@ -4837,9 +4818,4 @@ func (c *Core) GenerateBCHRecoveryTransaction(appPW []byte, recipient string) ([
 		return nil, err
 	}
 	return asset.SPVWithdrawTx(c.ctx, bipID, walletPW, recipient, c.assetDataDirectory(bipID), c.net, c.log.SubLogger("BCH"))
-}
-
-// ExtensionModeConfig is the configuration parsed from the extension-mode file.
-func (c *Core) ExtensionModeConfig() *ExtensionModeConfig {
-	return c.extensionModeConfig
 }

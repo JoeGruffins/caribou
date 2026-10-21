@@ -294,7 +294,6 @@ var Ar = map[string]*intl.Translation{
 	"settings_updated":                {T: "تم تحديث الإعدادات!"},
 	"Votes cast":                      {T: "الأصوات المدلى بها"},
 	"Send enough with estimate":       {T: "قم بالإيداع بما لا يقل عن \u003cspan data-tmpl=\"totalForBond\"\u003e\u003c/span\u003e \u003cspan class=\"unit\"\u003eXYZ\u003c/span\u003e لتغطية السند والرسوم. يمكنك الإيداع بقدر ما تشاء في محفظتك، حيث سيتم استخدام الكمية المطلوبة فقط في الخطوة التالية. قد تتطلب المحفظة تأكيدًا على الأموال الجديدة قبل المتابعة."},
-	"staking_disabled":                {T: "تم تعطيل شراء التذاكر بواسطة \u003cspan id=\"extensionModeAppName\"\u003e\u003c/span\u003e."},
 	"stop_market_making":              {T: "إيقاف"},
 	"posting_bonds_shortly":           {T: "إنشاء السندات..."},
 	"start_market_making":             {T: "بدء التشغيل"},

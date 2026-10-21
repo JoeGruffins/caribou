@@ -533,7 +533,6 @@ var ZhCN = map[string]*intl.Translation{
 	"Configure Privacy":           {T: "配置隐私"},
 	"Privacy active":              {T: "隐私已激活"},
 	"Privacy off":                 {T: "隐私关闭"},
-	"staking_disabled":            {T: `购票功能已被 <span id="extensionModeAppName"></span> 禁用。`},
 	"loading privacy status":      {T: "加载隐私状态"},
 	"mixing_pw_prompt":            {T: "输入您的密码以解锁钱包并开启隐私"},
 	"cspp_addr":                   {T: "CSPP 服务器地址"},

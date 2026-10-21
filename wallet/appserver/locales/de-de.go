@@ -533,7 +533,6 @@ var DeDE = map[string]*intl.Translation{
 	"Configure Privacy":           {T: "Privacy konfigurieren"},
 	"Privacy active":              {T: "Privacy aktiv"},
 	"Privacy off":                 {T: "Privacy aus"},
-	"staking_disabled":            {T: `Ticketkauf deaktiviert durch <span id="extensionModeAppName"></span>.`},
 	"loading privacy status":      {T: "Privatsphäre-Status wird geladen"},
 	"mixing_pw_prompt":            {T: "Gib dein Passwort ein um dein Wallet zu entsperren und die Privatsphäre zu aktivieren."},
 	"cspp_addr":                   {T: "CSPP Server Adresse"},
