@@ -589,8 +589,8 @@ func TestNew_siteError(t *testing.T) {
 		Logger:  tLogger,
 		NoEmbed: true, // this tests locating on-disk files, not the embedded ones
 	})
-	if err == nil || !strings.HasPrefix(err.Error(), "no HTML template files found") {
-		t.Errorf("Should have failed to start with no site folder.")
+	if err == nil || !strings.HasPrefix(err.Error(), "no UI bundle found") {
+		t.Errorf("Should have failed to start with no UI bundle folder.")
 	}
 }
 

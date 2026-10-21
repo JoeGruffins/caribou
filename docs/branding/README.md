@@ -27,11 +27,11 @@ Regenerated in #182. Embedded via `//go:embed` in `main.go`, `icon.go`,
 | File | Used by |
 | --- | --- |
 | `caribou.ico` | Windows executable (winres `#1` and `#32512`) and the NSIS installer |
-| `caribou.png` | window icon (`Icon`) |
-| `caribou-dark-256.png` | toast notification icon (`main.go`) |
+| `caribou.png` | window icon on Linux and macOS (`Icon`), and the notification icon there (`main.go`) |
+| `caribou-dark-256.png` | notification icon on Windows only (`main.go`) |
 | `caribou-256.png` | nothing in the build, kept as a 256 px export |
-| `favicon-32.png` / `.ico` | tray icon |
-| `favicon-bw-32.png` / `.ico` | greyed tray icon (`FavIconBW`) |
+| `favicon-32.png` / `.ico` | tray icon and the tray menu's Open item (`FavIcon`) |
+| `favicon-bw-32.png` / `.ico` | embedded as `FavIconBW` but unused |
 
 Packaging artwork lives under `release/`: the hicolor PNG set in
 `release/linux/icons/`, `caribou.icns` and the menu-bar template images in
@@ -48,8 +48,8 @@ after changing it.
 | File | Used by |
 | --- | --- |
 | `caribou.ico` | Windows executable icon |
-| `favicon-32.png` / `.ico` | tray icon |
-| `favicon-bw-32.png` / `.ico` | greyed tray icon |
+| `favicon-32.png` / `.ico` | tray icon (`FavIcon`) |
+| `favicon-bw-32.png` / `.ico` | the tray menu's Open item (`FavIconBW`, `main_tray.go`) |
 
 ### Web UI: `wallet/appserver/newui/`
 

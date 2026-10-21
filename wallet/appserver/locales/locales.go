@@ -1,3 +1,6 @@
+// Package locales holds the translations of the removed site UI. Nothing
+// serves them anymore. They are kept as a source for
+// wallet/appserver/newui/locales/cmd/importlocales.
 package locales
 
 import (
@@ -10,18 +13,6 @@ import (
 var (
 	Locales map[string]map[string]*intl.Translation
 )
-
-// RegisterTranslations registers translations with the init package for
-// translator worksheet preparation.
-func RegisterTranslations() {
-	const callerID = "html"
-	for lang, ts := range Locales {
-		r := intl.NewRegistrar(callerID, lang, len(ts))
-		for translationID, t := range ts {
-			r.Register(translationID, t)
-		}
-	}
-}
 
 func init() {
 	Locales = map[string]map[string]*intl.Translation{
