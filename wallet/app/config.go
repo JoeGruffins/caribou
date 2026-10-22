@@ -52,7 +52,7 @@ type CoreConfig struct {
 type WebConfig struct {
 	WebAddr     string `long:"webaddr" description:"HTTP server address"`
 	WebTLS      bool   `long:"webtls" description:"Use a self-signed certificate for HTTPS with the web server. This is implied for a publicly routable (not loopback or private subnet) webaddr. When changing webaddr, you mean need to delete web.cert and web.key."`
-	SiteDir     string `long:"sitedir" description:"Path to the UI bundle directory (e.g. newui) to serve with --no-embed-site. Unspecified = default is good in most cases."`
+	SiteDir     string `long:"sitedir" description:"Path to the UI bundle directory (e.g. desktop) to serve with --no-embed-site. Unspecified = default is good in most cases."`
 	NoEmbedSite bool   `long:"no-embed-site" description:"Use on-disk UI files instead of embedded resources. For development purposes."`
 	HTTPProfile bool   `long:"httpprof" description:"Start HTTP profiler on /pprof."`
 	Tor         bool   `long:"tor" description:"Enable tor hidden service"`

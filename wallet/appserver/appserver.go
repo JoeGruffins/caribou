@@ -333,10 +333,10 @@ func New(cfg *Config) (*AppServer, error) {
 	}
 
 	// Only look for files on disk if NoEmbed is set. This is necessary since
-	// site files from older distributions may be present.
+	// UI bundle files from older distributions may be present.
 	var siteDir string // empty signals embedded files only
 	if cfg.NoEmbed {
-		// Look for the UI bundle folder (site, e.g. "newui") in the
+		// Look for the UI bundle folder (site, e.g. "desktop") in the
 		// executable's path, the working directory, or relative to
 		// [repo root]/wallet/cmd/caribou.
 		execPath, err := os.Executable() // e.g. /usr/bin/caribou
@@ -1288,7 +1288,7 @@ func readPost(w http.ResponseWriter, r *http.Request, thing any) bool {
 	return true
 }
 
-// serveSPAIndex serves the bundled newui index.html. Under the new UI, the
+// serveSPAIndex serves the bundled UI index.html. Under the SPA UI, the
 // page routes do not render server-side templates; they deliver the SPA
 // bootstrap document and the client performs its own routing.
 func (s *AppServer) serveSPAIndex(w http.ResponseWriter) {

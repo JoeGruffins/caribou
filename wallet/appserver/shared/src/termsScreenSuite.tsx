@@ -1,5 +1,5 @@
 // termsScreenSuite is the behavior suite for the first-run Terms screen. The
-// desktop (newui) and mobile bundles each render their own TermsScreen, but
+// desktop and mobile bundles each render their own TermsScreen, but
 // both must behave the same, so each bundle's test file runs this one suite
 // against its component. The calling test file must
 // vi.mock('@caribou/shared/http') with getJSON and postJSON stubs. Like

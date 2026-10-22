@@ -163,7 +163,7 @@ func printCoreLines(es []*WorksheetEntry) (entryErrs []string) {
 }
 
 func printJSLines(es []*WorksheetEntry) (entryErrs []string) {
-	fmt.Printf("\nUI strings. Add these to the language file in wallet/appserver/newui/locales\n------------\n")
+	fmt.Printf("\nUI strings. Add these to the language file in wallet/appserver/desktop/locales\n------------\n")
 	for _, e := range es {
 		fmt.Printf(`	"%s": %s,`+"\n", e.ID, formatReportEntry(e))
 	}
