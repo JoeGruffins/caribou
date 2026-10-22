@@ -333,7 +333,7 @@ func New(cfg *Config) (*AppServer, error) {
 	}
 
 	// Only look for files on disk if NoEmbed is set. This is necessary since
-	// site files from older distributions may be present.
+	// UI bundle files from older distributions may be present.
 	var siteDir string // empty signals embedded files only
 	if cfg.NoEmbed {
 		// Look for the UI bundle folder (site, e.g. "desktop") in the
