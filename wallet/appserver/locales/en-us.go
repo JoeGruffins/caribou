@@ -556,7 +556,6 @@ var EnUS = map[string]*intl.Translation{
 	"Configure Privacy":           {T: "Configure Privacy"},
 	"Privacy active":              {T: "Privacy active"},
 	"Privacy off":                 {T: "Privacy off"},
-	"staking_disabled":            {T: `Ticket purchasing disabled by <span id="extensionModeAppName"></span>.`},
 	"loading privacy status":      {T: "loading privacy status"},
 	"mixing_pw_prompt":            {T: "Enter your password to unlock your wallet turn on privacy"},
 	"cspp_addr":                   {T: "CSPP Server Address"},

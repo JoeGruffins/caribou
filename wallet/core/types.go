@@ -99,33 +99,6 @@ type BridgeFeesAndLimits struct {
 	HasLimits bool              `json:"hasLimits"`
 }
 
-// ExtensionModeConfig is configuration for running core in extension mode,
-// primarily for restricting certain wallet reconfiguration options.
-type ExtensionModeConfig struct {
-	// Name of embedding application. Used for messaging with disable features.
-	Name string `json:"name"`
-	// UseDEXBranding will tell the front end to use legacy DCRDEX branding
-	// instead of Caribou branding where possible.
-	UseDEXBranding bool `json:"useDEXBranding"`
-	// RestrictedWallets are wallets that need restrictions on reconfiguration
-	// options.
-	RestrictedWallets map[string] /*symbol*/ struct {
-		// HiddenFields are configuration fields (asset.ConfigOption.Key) that
-		// should not be displayed to the user.
-		HiddenFields []string `json:"hiddenFields"`
-		// DisableWalletType indicates that we should not offer the user an
-		// an option to change the wallet type.
-		DisableWalletType bool `json:"disableWalletType"`
-		// DisablePassword indicates that we should not offer the user an option
-		// to change the wallet password.
-		DisablePassword bool `json:"disablePassword"`
-		// DisableStaking disables vsp configuration and ticket purchasing.
-		DisableStaking bool `json:"disableStaking"`
-		// DisablePrivacy disables mixing configuration and control.
-		DisablePrivacy bool `json:"disablePrivacy"`
-	} `json:"restrictedWallets"`
-}
-
 // User is information about the user's wallets.
 type User struct {
 	Initialized        bool                       `json:"inited"`
@@ -137,10 +110,9 @@ type User struct {
 	// share an economic value, so their per-asset rates are collapsed into one
 	// entry; the front end uses it to price ticker-aggregated balances without
 	// having to pick a representative asset ID.
-	TickerRates     map[string]float64          `json:"tickerRates"`
-	Net             util.Network                `json:"net"`
-	ExtensionConfig *ExtensionModeConfig        `json:"extensionModeConfig,omitempty"`
-	Actions         []*asset.ActionRequiredNote `json:"actions,omitempty"`
+	TickerRates map[string]float64          `json:"tickerRates"`
+	Net         util.Network                `json:"net"`
+	Actions     []*asset.ActionRequiredNote `json:"actions,omitempty"`
 }
 
 // SupportedAsset is data about an asset and possibly the wallet associated

@@ -41,8 +41,7 @@ type CoreConfig struct {
 	// Net is a derivative field set by ResolveConfig.
 	Net util.Network
 
-	NoAutoWalletLock  bool   `long:"no-wallet-lock" description:"Disable locking of wallets on shutdown or logout. Use this if you want your external wallets to stay unlocked after closing the app."`
-	ExtensionModeFile string `long:"extension-mode-file" description:"path to a file that specifies options for running core as an extension."`
+	NoAutoWalletLock bool `long:"no-wallet-lock" description:"Disable locking of wallets on shutdown or logout. Use this if you want your external wallets to stay unlocked after closing the app."`
 
 	IntentsAPI        string `long:"intentsapi" description:"Override the NEAR Intents 1Click API base URL, e.g. for the simnet mock server. Ignored on mainnet. On simnet, defaults to the util/testing/near-intents harness."`
 	IntentsSigningKey string `long:"intentssigningkey" description:"Override the pinned 1Click quote-signing public key (base58, optional ed25519: prefix). Ignored on mainnet. On simnet, defaults to the simnet mock's dev key."`
@@ -139,7 +138,6 @@ func (cfg *Config) Core(log util.Logger) *core.Config {
 		TorIsolation:      cfg.TorIsolation,
 		Language:          cfg.Language,
 		NoAutoWalletLock:  cfg.NoAutoWalletLock,
-		ExtensionModeFile: cfg.ExtensionModeFile,
 		IntentsBaseURL:    cfg.IntentsAPI,
 		IntentsSigningKey: cfg.IntentsSigningKey,
 	}

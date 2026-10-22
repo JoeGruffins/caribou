@@ -169,7 +169,6 @@ type clientCore interface {
 	UnapproveBridgeContract(assetID uint32, bridgeName string) (string, error)
 	PendingBridges(assetID uint32) ([]*txdb.WalletTransaction, error)
 	BridgeHistory(assetID uint32, n int, refID *string, past bool) ([]*txdb.WalletTransaction, error)
-	ExtensionModeConfig() *core.ExtensionModeConfig
 	PoliteiaDetails() (string, bool, int64)
 	ProposalsAll(offset, rowsCount int, searchPhrase string, filterByVoteStatus ...int) ([]*pi.Proposal, int, error)
 	Proposal(assetID uint32, token string) (*pi.Proposal, error)

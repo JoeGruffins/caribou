@@ -530,7 +530,6 @@ var PlPL = map[string]*intl.Translation{
 	"Configure Privacy":           {T: "Skonfiguruj funkcję prywatności"},
 	"Privacy active":              {T: "Funkcja prywatności włączona"},
 	"Privacy off":                 {T: "Funkcja prywatności wyłączona"},
-	"staking_disabled":            {T: `Zakup biletów wyłączony przez <span id="extensionModeAppName"></span>.`},
 	"loading privacy status":      {T: "ładowanie statusu prywatności"},
 	"mixing_pw_prompt":            {T: "Wprowadź hasło, aby odblokować portfel i włączyć funkcję prywatności."},
 	"cspp_addr":                   {T: "Adres serwera CSPP"},

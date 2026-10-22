@@ -296,10 +296,6 @@ func (c *TCore) IntentsExecute(pw []byte, originAssetID, destAssetID uint32, ato
 
 func (*TCore) TakeAction(assetID uint32, actionID string, actionB json.RawMessage) error { return nil }
 
-func (*TCore) ExtensionModeConfig() *core.ExtensionModeConfig {
-	return nil
-}
-
 func (*TCore) ProposalsAll(offset, rowsCount int, searchPhrase string, filterByVoteStatus ...int) ([]*pi.Proposal, int, error) {
 	return nil, 0, nil
 }
