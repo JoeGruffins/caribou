@@ -1137,9 +1137,10 @@ type Balance struct {
 	// ReservesDeficit is the difference between the available balance and the
 	// amount reserved for specific purposes.
 	ReservesDeficit uint64 `json:"reservesDeficit"`
-	// Other is a place to list custom balance categories. It is recommended for
-	// custom balance added here to have a translation and tooltip info in
-	// wallet/appserver/site/src/js/wallet.js#customWalletBalanceCategory
+	// Other is a place to list custom balance categories. The frontend type is
+	// CustomBalance in wallet/appserver/shared/src/registry.ts. The current UIs
+	// do not display these yet, so a category added here needs UI work, with a
+	// translation and tooltip, to be shown.
 	Other map[BalanceCategory]CustomBalance `json:"other"`
 }
 
@@ -1158,13 +1159,11 @@ type CustomBalance struct {
 // BalanceCategory is a string identifier for a custom balance category.
 type BalanceCategory string
 
-// Balance categories for custom balances These values are used as a map key for
-// custom balances and may be recognized in the frontend to support translation.
-// It is recommended for custom balance categories listed here to have a
-// translation and tooltip info in
-// wallet/appserver/site/src/js/wallet.js#customWalletBalanceCategory. If any of
-// these balance categories should change, the customWalletBalanceCategory
-// function in the wallet.js file above should be updated with the new value.
+// Balance categories for custom balances. These values are used as a map key for
+// custom balances (Balance.Other). The current UIs do not display custom
+// balances yet. When they do, each category listed here should have a
+// translation and tooltip there, and a change to a value here must be made in
+// the frontend too.
 const (
 	BalanceCategoryShielded = "Shielded"
 	BalanceCategoryUnmixed  = "Unmixed"

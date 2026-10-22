@@ -247,12 +247,10 @@ type Config struct {
 	AppVersion    string // e.g. "1.0.4-pre", "1.0.4"
 	CertFile      string
 	KeyFile       string
-	// NoEmbed indicates to serve files from the system disk rather than the
-	// embedded files. Since this is a developer setting, this also implies
-	// reloading of templates on each request. Note that only embedded files
-	// should be used by default since site files from older distributions may
-	// be present on the disk. When NoEmbed is true, this also implies reloading
-	// and execution of html templates on each request.
+	// NoEmbed indicates to serve the UI bundle from the system disk rather
+	// than the embedded files. It is a developer setting. Only embedded files
+	// should be used by default since bundles from older distributions may be
+	// present on the disk.
 	NoEmbed         bool
 	HttpProf        bool
 	Tor             bool
@@ -338,8 +336,9 @@ func New(cfg *Config) (*AppServer, error) {
 	// site files from older distributions may be present.
 	var siteDir string // empty signals embedded files only
 	if cfg.NoEmbed {
-		// Look for the "site" folder in the executable's path, the working
-		// directory, or relative to [repo root]/wallet/cmd/caribou.
+		// Look for the UI bundle folder (site, e.g. "newui") in the
+		// executable's path, the working directory, or relative to
+		// [repo root]/wallet/cmd/caribou.
 		execPath, err := os.Executable() // e.g. /usr/bin/caribou
 		if err != nil {
 			return nil, fmt.Errorf("unable to locate executable path: %w", err)
@@ -368,13 +367,13 @@ func New(cfg *Config) (*AppServer, error) {
 		}
 
 		if siteDir == "" {
-			return nil, fmt.Errorf("no HTML template files found. "+
-				"Place the 'site' folder in the executable's directory %q or the working directory, "+
-				"or run caribou from within the wallet/cmd/caribou source workspace folder, or specify the"+
-				"'sitedir' configuration directive to caribou", execPath)
+			return nil, fmt.Errorf("no UI bundle found. "+
+				"Place the %q folder in the executable's directory %q or the working directory, "+
+				"or run caribou from within the wallet/cmd/caribou source workspace folder, or specify the "+
+				"'sitedir' configuration directive to caribou", site, execPath)
 		}
 
-		log.Infof("Located \"site\" folder at %v", siteDir)
+		log.Infof("Located the UI bundle folder at %v", siteDir)
 	} else {
 		// Developer should remember to rebuild the Go binary if they modify any
 		// frontend files, otherwise they should run with --no-embed-site.

@@ -11,7 +11,6 @@ import (
 
 	"github.com/bisoncraft/caribou/util"
 	"github.com/bisoncraft/caribou/wallet/appserver"
-	"github.com/bisoncraft/caribou/wallet/appserver/locales"
 	"github.com/bisoncraft/caribou/wallet/core"
 	"github.com/bisoncraft/caribou/wallet/intl"
 )
@@ -35,7 +34,6 @@ func mainErr() error {
 
 	core.RegisterTranslations()
 	appserver.RegisterTranslations()
-	locales.RegisterTranslations()
 
 	reports := intl.Report()
 	if err := os.MkdirAll("worksheets", 0755); err != nil {
@@ -107,7 +105,6 @@ func formatReport(reportFile string) error {
 
 	entryErrs = append(entryErrs, printCoreLines(sortedEntries["notifications"])...)
 	entryErrs = append(entryErrs, printJSLines(sortedEntries["js"])...)
-	entryErrs = append(entryErrs, printHTMLLines(sortedEntries["html"])...)
 
 	if len(entryErrs) == 0 {
 		return nil
@@ -166,15 +163,7 @@ func printCoreLines(es []*WorksheetEntry) (entryErrs []string) {
 }
 
 func printJSLines(es []*WorksheetEntry) (entryErrs []string) {
-	fmt.Printf("\nJS Notifications. Add these to the appropriate map in wallet/appserver/jsintl.go, replacing the IDs with the appropriate variables\n------------\n")
-	for _, e := range es {
-		fmt.Printf("	%s: %s,\n", e.ID, formatReportEntry(e))
-	}
-	return
-}
-
-func printHTMLLines(es []*WorksheetEntry) (entryErrs []string) {
-	fmt.Printf("\nHTML Notifications. Add these to the language file in wallet/appserver/locales\n------------\n")
+	fmt.Printf("\nUI strings. Add these to the language file in wallet/appserver/newui/locales\n------------\n")
 	for _, e := range es {
 		fmt.Printf(`	"%s": %s,`+"\n", e.ID, formatReportEntry(e))
 	}
