@@ -22,6 +22,7 @@ import (
 	"github.com/bisoncraft/caribou/wallet/utxowallet/electrum"
 	"github.com/bisoncraft/caribou/wallet/utxowallet/netparams"
 	"github.com/bisoncraft/caribou/wallet/utxowallet/spv"
+	"github.com/bisoncraft/caribou/wallet/utxowallet/waddrmgr"
 	"github.com/bisoncraft/caribou/wallet/utxowallet/walletdb"
 )
 
@@ -82,8 +83,46 @@ func (b *electrumWalletBackend) CanRescan() bool { return false }
 
 var _ walletBackend = (*electrumWalletBackend)(nil)
 
+// anchorCheckpoint selects the checkpoint a wallet's header store starts at:
+// the newest checkpoint whose header is at least birthdayBlockDelta older than
+// the wallet birthday and, when a verified birthday block is known, at or
+// below it. The stored birthday already carries a 48-hour margin, which keeps
+// the checkpoint below the wallet's first transaction; the extra
+// birthdayBlockDelta keeps the window locateBirthdayBlock accepts above the
+// checkpoint. A verified birthday block therefore never sits below the
+// anchor, and the choice is the same on every start: a first sync locates the
+// birthday block with the anchor as its floor, and later starts are capped at
+// that block. An unverified block is a caller's guess that birthdaySanityCheck
+// relocates with the anchor as the floor, so it does not cap the choice.
+//
+// When no checkpoint qualifies, the first checkpoint is returned. Networks
+// without checkpoints (regtest) return nil and sync from genesis.
+func anchorCheckpoint(np *netparams.ChainParams, birthday time.Time,
+	birthdayBlock *waddrmgr.BlockStamp) *netparams.Checkpoint {
+
+	cps := np.Checkpoints
+	if len(cps) == 0 {
+		return nil
+	}
+	latest := birthday.Add(-birthdayBlockDelta)
+	for i := len(cps) - 1; i > 0; i-- {
+		cp := &cps[i]
+		// A record awaiting its header literal has no timestamp to test.
+		if cp.Header == nil || cp.Header.Timestamp.After(latest) {
+			continue
+		}
+		if birthdayBlock != nil && cp.Height > birthdayBlock.Height {
+			continue
+		}
+		return cp
+	}
+	return &cps[0]
+}
+
 // newElectrumBackend constructs an electrum backend for the given chain params.
-func newElectrumBackend(np *netparams.ChainParams, dataDir, torProxy string) (walletBackend, error) {
+// A non-nil anchor sets the checkpoint the header store starts at; nil keeps
+// the electrum default (the first checkpoint, or genesis without checkpoints).
+func newElectrumBackend(np *netparams.ChainParams, anchor *netparams.Checkpoint, dataDir, torProxy string) (walletBackend, error) {
 	if len(np.ElectrumServers) == 0 {
 		return nil, fmt.Errorf("electrum: no built-in server for network %q", np.BTCDParams().Name)
 	}
@@ -99,6 +138,14 @@ func newElectrumBackend(np *netparams.ChainParams, dataDir, torProxy string) (wa
 	chainCfg, err := electrum.NewChainConfig(bwChain, np)
 	if err != nil {
 		return nil, fmt.Errorf("electrum: chain config: %w", err)
+	}
+	if anchor != nil {
+		chainCfg.StartHeight = anchor.Height
+		when := "no header recorded"
+		if anchor.Header != nil {
+			when = anchor.Header.Timestamp.UTC().Format(time.DateOnly)
+		}
+		log.Infof("Electrum %s headers start at checkpoint %d (%s)", np.Chain, anchor.Height, when)
 	}
 	// The full built-in list, in preference order: Start elects one
 	// connection, rotating past recently-failed candidates (electrum
@@ -479,11 +526,15 @@ func (s *walletSPVPeerManager) connectToInitialPeers() {
 
 // ─── newBackend dispatches on BackendKind ─────────────────────────────────────
 
-// newBackend constructs and returns an unstarted walletBackend of the given kind.
-func newBackend(kind BackendKind, np *netparams.ChainParams, dataDir, torProxy string, logger backendLogger) (walletBackend, error) {
+// newBackend constructs and returns an unstarted walletBackend of the given
+// kind. anchor is the checkpoint the header store starts at (see
+// anchorCheckpoint); the neutrino backend does not use it yet.
+func newBackend(kind BackendKind, np *netparams.ChainParams, anchor *netparams.Checkpoint,
+	dataDir, torProxy string, logger backendLogger) (walletBackend, error) {
+
 	switch kind {
 	case BackendElectrum:
-		return newElectrumBackend(np, dataDir, torProxy)
+		return newElectrumBackend(np, anchor, dataDir, torProxy)
 	case BackendNeutrino:
 		return newNeutrinoBackend(np, dataDir, torProxy, logger)
 	default:
