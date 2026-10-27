@@ -84,6 +84,10 @@ var (
 	// watch-only mode where we can select coins but not sign any inputs.
 	ErrTxUnsigned = errors.New("watch-only wallet, transaction not signed")
 
+	// errChainClientInactive is returned by requireChainClient when no
+	// backend is set yet.
+	errChainClientInactive = errors.New("blockchain RPC is inactive")
+
 	// Namespace bucket keys.
 	waddrmgrNamespaceKey = []byte("waddrmgr")
 	wtxmgrNamespaceKey   = []byte("wtxmgr")
@@ -355,7 +359,7 @@ func (w *Wallet) requireChainClient() (chain.Backend, error) {
 	chainClient := w.chainClient
 	w.chainClientLock.Unlock()
 	if chainClient == nil {
-		return nil, errors.New("blockchain RPC is inactive")
+		return nil, errChainClientInactive
 	}
 	return chainClient, nil
 }

@@ -147,7 +147,8 @@ type anchoredMockClient struct {
 func (c *anchoredMockClient) EarliestBlockHeight() int32 { return c.start }
 
 // TestImportPrivateKeyBeforeAnchor checks that a key whose starting block is
-// below the backend's first header is refused.
+// below the backend's first header, or not given, is refused, as is any key
+// imported before a backend is set.
 func TestImportPrivateKeyBeforeAnchor(t *testing.T) {
 	w, cleanup := testWallet(t)
 	defer cleanup()
@@ -170,6 +171,18 @@ func TestImportPrivateKeyBeforeAnchor(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewWIF: %v", err)
 	}
+	// Before sync there is no backend to check the start against.
+	w.chainClient = nil
+	_, err = w.ImportPrivateKey(w.PrimaryScope(), wif, nil, false)
+	if !errors.Is(err, errChainClientInactive) {
+		t.Fatalf("import without a chain client: err = %v, want errChainClientInactive", err)
+	}
+	w.chainClient = &anchoredMockClient{start: 100}
+	// No block stamp means the key's history may start at genesis.
+	_, err = w.ImportPrivateKey(w.PrimaryScope(), wif, nil, false)
+	if !errors.Is(err, errImportBeforeAnchor) {
+		t.Fatalf("import without a block stamp: err = %v, want errImportBeforeAnchor", err)
+	}
 	below := &waddrmgr.BlockStamp{Height: 99, Timestamp: time.Unix(1_700_000_000, 0)}
 	_, err = w.ImportPrivateKey(w.PrimaryScope(), wif, below, false)
 	if !errors.Is(err, errImportBeforeAnchor) {
@@ -177,6 +190,47 @@ func TestImportPrivateKeyBeforeAnchor(t *testing.T) {
 	}
 	at := &waddrmgr.BlockStamp{Height: 100, Timestamp: time.Unix(1_700_000_000, 0)}
 	if _, err := w.ImportPrivateKey(w.PrimaryScope(), wif, at, false); err != nil {
+		t.Fatalf("import at the start: %v", err)
+	}
+}
+
+// TestImportTaprootScriptBeforeAnchor checks that a script whose starting block
+// is below the backend's first header, or not given, is refused, as is any
+// script imported before a backend is set.
+func TestImportTaprootScriptBeforeAnchor(t *testing.T) {
+	w, cleanup := testWallet(t)
+	defer cleanup()
+
+	priv, err := btcec.NewPrivateKey()
+	if err != nil {
+		t.Fatalf("NewPrivateKey: %v", err)
+	}
+	script := &waddrmgr.Tapscript{
+		Type:          waddrmgr.TaprootFullKeyOnly,
+		FullOutputKey: priv.PubKey(),
+	}
+	scope := w.ScopeForPurpose(86)
+	importScript := func(bs *waddrmgr.BlockStamp) error {
+		_, err := w.ImportTaprootScript(scope, script, bs, 1, false)
+		return err
+	}
+
+	// Before sync there is no backend to check the start against.
+	w.chainClient = nil
+	if err := importScript(nil); !errors.Is(err, errChainClientInactive) {
+		t.Fatalf("import without a chain client: err = %v, want errChainClientInactive", err)
+	}
+	w.chainClient = &anchoredMockClient{start: 100}
+	// No block stamp means the script's history may start at genesis.
+	if err := importScript(nil); !errors.Is(err, errImportBeforeAnchor) {
+		t.Fatalf("import without a block stamp: err = %v, want errImportBeforeAnchor", err)
+	}
+	below := &waddrmgr.BlockStamp{Height: 99, Timestamp: time.Unix(1_700_000_000, 0)}
+	if err := importScript(below); !errors.Is(err, errImportBeforeAnchor) {
+		t.Fatalf("import below the start: err = %v, want errImportBeforeAnchor", err)
+	}
+	at := &waddrmgr.BlockStamp{Height: 100, Timestamp: time.Unix(1_700_000_000, 0)}
+	if err := importScript(at); err != nil {
 		t.Fatalf("import at the start: %v", err)
 	}
 }
