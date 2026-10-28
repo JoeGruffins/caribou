@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 
+	"github.com/bisoncraft/caribou/wallet/utxowallet/chain"
 	"github.com/bisoncraft/caribou/wallet/utxowallet/waddrmgr"
 	"github.com/bisoncraft/caribou/wallet/utxowallet/walletdb"
 	"github.com/btcsuite/btcd/btcec/v2"
@@ -442,6 +443,13 @@ func (w *Wallet) ImportPublicKey(pubKey *btcec.PublicKey,
 		return err
 	}
 
+	// The import subscribes the backend for notifications, so it must be
+	// set.
+	chainClient, err := w.requireChainClient()
+	if err != nil {
+		return err
+	}
+
 	// TODO: Perform rescan if requested.
 	var addr waddrmgr.ManagedAddress
 	err = walletdb.Update(w.db, func(tx walletdb.ReadWriteTx) error {
@@ -455,7 +463,7 @@ func (w *Wallet) ImportPublicKey(pubKey *btcec.PublicKey,
 
 	log.Infof("Imported address %v", addr.Address())
 
-	err = w.chainClient.NotifyReceived([]btcutil.Address{addr.Address()})
+	err = chainClient.NotifyReceived([]btcutil.Address{addr.Address()})
 	if err != nil {
 		return fmt.Errorf("unable to subscribe for address "+
 			"notifications: %w", err)
@@ -466,6 +474,11 @@ func (w *Wallet) ImportPublicKey(pubKey *btcec.PublicKey,
 
 // ImportTaprootScript imports a user-provided taproot script into the address
 // manager. The imported script will act as a pay-to-taproot address.
+//
+// NOTE: If a block stamp is not provided, the script's history starts at the
+// genesis block, which a backend whose header store starts above genesis
+// (electrum) cannot serve. Such a backend requires a block stamp at or above
+// its first header.
 func (w *Wallet) ImportTaprootScript(scope waddrmgr.KeyScope,
 	tapscript *waddrmgr.Tapscript, bs *waddrmgr.BlockStamp,
 	witnessVersion byte, isSecretScript bool) (waddrmgr.ManagedAddress,
@@ -476,21 +489,15 @@ func (w *Wallet) ImportTaprootScript(scope waddrmgr.KeyScope,
 		return nil, err
 	}
 
-	// The starting block for the key is the genesis block unless otherwise
-	// specified.
-	if bs == nil {
-		bs = &waddrmgr.BlockStamp{
-			Hash:      *w.chainParams.GenesisHash,
-			Height:    0,
-			Timestamp: w.chainParams.GenesisBlock.Header.Timestamp,
-		}
-	} else if bs.Timestamp.IsZero() {
-		// Only update the new birthday time from default value if we
-		// actually have timestamp info in the header.
-		header, err := w.chainClient.GetBlockHeader(&bs.Hash)
-		if err == nil {
-			bs.Timestamp = header.Timestamp
-		}
+	// The backend decides how far back the script's history can be served,
+	// and the import subscribes it for notifications, so it must be set.
+	chainClient, err := w.requireChainClient()
+	if err != nil {
+		return nil, err
+	}
+	bs, err = w.importBlockStamp(chainClient, bs)
+	if err != nil {
+		return nil, err
 	}
 
 	// TODO: Perform rescan if requested.
@@ -508,7 +515,7 @@ func (w *Wallet) ImportTaprootScript(scope waddrmgr.KeyScope,
 
 	log.Infof("Imported address %v", addr.Address())
 
-	err = w.chainClient.NotifyReceived([]btcutil.Address{addr.Address()})
+	err = chainClient.NotifyReceived([]btcutil.Address{addr.Address()})
 	if err != nil {
 		return nil, fmt.Errorf("unable to subscribe for address "+
 			"notifications: %w", err)
@@ -522,21 +529,29 @@ func (w *Wallet) ImportTaprootScript(scope waddrmgr.KeyScope,
 // supported yet.
 var errImportBeforeAnchor = errors.New("importing a key with history before the header store's start is not supported yet")
 
-// ImportPrivateKey imports a private key to the wallet and writes the new
-// wallet to disk.
+// importBlockStamp returns the block an imported key or script's history
+// starts at. It is the genesis block unless bs is given, in which case a
+// missing timestamp is filled in from the backend's header when it has one.
 //
-// NOTE: If a block stamp is not provided, then the wallet's birthday will be
-// set to the genesis block of the corresponding chain.
-func (w *Wallet) ImportPrivateKey(scope waddrmgr.KeyScope, wif *btcutil.WIF,
-	bs *waddrmgr.BlockStamp, rescan bool) (string, error) {
+// A key with history below the backend's first header would need a rescan the
+// backend cannot serve. Refuse rather than import a key whose earlier history
+// would go unseen. Without a block stamp the history may reach back to
+// genesis, so a backend that starts above genesis requires one.
+func (w *Wallet) importBlockStamp(chainClient chain.Backend,
+	bs *waddrmgr.BlockStamp) (*waddrmgr.BlockStamp, error) {
 
-	manager, err := w.Manager.FetchScopedKeyManager(scope)
-	if err != nil {
-		return "", err
+	var start int32
+	if e, ok := chainClient.(interface{ EarliestBlockHeight() int32 }); ok {
+		start = e.EarliestBlockHeight()
+	}
+	// A nil stamp would default to genesis below and fail the height check
+	// anyway. Refuse it here so the error asks for a block stamp instead of
+	// reporting block 0.
+	if bs == nil && start > 0 {
+		return nil, fmt.Errorf("%w: a block stamp at or above %d is required",
+			errImportBeforeAnchor, start)
 	}
 
-	// The starting block for the key is the genesis block unless otherwise
-	// specified.
 	if bs == nil {
 		bs = &waddrmgr.BlockStamp{
 			Hash:      *w.chainParams.GenesisHash,
@@ -546,20 +561,44 @@ func (w *Wallet) ImportPrivateKey(scope waddrmgr.KeyScope, wif *btcutil.WIF,
 	} else if bs.Timestamp.IsZero() {
 		// Only update the new birthday time from default value if we
 		// actually have timestamp info in the header.
-		header, err := w.chainClient.GetBlockHeader(&bs.Hash)
+		header, err := chainClient.GetBlockHeader(&bs.Hash)
 		if err == nil {
 			bs.Timestamp = header.Timestamp
 		}
 	}
 
-	// A key with history below the backend's first header would need a
-	// rescan the backend cannot serve. Refuse rather than import a key
-	// whose earlier history would go unseen.
-	if e, ok := w.chainClient.(interface{ EarliestBlockHeight() int32 }); ok {
-		if start := e.EarliestBlockHeight(); bs.Height < start {
-			return "", fmt.Errorf("%w: block %d is below the header store's start %d",
-				errImportBeforeAnchor, bs.Height, start)
-		}
+	if bs.Height < start {
+		return nil, fmt.Errorf("%w: block %d is below the header store's start %d",
+			errImportBeforeAnchor, bs.Height, start)
+	}
+	return bs, nil
+}
+
+// ImportPrivateKey imports a private key to the wallet and writes the new
+// wallet to disk.
+//
+// NOTE: If a block stamp is not provided, then the wallet's birthday will be
+// set to the genesis block of the corresponding chain. A backend whose header
+// store starts above genesis (electrum) cannot serve that history, so it
+// requires a block stamp at or above its first header.
+func (w *Wallet) ImportPrivateKey(scope waddrmgr.KeyScope, wif *btcutil.WIF,
+	bs *waddrmgr.BlockStamp, rescan bool) (string, error) {
+
+	manager, err := w.Manager.FetchScopedKeyManager(scope)
+	if err != nil {
+		return "", err
+	}
+
+	// The backend decides how far back the key's history can be served,
+	// and the import subscribes it for notifications, so it must be set.
+	chainClient, err := w.requireChainClient()
+	if err != nil {
+		return "", err
+	}
+
+	bs, err = w.importBlockStamp(chainClient, bs)
+	if err != nil {
+		return "", err
 	}
 
 	// Attempt to import private key into wallet.
@@ -620,7 +659,7 @@ func (w *Wallet) ImportPrivateKey(scope waddrmgr.KeyScope, wif *btcutil.WIF,
 		// required to be read, so discard the return value.
 		_ = w.SubmitRescan(job)
 	} else {
-		err := w.chainClient.NotifyReceived([]btcutil.Address{addr})
+		err := chainClient.NotifyReceived([]btcutil.Address{addr})
 		if err != nil {
 			return "", fmt.Errorf("failed to subscribe for address ntfns for "+
 				"address %s: %w", addr.EncodeAddress(), err)
