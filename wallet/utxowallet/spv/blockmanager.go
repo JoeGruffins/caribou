@@ -3076,6 +3076,20 @@ func ruleError(c blockchain.ErrorCode, desc string) blockchain.RuleError {
 	return blockchain.RuleError{ErrorCode: c, Description: desc}
 }
 
+// dashMaxBlockSize is the largest block Dash allows since DIP-1, twice
+// Bitcoin's base size limit (MAX_DIP0001_BLOCK_SIZE in Dash Core).
+const dashMaxBlockSize = 2_000_000
+
+// maxBlockSize returns the largest serialized block the chain allows. The size
+// checked excludes a Dash block's special transaction payloads, which only
+// makes the check more lenient than the network rule.
+func maxBlockSize(chain string) int {
+	if bisonwire.Chain(chain) == bisonwire.ChainDASH {
+		return dashMaxBlockSize
+	}
+	return blockchain.MaxBlockBaseSize
+}
+
 // checkBlockSanity performs some preliminary checks on a block to ensure it is
 // sane before continuing with block processing.  These checks are context free.
 //
@@ -3111,18 +3125,19 @@ func checkBlockSanity(block *bisonwire.Block, chainParams *netparams.ChainParams
 
 	// A block must not have more transactions than the max block payload or
 	// else it is certainly over the weight limit.
-	if numTx > blockchain.MaxBlockBaseSize {
+	maxSize := maxBlockSize(block.Chain)
+	if numTx > maxSize {
 		str := fmt.Sprintf("block contains too many transactions - "+
-			"got %d, max %d", numTx, blockchain.MaxBlockBaseSize)
+			"got %d, max %d", numTx, maxSize)
 		return ruleError(blockchain.ErrBlockTooBig, str)
 	}
 
 	// A block must not exceed the maximum allowed block payload when
 	// serialized.
 	serializedSize := msgBlock.SerializeSizeStripped()
-	if serializedSize > blockchain.MaxBlockBaseSize {
+	if serializedSize > maxSize {
 		str := fmt.Sprintf("serialized block is too big - got %d, "+
-			"max %d", serializedSize, blockchain.MaxBlockBaseSize)
+			"max %d", serializedSize, maxSize)
 		return ruleError(blockchain.ErrBlockTooBig, str)
 	}
 
@@ -3253,17 +3268,39 @@ func isNullOutpoint(outpoint *wire.OutPoint) bool {
 	return false
 }
 
+// Dash special transaction types that the sanity checks treat differently.
+const (
+	// dashCoinbaseTxType is a coinbase (DIP-4).
+	dashCoinbaseTxType = 5
+	// dashQuorumCommitmentTxType is an LLMQ final commitment (DIP-6).
+	dashQuorumCommitmentTxType = 6
+	// dashMNHFSignalTxType is a masternode hard fork signal.
+	dashMNHFSignalTxType = 7
+	// dashAssetUnlockTxType is a credit pool withdrawal (DIP-27).
+	dashAssetUnlockTxType = 9
+)
+
 // checkTransactionSanity performs some preliminary checks on a transaction to
 // ensure it is sane.  These checks are context free.
 func checkTransactionSanity(tx *bisonwire.Tx, chainParams *netparams.ChainParams) error {
+	// Some Dash special transactions carry everything in their payload and
+	// are allowed to have no inputs and/or no outputs.
+	var allowEmptyTxIn, allowEmptyTxOut bool
+	switch tx.Type {
+	case dashQuorumCommitmentTxType, dashMNHFSignalTxType:
+		allowEmptyTxIn, allowEmptyTxOut = true, true
+	case dashAssetUnlockTxType:
+		allowEmptyTxIn = true
+	}
+
 	// A transaction must have at least one input.
 	msgTx := &tx.MsgTx
-	if len(msgTx.TxIn) == 0 {
+	if len(msgTx.TxIn) == 0 && !allowEmptyTxIn {
 		return ruleError(blockchain.ErrNoTxInputs, "transaction has no inputs")
 	}
 
 	// A transaction must have at least one output.
-	if len(msgTx.TxOut) == 0 {
+	if len(msgTx.TxOut) == 0 && !allowEmptyTxOut {
 		return ruleError(blockchain.ErrNoTxOutputs, "transaction has no outputs")
 	}
 
@@ -3329,10 +3366,16 @@ func checkTransactionSanity(tx *bisonwire.Tx, chainParams *netparams.ChainParams
 	// Coinbase script length must be between min and max length.
 	if blockchain.IsCoinBaseTx(&tx.MsgTx) {
 		slen := len(msgTx.TxIn[0].SignatureScript)
-		if slen < blockchain.MinCoinbaseScriptLen || slen > blockchain.MaxCoinbaseScriptLen {
+		minLen := blockchain.MinCoinbaseScriptLen
+		if tx.Type == dashCoinbaseTxType {
+			// Dash coinbase special transactions carry the height in
+			// their payload, so the script no longer needs to hold it.
+			minLen = 1
+		}
+		if slen < minLen || slen > blockchain.MaxCoinbaseScriptLen {
 			str := fmt.Sprintf("coinbase transaction script length "+
 				"of %d is out of range (min: %d, max: %d)",
-				slen, blockchain.MinCoinbaseScriptLen, blockchain.MaxCoinbaseScriptLen)
+				slen, minLen, blockchain.MaxCoinbaseScriptLen)
 			return ruleError(blockchain.ErrBadCoinbaseScriptLen, str)
 		}
 	} else {
