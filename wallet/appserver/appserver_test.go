@@ -83,6 +83,7 @@ type TCore struct {
 	sendRequiresPWErr    error
 	setSendRequiresPWErr error
 	verifyPasswordErr    error
+	verifyPasswordDelay  time.Duration // stands in for the key derivation
 	notHas               bool
 	notRunning           bool
 	notOpen              bool
@@ -275,7 +276,10 @@ func (c *TCore) SetAcceptedTermsVersion(v string) error {
 	return nil
 }
 func (c *TCore) AcceptedTermsVersion() (string, error) { return c.acceptedTerms, c.acceptedTermsErr }
-func (c *TCore) VerifyPassword(pw []byte) error        { return c.verifyPasswordErr }
+func (c *TCore) VerifyPassword(pw []byte) error {
+	time.Sleep(c.verifyPasswordDelay)
+	return c.verifyPasswordErr
+}
 
 func (c *TCore) Bridge(fromAssetID, toAssetID uint32, amt uint64, bridgeName string) (string, error) {
 	c.bridgeCalls++
