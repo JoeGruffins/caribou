@@ -283,10 +283,14 @@ type AppServer struct {
 	core     clientCore
 	addr     string
 	cfgAddr  string // Config.Addr as given, for hostMiddleware
-	csp      string
-	srv      *http.Server
-	tor      bool
-	onion    string
+	// https is whether srv serves TLS. It is fixed in New. Read it rather
+	// than srv.TLSConfig once serving: http.Server.Serve writes TLSConfig
+	// when it sets up HTTP/2.
+	https bool
+	csp   string
+	srv   *http.Server
+	tor   bool
+	onion string
 
 	capToken string // see Config.CapabilityToken
 
@@ -464,6 +468,7 @@ func New(cfg *Config) (*AppServer, error) {
 		srv:             httpServer,
 		addr:            cfg.Addr,
 		cfgAddr:         cfg.Addr,
+		https:           httpServer.TLSConfig != nil,
 		dataDir:         cfg.DataDir,
 		wsServer:        websocket.New(cfg.Core, log.SubLogger("WS")),
 		authTokens:      make(map[string]bool),
@@ -674,7 +679,7 @@ func New(cfg *Config) (*AppServer, error) {
 // as a secret. Use only after Connect.
 func (s *AppServer) BootstrapURL() string {
 	scheme := "http"
-	if s.srv.TLSConfig != nil {
+	if s.https {
 		scheme = "https"
 	}
 	u := scheme + "://" + s.addr
