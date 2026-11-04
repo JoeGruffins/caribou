@@ -274,6 +274,7 @@ type AppServer struct {
 	langs    []string
 	core     clientCore
 	addr     string
+	cfgAddr  string // Config.Addr as given, for hostMiddleware
 	csp      string
 	srv      *http.Server
 	tor      bool
@@ -436,6 +437,7 @@ func New(cfg *Config) (*AppServer, error) {
 		mux:             mux,
 		srv:             httpServer,
 		addr:            cfg.Addr,
+		cfgAddr:         cfg.Addr,
 		dataDir:         cfg.DataDir,
 		wsServer:        websocket.New(cfg.Core, log.SubLogger("WS")),
 		authTokens:      make(map[string]bool),
@@ -472,6 +474,9 @@ func New(cfg *Config) (*AppServer, error) {
 	// reaches the log, and so rejected scanner/other-app requests do not
 	// generate log noise (no-op on desktop).
 	mux.Use(s.securityMiddleware)
+	// hostMiddleware runs before anything that answers a request, so a DNS
+	// rebinding page gets nothing.
+	mux.Use(s.hostMiddleware)
 	mux.Use(s.capabilityMiddleware)
 	// grantMiddleware runs after the capability gate (so the gate still protects
 	// it) and before the logger (so a ?g= session grant never reaches the log).

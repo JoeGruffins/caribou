@@ -587,3 +587,56 @@ func TestUnpairCompanionDisconnectsWS(t *testing.T) {
 
 	assertWSClosed(t, conn, "the companion app was unpaired")
 }
+
+// TestHostAllowlist checks hostMiddleware, the DNS rebinding defense. A page
+// that rebinds its own name to 127.0.0.1 still sends that name as the Host
+// header, and must get nothing, not even the unauthenticated routes.
+func TestHostAllowlist(t *testing.T) {
+	s, _, shutdown := newTServer(t, false)
+	defer shutdown()
+	s.cfgAddr = "mywallet.lan:5758"
+	s.onion = "abcdefghijklmnopqrstuvwxyz234567abcdefghijklmnopqrstuvwx.onion"
+
+	allowed := []string{
+		"127.0.0.1:5758",
+		"127.0.0.1",
+		"[::1]:5758",
+		"192.168.1.20:5758", // bound to 0.0.0.0 or a LAN IP
+		"localhost:5758",
+		"LOCALHOST:5758",
+		"mywallet.lan:5758", // the configured --webaddr host
+		"mywallet.lan.",
+		"abcdefghijklmnopqrstuvwxyz234567abcdefghijklmnopqrstuvwx.onion",
+		"abcdefghijklmnopqrstuvwxyz234567abcdefghijklmnopqrstuvwx.onion:80",
+	}
+	refused := []string{
+		"evil.example:5758", // the rebinding case
+		"evil.example",
+		"localhost.evil.example:5758",
+		"127.0.0.1.evil.example:5758",
+		"sub.localhost:5758",
+		"other.onion",
+		"",
+	}
+
+	serve := func(host string) int {
+		t.Helper()
+		req := httptest.NewRequest(http.MethodPost, "http://127.0.0.1/api/login", strings.NewReader(`{"pass":"x"}`))
+		req.Host = host
+		req.Header.Set("Content-Type", "application/json")
+		rec := httptest.NewRecorder()
+		s.mux.ServeHTTP(rec, req)
+		return rec.Code
+	}
+	for _, h := range allowed {
+		if code := serve(h); code == http.StatusMisdirectedRequest {
+			t.Errorf("Host %q refused, want allowed", h)
+		}
+	}
+	for _, h := range refused {
+		if code := serve(h); code != http.StatusMisdirectedRequest {
+			t.Errorf("Host %q got %d, want %d", h, code, http.StatusMisdirectedRequest)
+		}
+	}
+
+}
