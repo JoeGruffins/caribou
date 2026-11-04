@@ -1645,25 +1645,29 @@ func (s *AppServer) passOrCached(appPW []byte, r *http.Request) ([]byte, error) 
 	return cachedPass, nil
 }
 
-// checkSendRequiresPassword enforces the send-requires-password setting for
-// endpoints that move or authorize value but, unlike '/send', do not
-// otherwise take a password to unlock a wallet (they rely on the wallet
-// already being unlocked). When the setting is enabled, the caller must
-// supply the correct app password explicitly; emptyPassMsg is returned when
-// none was supplied.
-func (s *AppServer) checkSendRequiresPassword(pass encode.PassBytes, emptyPassMsg string) error {
+// requireSendPassword gates endpoints that move or authorize value but, unlike
+// '/send', do not pass a password to core (they rely on the wallet already
+// being unlocked). It applies the same rule as '/send': the caller needs the
+// app password, either explicit in the request or the session's cached one,
+// and with send-requires-password on it must be explicit. emptyPassMsg is
+// returned when the setting is on and none was supplied. An API token caller
+// has no cached password, so it always has to send one.
+func (s *AppServer) requireSendPassword(pass encode.PassBytes, r *http.Request, emptyPassMsg string) error {
 	requirePW, err := s.core.SendRequiresPassword()
 	if err != nil {
 		return fmt.Errorf("error reading send-requires-password setting: %w", err)
 	}
-	if !requirePW {
-		return nil
-	}
-	if len(pass) == 0 {
+	if requirePW && len(pass) == 0 {
 		return errors.New(emptyPassMsg)
 	}
-	if err := s.checkAppPassword(pass); err != nil {
+	// An explicit password is checked under the throttle. A cached one came
+	// from this session's login, so finding it is enough.
+	pw, err := s.resolvePass(pass, r)
+	if err != nil {
 		return fmt.Errorf("password error: %w", err)
+	}
+	if len(pass) == 0 {
+		zero(pw) // a decrypted copy of the cached password
 	}
 	return nil
 }
@@ -1711,8 +1715,7 @@ func (s *AppServer) apiBridgeFeesAndLimits(w http.ResponseWriter, r *http.Reques
 }
 
 // apiBridge is the handler for the '/bridge' API request. It moves funds off
-// the source chain, so it honors the send-requires-password setting exactly
-// as '/send' does.
+// the source chain, so it needs the app password exactly as '/send' does.
 func (s *AppServer) apiBridge(w http.ResponseWriter, r *http.Request) {
 	form := &struct {
 		FromAssetID uint32           `json:"fromAssetID"`
@@ -1730,7 +1733,7 @@ func (s *AppServer) apiBridge(w http.ResponseWriter, r *http.Request) {
 	if !readPost(w, r, form) {
 		return
 	}
-	if err := s.checkSendRequiresPassword(form.Pass, "password required to bridge"); err != nil {
+	if err := s.requireSendPassword(form.Pass, r, "password required to bridge"); err != nil {
 		s.writeAPIError(w, err)
 		return
 	}
@@ -1777,7 +1780,7 @@ func (s *AppServer) apiBridgeApprovalStatus(w http.ResponseWriter, r *http.Reque
 
 // apiApproveBridgeContract is the handler for the '/approvebridgecontract'
 // API request. It grants the bridge contract a token spending allowance, so
-// it honors the send-requires-password setting exactly as '/send' does.
+// it needs the app password exactly as '/send' does.
 func (s *AppServer) apiApproveBridgeContract(w http.ResponseWriter, r *http.Request) {
 	form := &struct {
 		AssetID    uint32           `json:"assetID"`
@@ -1789,7 +1792,7 @@ func (s *AppServer) apiApproveBridgeContract(w http.ResponseWriter, r *http.Requ
 	if !readPost(w, r, form) {
 		return
 	}
-	if err := s.checkSendRequiresPassword(form.Pass, "password required to approve the bridge contract"); err != nil {
+	if err := s.requireSendPassword(form.Pass, r, "password required to approve the bridge contract"); err != nil {
 		s.writeAPIError(w, err)
 		return
 	}
@@ -1811,8 +1814,8 @@ func (s *AppServer) apiApproveBridgeContract(w http.ResponseWriter, r *http.Requ
 
 // apiUnapproveBridgeContract is the handler for the
 // '/unapprovebridgecontract' API request. It revokes the bridge contract's
-// token spending allowance, so it honors the send-requires-password setting
-// exactly as '/send' does.
+// token spending allowance, so it needs the app password exactly as '/send'
+// does.
 func (s *AppServer) apiUnapproveBridgeContract(w http.ResponseWriter, r *http.Request) {
 	form := &struct {
 		AssetID    uint32           `json:"assetID"`
@@ -1824,7 +1827,7 @@ func (s *AppServer) apiUnapproveBridgeContract(w http.ResponseWriter, r *http.Re
 	if !readPost(w, r, form) {
 		return
 	}
-	if err := s.checkSendRequiresPassword(form.Pass, "password required to unapprove the bridge contract"); err != nil {
+	if err := s.requireSendPassword(form.Pass, r, "password required to unapprove the bridge contract"); err != nil {
 		s.writeAPIError(w, err)
 		return
 	}

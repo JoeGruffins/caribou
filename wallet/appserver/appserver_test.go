@@ -1272,6 +1272,82 @@ func TestApiGetBalance(t *testing.T) {
 	tCore.balanceErr = nil
 }
 
+// TestAPIBridgeNeedsPasswordByDefault checks the bridge and approval routes
+// with send-requires-password off (the default). Like '/send', they still need
+// the app password: the session's cached one, or an explicit one. A caller with
+// neither, such as an API token caller, is refused before core is reached.
+func TestAPIBridgeNeedsPasswordByDefault(t *testing.T) {
+	s, tCore, shutdown := newTServer(t, false)
+	defer shutdown()
+	tCore.sendRequiresPW = false
+
+	authToken, err := s.authorize()
+	if err != nil {
+		t.Fatalf("authorize: %v", err)
+	}
+	pwKey, err := s.cacheAppPassword(encode.PassBytes("apppass"), authToken)
+	if err != nil {
+		t.Fatalf("cacheAppPassword: %v", err)
+	}
+
+	routes := []struct {
+		name  string
+		h     http.HandlerFunc
+		calls func() int
+	}{
+		{"bridge", s.apiBridge, func() int { return tCore.bridgeCalls }},
+		{"approvebridgecontract", s.apiApproveBridgeContract, func() int { return tCore.approveBridgeCalls }},
+		{"unapprovebridgecontract", s.apiUnapproveBridgeContract, func() int { return tCore.unapproveBridgeCalls }},
+	}
+	for _, rt := range routes {
+		post := func(body string, session bool) bool {
+			t.Helper()
+			req := httptest.NewRequest(http.MethodPost, "/", strings.NewReader(body))
+			if session {
+				req.AddCookie(&http.Cookie{Name: authCK, Value: authToken})
+				req.AddCookie(&http.Cookie{Name: pwKeyCK, Value: hex.EncodeToString(pwKey)})
+			}
+			rec := httptest.NewRecorder()
+			rt.h(rec, req)
+			resp := &standardResponse{}
+			if err := json.Unmarshal(rec.Body.Bytes(), resp); err != nil {
+				t.Fatalf("%s: decode response: %v (%s)", rt.name, err, rec.Body.String())
+			}
+			return resp.OK
+		}
+
+		// No password and no session: refused.
+		before := rt.calls()
+		if post(`{"amount":1}`, false) {
+			t.Fatalf("%s: ok with no password and no session", rt.name)
+		}
+		if rt.calls() != before {
+			t.Fatalf("%s: core called with no password and no session", rt.name)
+		}
+
+		// A wrong explicit password: refused.
+		tCore.verifyPasswordErr = errTest
+		if post(`{"amount":1,"pass":"wrong"}`, false) {
+			t.Fatalf("%s: ok with a wrong password", rt.name)
+		}
+		tCore.verifyPasswordErr = nil
+		if rt.calls() != before {
+			t.Fatalf("%s: core called with a wrong password", rt.name)
+		}
+
+		// The session's cached password, or an explicit one: allowed.
+		if !post(`{"amount":1}`, true) {
+			t.Fatalf("%s: refused with the session's cached password", rt.name)
+		}
+		if !post(`{"amount":1,"pass":"apppass"}`, false) {
+			t.Fatalf("%s: refused with an explicit password", rt.name)
+		}
+		if got := rt.calls() - before; got != 2 {
+			t.Fatalf("%s: core called %d times, want 2", rt.name, got)
+		}
+	}
+}
+
 func TestPasswordCache(t *testing.T) {
 	s, tCore, shutdown := newTServer(t, false)
 	defer shutdown()
