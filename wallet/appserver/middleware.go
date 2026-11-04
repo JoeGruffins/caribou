@@ -65,7 +65,8 @@ func hostOnly(hostport string) string {
 }
 
 // capabilityMiddleware gates every request on a capability token when one is
-// configured (Config.CapabilityToken, set by the mobile build). The token is
+// configured (Config.CapabilityToken, set by the mobile build, or
+// Config.CapabilityGate, set by the desktop shells). The token is
 // handed to the WebView in the bootstrap URL (?k=...) and exchanged here for an
 // HttpOnly cookie on first load; thereafter the cookie authorizes requests.
 //
@@ -75,7 +76,11 @@ func hostOnly(hostport string) string {
 // other apps cannot present the token, so they cannot reach the SPA, the
 // unauthenticated API routes (e.g. /api/login), or the notification websocket.
 //
-// When no token is configured (desktop) the gate is a no-op.
+// The desktop shells turn it on for the same reason against web pages: with
+// DNS rebinding a page can reach the loopback server, and this leaves it
+// nothing to talk to. hostMiddleware covers the browser and CLI cases.
+//
+// When no token is configured (CLI opened from a browser) the gate is a no-op.
 func (s *AppServer) capabilityMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if s.capToken == "" {
