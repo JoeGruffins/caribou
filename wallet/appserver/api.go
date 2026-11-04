@@ -342,6 +342,10 @@ func (s *AppServer) apiExportSeed(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	r.Close = true
+	if err := s.checkAppPassword(form.Pass); err != nil {
+		s.writeAPIError(w, fmt.Errorf("error exporting seed: %w", err))
+		return
+	}
 	seed, err := s.core.ExportSeed(form.Pass)
 	if err != nil {
 		s.writeAPIError(w, fmt.Errorf("error exporting seed: %w", err))
@@ -368,6 +372,10 @@ func (s *AppServer) apiRestoreWalletInfo(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
+	if err := s.checkAppPassword(form.Pass); err != nil {
+		s.writeAPIError(w, fmt.Errorf("error getting restoration info: %w", err))
+		return
+	}
 	info, err := s.core.WalletRestorationInfo(form.Pass, form.AssetID)
 	if err != nil {
 		s.writeAPIError(w, fmt.Errorf("error updating cert: %w", err))
@@ -538,30 +546,37 @@ func (e badCredentials) Error() string        { return e.err.Error() }
 func (e badCredentials) Unwrap() error        { return e.err }
 func (e badCredentials) Is(target error) bool { return target == errBadCredentials }
 
+// throttledLogin is actuallyLogin under the password throttle, as one step
+// with respect to other password checks (see passCheckMtx).
+func (s *AppServer) throttledLogin(w http.ResponseWriter, r *http.Request, login *loginForm) error {
+	s.passCheckMtx.Lock()
+	defer s.passCheckMtx.Unlock()
+	if d := s.passwordThrottle(); d > 0 {
+		return throttledErr(d)
+	}
+	if err := s.actuallyLogin(w, r, login); err != nil {
+		// Only a rejected password counts toward the throttle; environmental
+		// errors must not lock out the (single) legitimate client.
+		if errors.Is(err, errBadCredentials) {
+			s.notePasswordFailure()
+		}
+		return err
+	}
+	s.notePasswordSuccess()
+	return nil
+}
+
 // apiLogin handles the 'login' API request.
 func (s *AppServer) apiLogin(w http.ResponseWriter, r *http.Request) {
-	if d := s.loginThrottle(); d > 0 {
-		s.writeAPIError(w, fmt.Errorf("too many failed login attempts, try again in %s", d.Round(time.Second)))
-		return
-	}
-
 	login := new(loginForm)
 	defer login.Pass.Clear()
 	if !readPost(w, r, login) {
 		return
 	}
-
-	err := s.actuallyLogin(w, r, login)
-	if err != nil {
-		// Only a rejected password counts toward the throttle; environmental
-		// errors must not lock out the (single) legitimate client.
-		if errors.Is(err, errBadCredentials) {
-			s.noteLoginFailure()
-		}
+	if err := s.throttledLogin(w, r, login); err != nil {
 		s.writeAPIError(w, err)
 		return
 	}
-	s.noteLoginSuccess()
 
 	notes, pokes, err := s.core.Notifications(100)
 	if err != nil {
@@ -853,6 +868,10 @@ func (s *AppServer) apiChangeAppPass(w http.ResponseWriter, r *http.Request) {
 	if !readPost(w, r, form) {
 		return
 	}
+	if err := s.checkAppPassword(form.AppPW); err != nil {
+		s.writeAPIError(w, fmt.Errorf("change app pass error: %w", err))
+		return
+	}
 
 	// Serialize against Lock/Unlock. Changing the password tears down every
 	// session (deauth) and mints a fresh one; without this a concurrent biometric
@@ -1092,7 +1111,10 @@ func (s *AppServer) actuallyLogin(w http.ResponseWriter, r *http.Request, login 
 			return errors.New("companion app is not paired")
 		}
 	}
-	pass, err := s.resolvePass(login.Pass, r)
+	// Not resolvePass: core.Login below is the password check, and apiLogin
+	// does the throttle accounting for it, so checking here would cost a second
+	// key derivation and count a wrong password twice.
+	pass, err := s.passOrCached(login.Pass, r)
 	defer zero(pass)
 	if err != nil {
 		// A missing or unreadable cached password is environmental, not a
@@ -1575,9 +1597,23 @@ func clearCookie(name string, w http.ResponseWriter) {
 	})
 }
 
-// resolvePass returns the appPW if it has a value, but if not, it attempts
-// to retrieve the cached password using the information in cookies.
+// resolvePass returns the appPW if it has a value, after checking it under the
+// password throttle. If not, it attempts to retrieve the cached password using
+// the information in cookies. A cached password is not a guess, so it is not
+// checked or counted.
 func (s *AppServer) resolvePass(appPW []byte, r *http.Request) ([]byte, error) {
+	if len(appPW) > 0 {
+		if err := s.checkAppPassword(appPW); err != nil {
+			return nil, err
+		}
+		return appPW, nil
+	}
+	return s.passOrCached(nil, r)
+}
+
+// passOrCached is resolvePass without the password check. Only actuallyLogin
+// should use it.
+func (s *AppServer) passOrCached(appPW []byte, r *http.Request) ([]byte, error) {
 	if len(appPW) > 0 {
 		return appPW, nil
 	}
@@ -1608,7 +1644,7 @@ func (s *AppServer) checkSendRequiresPassword(pass encode.PassBytes, emptyPassMs
 	if len(pass) == 0 {
 		return errors.New(emptyPassMsg)
 	}
-	if err := s.core.VerifyPassword(pass); err != nil {
+	if err := s.checkAppPassword(pass); err != nil {
 		return fmt.Errorf("password error: %w", err)
 	}
 	return nil
