@@ -5,8 +5,64 @@ package appserver
 
 import (
 	"crypto/subtle"
+	"net"
 	"net/http"
+	"strings"
 )
+
+// hostMiddleware rejects requests whose Host header names a host this server
+// was not set up to answer for. That defeats DNS rebinding: a web page on
+// evil.example can re-point its own name at 127.0.0.1, and the browser then
+// treats the wallet's loopback server as same-origin with the page. Cookies
+// do not follow (they belong to 127.0.0.1), but every unauthenticated route
+// would answer it: login guessing, the global login throttle (locking the user
+// out), and /api/init on a fresh install. The browser still sends the
+// attacker's name as the Host header, which is what this checks.
+//
+// Allowed hosts:
+//   - any IP literal. Rebinding needs a DNS name, so an IP is never an
+//     attacker's origin. This keeps 0.0.0.0 and LAN IP binds working.
+//   - "localhost", which browsers resolve to loopback without DNS.
+//   - the host of the configured listen address (--webaddr), which may be a
+//     name.
+//   - the onion address, when the hidden service is on.
+func (s *AppServer) hostMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !s.allowedHost(r.Host) {
+			http.Error(w, "invalid Host header", http.StatusMisdirectedRequest)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+// allowedHost reports whether hostport, a Host header value, names this
+// server. See hostMiddleware.
+func (s *AppServer) allowedHost(hostport string) bool {
+	host := hostOnly(hostport)
+	if host == "" {
+		return false
+	}
+	if net.ParseIP(host) != nil || host == "localhost" {
+		return true
+	}
+	if cfgHost := hostOnly(s.cfgAddr); cfgHost != "" && host == cfgHost {
+		return true
+	}
+	// s.onion is set in Connect before any listener serves.
+	return s.onion != "" && host == hostOnly(s.onion)
+}
+
+// hostOnly returns the lowercased host part of a host[:port] string, without
+// IPv6 brackets or a trailing dot.
+func hostOnly(hostport string) string {
+	host := hostport
+	if h, _, err := net.SplitHostPort(hostport); err == nil {
+		host = h
+	}
+	host = strings.TrimSuffix(strings.TrimPrefix(strings.TrimSuffix(host, "]"), "["), ".")
+	return strings.ToLower(host)
+}
 
 // capabilityMiddleware gates every request on a capability token when one is
 // configured (Config.CapabilityToken, set by the mobile build). The token is
