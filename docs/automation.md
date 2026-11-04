@@ -98,19 +98,20 @@ asset's smallest unit (satoshis for BTC).
 
 ### Common endpoints
 
-| Route                   | Reads/Writes | App password?       |
-| ----------------------- | ------------ | ------------------- |
-| `/api/user`             | read         | no                  |
-| `/api/balance`          | read         | no                  |
-| `/api/depositaddress`   | write        | no                  |
-| `/api/validateaddress`  | read         | no                  |
-| `/api/txfee`            | read         | no                  |
-| `/api/txhistory`        | read         | no                  |
-| `/api/send`             | write        | **yes** (`"pw"`)    |
-| `/api/bridge`           | write        | **yes** (`"pass"`)  |
-| `/api/approvebridgecontract`, `/api/unapprovebridgecontract` | write | **yes** (`"pass"`) |
-| `/api/generateapitoken` | write        | session (bootstrap) |
-| `/api/revokeapitoken`   | write        | token or session    |
+| Route                          | Reads/Writes | App password?       |
+| ------------------------------ | ------------ | ------------------- |
+| `/api/user`                    | read         | no                  |
+| `/api/balance`                 | read         | no                  |
+| `/api/depositaddress`          | write        | no                  |
+| `/api/validateaddress`         | read         | no                  |
+| `/api/txfee`                   | read         | no                  |
+| `/api/txhistory`               | read         | no                  |
+| `/api/send`                    | write        | **yes** (`"pw"`)    |
+| `/api/bridge`                  | write        | **yes** (`"pass"`)  |
+| `/api/approvebridgecontract`   | write        | **yes** (`"pass"`)  |
+| `/api/unapprovebridgecontract` | write        | **yes** (`"pass"`)  |
+| `/api/generateapitoken`        | write        | session (bootstrap) |
+| `/api/revokeapitoken`          | write        | token or session    |
 
 These are a subset; any endpoint behind the authenticated API accepts the token.
 
