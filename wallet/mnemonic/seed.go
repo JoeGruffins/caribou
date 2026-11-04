@@ -31,7 +31,12 @@ func New() ([]byte, string) {
 }
 
 // DecodeMnemonic decodes the entropy, time, and checksum from the mnemonic
-// seed and validates the checksum.
+// seed and validates the checksum. Words are matched case-insensitively.
+//
+// Errors never contain the input words, or the nearby words of the list. They
+// reach the app log, which users export for support, and a typo in a seed word
+// is usually one letter off the real word. A bad word is reported by its
+// position only.
 func DecodeMnemonic(mnemonic string) ([]byte, time.Time, error) {
 	words := strings.Fields(mnemonic)
 	if len(words) != 15 {
@@ -40,9 +45,9 @@ func DecodeMnemonic(mnemonic string) ([]byte, time.Time, error) {
 	buf := make([]byte, entropyBytes+timeBytes+1) // extra byte for checksum bits
 	var cursor int
 	for i := range words {
-		v, err := wordIndex(words[i])
+		v, err := wordIndex(strings.ToLower(words[i]))
 		if err != nil {
-			return nil, time.Time{}, err
+			return nil, time.Time{}, fmt.Errorf("word %d is not in the word list", i+1)
 		}
 		bs := make([]byte, 2)
 		binary.BigEndian.PutUint16(bs, v)
@@ -147,15 +152,16 @@ func generateMnemonic(entropy []byte, stamp time.Time) string {
 	return strings.Join(words, " ")
 }
 
+var errUnknownWord = errors.New("word not in list")
+
+// wordIndex returns the index of word in the word list. The error does not
+// include the word, see DecodeMnemonic.
 func wordIndex(word string) (uint16, error) {
 	i := sort.Search(len(wordList), func(i int) bool {
 		return strings.Compare(wordList[i], word) >= 0
 	})
-	if i == len(wordList) {
-		return 0, fmt.Errorf("word %q exceeded range", word)
-	}
-	if wordList[i] != word {
-		return 0, fmt.Errorf("word %q not known. closest match lexicographically is %q", word, wordList[i])
+	if i == len(wordList) || wordList[i] != word {
+		return 0, errUnknownWord
 	}
 	return uint16(i), nil
 }

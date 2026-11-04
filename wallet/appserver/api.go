@@ -426,7 +426,12 @@ func (s *AppServer) apiInit(w http.ResponseWriter, r *http.Request) {
 	}
 	mnemonicSeed, err := s.core.InitializeClient(init.Pass, seed)
 	if err != nil {
-		s.writeAPIError(w, fmt.Errorf("initialization error: %w", err))
+		err = fmt.Errorf("initialization error: %w", err)
+		if seed != nil {
+			s.writeSeedError(w, "initialize with seed", err)
+		} else {
+			s.writeAPIError(w, err)
+		}
 		return
 	}
 	err = s.actuallyLogin(w, r, &loginForm{Pass: init.Pass})
@@ -468,7 +473,7 @@ func (s *AppServer) apiValidateSeed(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if _, _, err := mnemonic.DecodeMnemonic(form.Seed); err != nil {
-		s.writeAPIError(w, fmt.Errorf("invalid seed: %w", err))
+		s.writeSeedError(w, "validate seed", fmt.Errorf("invalid seed: %w", err))
 		return
 	}
 	writeJSON(w, simpleAck())
@@ -912,7 +917,7 @@ func (s *AppServer) apiResetAppPassword(w http.ResponseWriter, r *http.Request) 
 
 	err := s.core.ResetAppPass(form.NewPass, form.Seed)
 	if err != nil {
-		s.writeAPIError(w, err)
+		s.writeSeedError(w, "reset app password", err)
 		return
 	}
 
@@ -1532,20 +1537,32 @@ func (s *AppServer) apiWalletLogFilePath(w http.ResponseWriter, r *http.Request)
 // writeAPIError logs the formatted error and sends a standardResponse with the
 // error message.
 func (s *AppServer) writeAPIError(w http.ResponseWriter, err error) {
+	log.Error(err.Error())
+	writeJSON(w, apiErrorResponse(err))
+}
+
+// apiErrorResponse builds the response body for an API error.
+func apiErrorResponse(err error) *standardResponse {
 	var cErr *core.Error
 	var code *int
 	if errors.As(err, &cErr) {
 		code = cErr.Code()
 	}
-
-	innerErr := core.UnwrapErr(err)
-	resp := &standardResponse{
+	return &standardResponse{
 		OK:   false,
-		Msg:  innerErr.Error(),
+		Msg:  core.UnwrapErr(err).Error(),
 		Code: code,
 	}
-	log.Error(err.Error())
-	writeJSON(w, resp)
+}
+
+// writeSeedError is writeAPIError for requests that carry a seed. The client
+// gets the same response, but the log gets only a fixed message naming the
+// operation. The error text could quote the seed, and the log is exported for
+// support. Mnemonic decode errors already leave the words out, but this keeps
+// it that way for errors from anywhere else on these paths.
+func (s *AppServer) writeSeedError(w http.ResponseWriter, op string, err error) {
+	log.Errorf("%s failed (error not logged, the request held a seed)", op)
+	writeJSON(w, apiErrorResponse(err))
 }
 
 // setCookie sets the value of a cookie in the http response.
