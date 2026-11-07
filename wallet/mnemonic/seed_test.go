@@ -136,8 +136,7 @@ func TestDecodeMnemonicCase(t *testing.T) {
 }
 
 // TestDecodeMnemonicErrorsOmitWords checks that a decode error names the bad
-// word by position only. The error text reaches the exportable app log, and a
-// typo, or the closest list word, gives away the real seed word.
+// word by position only.
 func TestDecodeMnemonicErrorsOmitWords(t *testing.T) {
 	words := strings.Fields(mnemonicVectors[3].mnemonic)
 	for i := range words {
@@ -153,7 +152,7 @@ func TestDecodeMnemonicErrorsOmitWords(t *testing.T) {
 			last++
 		}
 		bad[i] = w[:len(w)-1] + string(last)
-		if _, err := wordIndex(bad[i]); err == nil {
+		if _, ok := wordIndex(bad[i]); ok {
 			// The typo is another list word, which the checksum handles.
 			continue
 		}
@@ -166,25 +165,25 @@ func TestDecodeMnemonicErrorsOmitWords(t *testing.T) {
 
 func TestFindWordIndex(t *testing.T) {
 	for i := range wordList {
-		j, err := wordIndex(wordList[i])
-		if err != nil {
-			t.Fatal(err)
+		j, ok := wordIndex(wordList[i])
+		if !ok {
+			t.Fatalf("%q not found", wordList[i])
 		}
 		if i != int(j) {
 			t.Fatalf("wrong index %d returned for %q. expected %d", j, wordList[i], i)
 		}
 	}
 
-	if _, err := wordIndex("blah"); err == nil {
-		t.Fatal("no error for blah")
+	if _, ok := wordIndex("blah"); ok {
+		t.Fatal("blah found")
 	}
 
-	if _, err := wordIndex("aaa"); err == nil {
-		t.Fatal("no error for aaa")
+	if _, ok := wordIndex("aaa"); ok {
+		t.Fatal("aaa found")
 	}
 
-	if _, err := wordIndex("zzz"); err == nil {
-		t.Fatal("no error for zzz")
+	if _, ok := wordIndex("zzz"); ok {
+		t.Fatal("zzz found")
 	}
 }
 

@@ -1,6 +1,11 @@
 // This code is available on the terms of the project LICENSE.md file,
 // also available online at https://blueoakcouncil.org/license/1.0.0.
 
+// Package mnemonic encodes and decodes the app seed as a mnemonic word list.
+//
+// Errors must never include seed words, or nearby words from the word list. A
+// typo in a seed word is usually one letter off the real word, so either one
+// gives the word away. Report a bad word by its position instead.
 package mnemonic
 
 import (
@@ -32,21 +37,16 @@ func New() ([]byte, string) {
 
 // DecodeMnemonic decodes the entropy, time, and checksum from the mnemonic
 // seed and validates the checksum. Words are matched case-insensitively.
-//
-// Errors never contain the input words, or the nearby words of the list. They
-// reach the app log, which users export for support, and a typo in a seed word
-// is usually one letter off the real word. A bad word is reported by its
-// position only.
 func DecodeMnemonic(mnemonic string) ([]byte, time.Time, error) {
-	words := strings.Fields(mnemonic)
+	words := strings.Fields(strings.ToLower(mnemonic))
 	if len(words) != 15 {
 		return nil, time.Time{}, fmt.Errorf("expected 15 words, got %d", len(words))
 	}
 	buf := make([]byte, entropyBytes+timeBytes+1) // extra byte for checksum bits
 	var cursor int
 	for i := range words {
-		v, err := wordIndex(strings.ToLower(words[i]))
-		if err != nil {
+		v, ok := wordIndex(words[i])
+		if !ok {
 			return nil, time.Time{}, fmt.Errorf("word %d is not in the word list", i+1)
 		}
 		bs := make([]byte, 2)
@@ -152,16 +152,14 @@ func generateMnemonic(entropy []byte, stamp time.Time) string {
 	return strings.Join(words, " ")
 }
 
-var errUnknownWord = errors.New("word not in list")
-
-// wordIndex returns the index of word in the word list. The error does not
-// include the word, see DecodeMnemonic.
-func wordIndex(word string) (uint16, error) {
+// wordIndex returns the index of word in the word list, and false if the word
+// is not in the list.
+func wordIndex(word string) (uint16, bool) {
 	i := sort.Search(len(wordList), func(i int) bool {
 		return strings.Compare(wordList[i], word) >= 0
 	})
 	if i == len(wordList) || wordList[i] != word {
-		return 0, errUnknownWord
+		return 0, false
 	}
-	return uint16(i), nil
+	return uint16(i), true
 }

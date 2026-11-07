@@ -473,7 +473,10 @@ func (s *AppServer) apiValidateSeed(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if _, _, err := mnemonic.DecodeMnemonic(form.Seed); err != nil {
-		s.writeSeedError(w, "validate seed", fmt.Errorf("invalid seed: %w", err))
+		// A rejected seed is the expected negative result here, not an
+		// error. The error text is left out of the log, as in writeSeedError.
+		log.Debug("validate seed: seed rejected")
+		writeJSON(w, apiErrorResponse(fmt.Errorf("invalid seed: %w", err)))
 		return
 	}
 	writeJSON(w, simpleAck())
@@ -1555,11 +1558,9 @@ func apiErrorResponse(err error) *standardResponse {
 	}
 }
 
-// writeSeedError is writeAPIError for requests that carry a seed. The client
-// gets the same response, but the log gets only a fixed message naming the
-// operation. The error text could quote the seed, and the log is exported for
-// support. Mnemonic decode errors already leave the words out, but this keeps
-// it that way for errors from anywhere else on these paths.
+// writeSeedError is writeAPIError for requests that carry a seed. It logs only
+// a fixed message naming the operation, not the error text, and sends the
+// client the same response as writeAPIError.
 func (s *AppServer) writeSeedError(w http.ResponseWriter, op string, err error) {
 	log.Errorf("%s failed (error not logged, the request held a seed)", op)
 	writeJSON(w, apiErrorResponse(err))
