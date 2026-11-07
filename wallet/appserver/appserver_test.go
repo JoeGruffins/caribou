@@ -159,7 +159,7 @@ func (c *TCore) ToggleWalletStatus(assetID uint32, disable bool) error {
 	c.walletDisabled = disable
 	return c.walletStatusErr
 }
-func (c *TCore) ChangeAppPass(appPW, newAppPW []byte) error                         { return nil }
+func (c *TCore) ChangeAppPass(appPW, newAppPW []byte) error                         { return c.verifyPasswordErr }
 func (c *TCore) ResetAppPass(newAppPW []byte, seed string) error                    { return c.resetAppPassErr }
 func (c *TCore) SetWalletPassword(appPW []byte, assetID uint32, newPW []byte) error { return nil }
 func (c *TCore) NewDepositAddress(assetID uint32) (string, error)                   { return "", nil }
@@ -197,6 +197,9 @@ func (c *TCore) AckNotes(ids []util.Bytes) {}
 func (c *TCore) Logout() error { c.logoutCalls++; return c.logoutErr }
 
 func (c *TCore) ExportSeed(pw []byte) (string, error) {
+	if c.verifyPasswordErr != nil {
+		return "", c.verifyPasswordErr
+	}
 	return "seed words here", nil
 }
 func (c *TCore) WalletLogFilePath(uint32) (string, error) {
@@ -206,7 +209,7 @@ func (c *TCore) RecoverWallet(uint32, []byte, bool) error {
 	return nil
 }
 func (c *TCore) WalletRestorationInfo(pw []byte, assetID uint32) ([]*asset.WalletRestoration, error) {
-	return nil, nil
+	return nil, c.verifyPasswordErr
 }
 func (c *TCore) WalletPeers(assetID uint32) ([]*asset.WalletPeer, error) {
 	return nil, nil

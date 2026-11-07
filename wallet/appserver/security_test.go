@@ -8,6 +8,7 @@ package appserver
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -16,8 +17,12 @@ import (
 	"testing"
 	"time"
 
+	"github.com/bisoncraft/caribou/util/encrypt"
 	"github.com/gorilla/websocket"
 )
+
+// errWrongPass is how core reports a wrong app password.
+var errWrongPass = fmt.Errorf("outer key deserialization error: %w", encrypt.ErrIncorrectPassword)
 
 func TestCapabilityMiddleware(t *testing.T) {
 	const token = "00112233445566778899aabbccddeeff"
@@ -294,7 +299,7 @@ func TestPasswordRoutesShareThrottle(t *testing.T) {
 			log = tLogger
 			t.Cleanup(func() { log = prevLog })
 
-			tCore.verifyPasswordErr = errors.New("wrong password")
+			tCore.verifyPasswordErr = errWrongPass
 			for i := 0; i <= passFailFree; i++ {
 				if resp := rt.call(s); strings.Contains(resp, "too many") {
 					t.Fatalf("throttled after %d wrong guesses: %s", i, resp)
@@ -323,12 +328,35 @@ func TestPasswordRoutesShareThrottle(t *testing.T) {
 	}
 }
 
+// TestPasswordCheckOtherErrorsNotCounted checks that an error other than a
+// wrong password, from a route that hands the password to core, is returned
+// but does not count toward the throttle.
+func TestPasswordCheckOtherErrorsNotCounted(t *testing.T) {
+	s, tCore, shutdown := newTServer(t, false)
+	defer shutdown()
+	prevLog := log
+	log = tLogger
+	t.Cleanup(func() { log = prevLog })
+
+	tCore.verifyPasswordErr = errors.New("db closed")
+	for i := 0; i <= passFailFree; i++ {
+		rec := httptest.NewRecorder()
+		s.apiExportSeed(rec, httptest.NewRequest(http.MethodPost, "/", strings.NewReader(`{"pass":"right"}`)))
+		if !strings.Contains(rec.Body.String(), "db closed") {
+			t.Fatalf("core error not returned: %s", rec.Body.String())
+		}
+	}
+	if s.passFails != 0 {
+		t.Fatalf("%d non-password errors counted as wrong guesses", s.passFails)
+	}
+}
+
 // TestPasswordThrottleConcurrent checks that concurrent wrong guesses cannot
 // all get past the throttle check before any failure is counted.
 func TestPasswordThrottleConcurrent(t *testing.T) {
 	s, tCore, shutdown := newTServer(t, false)
 	defer shutdown()
-	tCore.verifyPasswordErr = errors.New("wrong password")
+	tCore.verifyPasswordErr = errWrongPass
 	tCore.verifyPasswordDelay = 10 * time.Millisecond
 
 	const n = 20
@@ -360,7 +388,7 @@ func TestResolvePassWrongPassword(t *testing.T) {
 	defer shutdown()
 	req := httptest.NewRequest(http.MethodPost, "/", nil)
 
-	tCore.verifyPasswordErr = errors.New("wrong password")
+	tCore.verifyPasswordErr = errWrongPass
 	if _, err := s.resolvePass([]byte("guess"), req); !errors.Is(err, errBadCredentials) {
 		t.Fatalf("wrong password not reported as bad credentials: %v", err)
 	}

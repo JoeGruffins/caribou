@@ -342,11 +342,11 @@ func (s *AppServer) apiExportSeed(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	r.Close = true
-	if err := s.checkAppPassword(form.Pass); err != nil {
-		s.writeAPIError(w, fmt.Errorf("error exporting seed: %w", err))
-		return
-	}
-	seed, err := s.core.ExportSeed(form.Pass)
+	var seed string
+	err := s.withAppPassword(func() (err error) {
+		seed, err = s.core.ExportSeed(form.Pass)
+		return err
+	})
 	if err != nil {
 		s.writeAPIError(w, fmt.Errorf("error exporting seed: %w", err))
 		return
@@ -372,13 +372,13 @@ func (s *AppServer) apiRestoreWalletInfo(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	if err := s.checkAppPassword(form.Pass); err != nil {
-		s.writeAPIError(w, fmt.Errorf("error getting restoration info: %w", err))
-		return
-	}
-	info, err := s.core.WalletRestorationInfo(form.Pass, form.AssetID)
+	var info []*asset.WalletRestoration
+	err := s.withAppPassword(func() (err error) {
+		info, err = s.core.WalletRestorationInfo(form.Pass, form.AssetID)
+		return err
+	})
 	if err != nil {
-		s.writeAPIError(w, fmt.Errorf("error updating cert: %w", err))
+		s.writeAPIError(w, fmt.Errorf("error getting restoration info: %w", err))
 		return
 	}
 
@@ -554,13 +554,12 @@ func (e badCredentials) Error() string        { return e.err.Error() }
 func (e badCredentials) Unwrap() error        { return e.err }
 func (e badCredentials) Is(target error) bool { return target == errBadCredentials }
 
-// throttledLogin is actuallyLogin under the password throttle, as one step
-// with respect to other password checks (see passCheckMtx).
+// throttledLogin is actuallyLogin under the password throttle.
 func (s *AppServer) throttledLogin(w http.ResponseWriter, r *http.Request, login *loginForm) error {
 	s.passCheckMtx.Lock()
 	defer s.passCheckMtx.Unlock()
 	if d := s.passwordThrottle(); d > 0 {
-		return throttledErr(d)
+		return passwordThrottled{d}
 	}
 	if err := s.actuallyLogin(w, r, login); err != nil {
 		// Only a rejected password counts toward the throttle; environmental
@@ -876,20 +875,24 @@ func (s *AppServer) apiChangeAppPass(w http.ResponseWriter, r *http.Request) {
 	if !readPost(w, r, form) {
 		return
 	}
-	if err := s.checkAppPassword(form.AppPW); err != nil {
-		s.writeAPIError(w, fmt.Errorf("change app pass error: %w", err))
-		return
-	}
-
 	// Serialize against Lock/Unlock. Changing the password tears down every
 	// session (deauth) and mints a fresh one; without this a concurrent biometric
 	// Unlock could mint a grant against a token this deauth is about to drop,
-	// leaving that unlock stranded on the login gate.
-	s.sessionMtx.Lock()
-	defer s.sessionMtx.Unlock()
+	// leaving that unlock stranded on the login gate. The password throttle's
+	// lock is taken first.
+	var sessionLocked bool
+	defer func() {
+		if sessionLocked {
+			s.sessionMtx.Unlock()
+		}
+	}()
 
 	// Update application password.
-	err := s.core.ChangeAppPass(form.AppPW, form.NewAppPW)
+	err := s.withAppPassword(func() error {
+		s.sessionMtx.Lock()
+		sessionLocked = true
+		return s.core.ChangeAppPass(form.AppPW, form.NewAppPW)
+	})
 	if err != nil {
 		s.writeAPIError(w, fmt.Errorf("change app pass error: %w", err))
 		return
@@ -1119,9 +1122,9 @@ func (s *AppServer) actuallyLogin(w http.ResponseWriter, r *http.Request, login 
 			return errors.New("companion app is not paired")
 		}
 	}
-	// Not resolvePass: core.Login below is the password check, and apiLogin
-	// does the throttle accounting for it, so checking here would cost a second
-	// key derivation and count a wrong password twice.
+	// Not resolvePass: core.Login below is the password check, so checking
+	// here too would cost a second key derivation and count a wrong password
+	// twice.
 	pass, err := s.passOrCached(login.Pass, r)
 	defer zero(pass)
 	if err != nil {
@@ -1562,7 +1565,12 @@ func (s *AppServer) apiWalletLogFilePath(w http.ResponseWriter, r *http.Request)
 // writeAPIError logs the formatted error and sends a standardResponse with the
 // error message.
 func (s *AppServer) writeAPIError(w http.ResponseWriter, err error) {
-	log.Error(err.Error())
+	// A wrong or throttled password is an expected outcome, not an error.
+	if errors.Is(err, errBadCredentials) || errors.As(err, new(passwordThrottled)) {
+		log.Debug(err.Error())
+	} else {
+		log.Error(err.Error())
+	}
 	writeJSON(w, apiErrorResponse(err))
 }
 
@@ -1629,8 +1637,8 @@ func (s *AppServer) resolvePass(appPW []byte, r *http.Request) ([]byte, error) {
 	return s.passOrCached(nil, r)
 }
 
-// passOrCached is resolvePass without the password check. Only actuallyLogin
-// should use it.
+// passOrCached is resolvePass without the password check. The caller must check
+// the password under the password throttle.
 func (s *AppServer) passOrCached(appPW []byte, r *http.Request) ([]byte, error) {
 	if len(appPW) > 0 {
 		return appPW, nil
@@ -1645,13 +1653,10 @@ func (s *AppServer) passOrCached(appPW []byte, r *http.Request) ([]byte, error) 
 	return cachedPass, nil
 }
 
-// requireSendPassword gates endpoints that move or authorize value but, unlike
-// '/send', do not pass a password to core (they rely on the wallet already
-// being unlocked). It applies the same rule as '/send': the caller needs the
-// app password, either explicit in the request or the session's cached one,
-// and with send-requires-password on it must be explicit. emptyPassMsg is
-// returned when the setting is on and none was supplied. An API token caller
-// has no cached password, so it always has to send one.
+// requireSendPassword checks for the app password the way '/send' does: an
+// explicit password, or the session's cached one, and only an explicit one
+// when send-requires-password is on. emptyPassMsg is returned when the setting
+// is on and none was supplied.
 func (s *AppServer) requireSendPassword(pass encode.PassBytes, r *http.Request, emptyPassMsg string) error {
 	requirePW, err := s.core.SendRequiresPassword()
 	if err != nil {

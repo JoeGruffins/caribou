@@ -297,13 +297,12 @@ type AppServer struct {
 	// authMtx.
 	pendingGrants map[string]*sessionGrant
 
-	// passCheckMtx serializes app password checks (checkAppPassword and
-	// apiLogin), so the throttle check, the key derivation and the failure
-	// accounting are one step. Without it, a burst of concurrent guesses
-	// would all pass the throttle check before any failure was counted. Take
-	// it before sessionMtx, never while holding it.
+	// passCheckMtx serializes app password checks, so the throttle check, the
+	// key derivation and the failure accounting are one step. Without it, a
+	// burst of concurrent guesses would all pass the throttle check before any
+	// failure was counted. It also guards passFails and passLockUntil. Take it
+	// before sessionMtx, never while holding it.
 	passCheckMtx  sync.Mutex
-	passMtx       sync.Mutex
 	passFails     int
 	passLockUntil time.Time
 
@@ -1139,14 +1138,9 @@ func hashToken(token string) string {
 }
 
 // passwordThrottle returns the remaining lockout duration, or 0 if an app
-// password may be tried now. One counter covers every route that checks the
-// app password (login, seed export, password change, sends with an explicit
-// password, ...), so no route is a free guessing oracle. It is global, not
-// per-IP: the wallet is single-client and the gate above already limits who
-// can reach the server.
+// password may be tried now. The counter is global, not per-IP. The
+// passCheckMtx must be held.
 func (s *AppServer) passwordThrottle() time.Duration {
-	s.passMtx.Lock()
-	defer s.passMtx.Unlock()
 	if d := time.Until(s.passLockUntil); d > 0 {
 		return d
 	}
@@ -1154,11 +1148,9 @@ func (s *AppServer) passwordThrottle() time.Duration {
 }
 
 // notePasswordFailure records a wrong app password. Once the free-attempt
-// budget is exhausted it extends a capped exponential lockout window, blunting
-// password brute-force from anything that can reach the loopback server.
+// budget is exhausted it extends a capped exponential lockout window. The
+// passCheckMtx must be held.
 func (s *AppServer) notePasswordFailure() {
-	s.passMtx.Lock()
-	defer s.passMtx.Unlock()
 	s.passFails++
 	if n := s.passFails - passFailFree; n > 0 {
 		backoff := passBackoffBase << min(n-1, 20) // cap the shift well short of overflow
@@ -1169,36 +1161,45 @@ func (s *AppServer) notePasswordFailure() {
 	}
 }
 
-// notePasswordSuccess clears the failed-password state.
+// notePasswordSuccess clears the failed-password state. The passCheckMtx must
+// be held.
 func (s *AppServer) notePasswordSuccess() {
-	s.passMtx.Lock()
-	defer s.passMtx.Unlock()
 	s.passFails = 0
 	s.passLockUntil = time.Time{}
 }
 
-// throttledErr is returned while the password throttle is locked out.
-func throttledErr(d time.Duration) error {
-	return fmt.Errorf("too many wrong password attempts, try again in %s", d.Round(time.Second))
+// passwordThrottled is returned while the password throttle is locked out.
+type passwordThrottled struct{ wait time.Duration }
+
+func (e passwordThrottled) Error() string {
+	return fmt.Sprintf("too many wrong password attempts, try again in %s", e.wait.Round(time.Second))
 }
 
-// checkAppPassword verifies an app password supplied by the caller, under the
-// shared throttle. Every route that checks a caller-supplied app password must
-// go through here (directly or via resolvePass) rather than call
-// core.VerifyPassword or pass the password straight to core, so each guess
-// counts. A wrong password is returned as badCredentials.
-func (s *AppServer) checkAppPassword(pw []byte) error {
+// withAppPassword runs fn, which checks a caller-supplied app password, under
+// the password throttle. fn is not run while the throttle is locked out. An
+// error from fn that wraps encrypt.ErrIncorrectPassword counts as a wrong
+// guess and is returned as badCredentials. Other errors are not counted.
+func (s *AppServer) withAppPassword(fn func() error) error {
 	s.passCheckMtx.Lock()
 	defer s.passCheckMtx.Unlock()
 	if d := s.passwordThrottle(); d > 0 {
-		return throttledErr(d)
+		return passwordThrottled{d}
 	}
-	if err := s.core.VerifyPassword(pw); err != nil {
-		s.notePasswordFailure()
-		return badCredentials{fmt.Errorf("wrong password: %w", err)}
+	if err := fn(); err != nil {
+		if errors.Is(err, encrypt.ErrIncorrectPassword) {
+			s.notePasswordFailure()
+			return badCredentials{err}
+		}
+		return err
 	}
 	s.notePasswordSuccess()
 	return nil
+}
+
+// checkAppPassword verifies a caller-supplied app password under the password
+// throttle.
+func (s *AppServer) checkAppPassword(pw []byte) error {
+	return s.withAppPassword(func() error { return s.core.VerifyPassword(pw) })
 }
 
 // getCachedPassword retrieves the cached password for the user identified by authToken and
