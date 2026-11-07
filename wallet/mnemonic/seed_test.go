@@ -3,6 +3,7 @@ package mnemonic
 import (
 	"bytes"
 	"encoding/hex"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -92,11 +93,6 @@ func TestDecodeMnemonicErrors(t *testing.T) {
 		{"too few words", strings.Join(words[:seedWords-1], " ")},
 		{"too many words", valid + " gun"},
 		{"unknown word", strings.Join(append([]string{"notaword"}, words[1:]...), " ")},
-		// Word matching is case-sensitive, so a seed pasted or typed with any
-		// capitalization is rejected rather than normalized. Recorded here as
-		// current behavior; whether restore should lower-case its input first is
-		// a separate decision.
-		{"uppercased", strings.ToUpper(valid)},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -122,27 +118,72 @@ func TestDecodeMnemonicErrors(t *testing.T) {
 	}
 }
 
+// TestDecodeMnemonicCase checks that capitalization is not an error. Mobile
+// keyboards capitalize the first word by default.
+func TestDecodeMnemonicCase(t *testing.T) {
+	v := mnemonicVectors[3]
+	words := strings.Fields(v.mnemonic)
+	words[0] = strings.ToUpper(words[0][:1]) + words[0][1:]
+	for _, m := range []string{strings.Join(words, " "), strings.ToUpper(v.mnemonic)} {
+		entropy, _, err := DecodeMnemonic(m)
+		if err != nil {
+			t.Fatalf("DecodeMnemonic(%q): %v", m, err)
+		}
+		if hex.EncodeToString(entropy) != v.entropy {
+			t.Fatalf("DecodeMnemonic(%q) entropy %x, want %s", m, entropy, v.entropy)
+		}
+	}
+}
+
+// TestDecodeMnemonicErrorsOmitWords checks that a decode error names the bad
+// word by position only.
+func TestDecodeMnemonicErrorsOmitWords(t *testing.T) {
+	words := strings.Fields(mnemonicVectors[3].mnemonic)
+	for i := range words {
+		bad := make([]string, len(words))
+		copy(bad, words)
+		// Change the last letter, so the typo sorts right next to the real
+		// word in the list.
+		w := bad[i]
+		last := w[len(w)-1]
+		if last == 'z' {
+			last = 'a'
+		} else {
+			last++
+		}
+		bad[i] = w[:len(w)-1] + string(last)
+		if _, ok := wordIndex(bad[i]); ok {
+			// The typo is another list word, which the checksum handles.
+			continue
+		}
+		_, _, err := DecodeMnemonic(strings.Join(bad, " "))
+		if want := fmt.Sprintf("word %d is not in the word list", i+1); err.Error() != want {
+			t.Fatalf("typo in word %d: got error %q, want %q", i+1, err, want)
+		}
+	}
+}
+
 func TestFindWordIndex(t *testing.T) {
 	for i := range wordList {
-		j, err := wordIndex(wordList[i])
-		if err != nil {
-			t.Fatal(err)
+		j, ok := wordIndex(wordList[i])
+		if !ok {
+			t.Fatalf("%q not found", wordList[i])
 		}
 		if i != int(j) {
 			t.Fatalf("wrong index %d returned for %q. expected %d", j, wordList[i], i)
 		}
 	}
 
-	if _, err := wordIndex("blah"); err == nil {
-		t.Fatal("no error for blah")
+	if _, ok := wordIndex("blah"); ok {
+		t.Fatal("blah found")
 	}
 
-	if _, err := wordIndex("aaa"); err == nil {
-		t.Fatal("no error for aaa")
+	if _, ok := wordIndex("aaa"); ok {
+		t.Fatal("aaa found")
 	}
 
-	if _, err := wordIndex("zzz"); err == nil {
-		t.Fatal("no error for zzz")
+	if _, ok := wordIndex("zzz"); ok {
+		t.Fatal("zzz found")
 	}
 }
 
