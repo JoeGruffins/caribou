@@ -659,9 +659,7 @@ func TestAcrossInitiateBridgeErrors(t *testing.T) {
 }
 
 // TestAcrossDepositParamsFromQuote checks the local bounds on an Across
-// suggested-fees response. The deposit's outputAmount is amount minus the
-// API's relay fee, so a bad fee from the API would otherwise make a deposit
-// any relayer can fill for almost nothing.
+// suggested-fees response.
 func TestAcrossDepositParamsFromQuote(t *testing.T) {
 	now := time.Unix(1_800_000_000, 0)
 	unix := func(d time.Duration) string { return strconv.FormatInt(now.Add(d).Unix(), 10) }

@@ -445,10 +445,7 @@ func (b *acrossBridge) initiateBridge(txOpts *bind.TransactOpts, sourceAssetID, 
 		txOpts.Value = amount
 	}
 
-	// TODO: also compare against a fee the caller approved. Nothing previews
-	// the relay fee yet (no UI bridges, and /bridgefeesandlimits does not
-	// return it), so for now the bounds in acrossDepositParamsFromQuote are
-	// the only check.
+	// TODO: also compare the relay fee against one the caller approved.
 
 	return b.spokePool.DepositV3(txOpts, depositor, recipient, sourceAsset.address, destAsset.address,
 		amount, params.outputAmount, destChainIdBig, exclusiveRelayer, params.quoteTimestamp,
@@ -457,12 +454,8 @@ func (b *acrossBridge) initiateBridge(txOpts *bind.TransactOpts, sourceAssetID, 
 
 const (
 	// maxAcrossRelayFeePct is the largest relay fee, as a percentage of the
-	// amount, this wallet will deposit with. The fee comes from the Across
-	// API at execution time, and outputAmount (what a relayer must pay out
-	// on the destination chain) is amount minus that fee, so a bad answer
-	// from the API could otherwise make a deposit any relayer fills for
-	// almost nothing. Real Across fees are well under 1%, more for very small
-	// amounts where the destination gas dominates.
+	// amount, this wallet will deposit with. Real Across fees are well under
+	// 1%, more for very small amounts where the destination gas dominates.
 	maxAcrossRelayFeePct = 5
 	// maxAcrossQuoteAge bounds how far the quote timestamp may be from now,
 	// either way. The SpokePool also rejects stale quotes, but this keeps
@@ -482,12 +475,8 @@ type acrossDepositParams struct {
 	fillDeadline   uint32
 }
 
-// acrossDepositParamsFromQuote checks a suggested-fees response against local
-// bounds and returns the deposit parameters. The API is a third party, so
-// nothing in the response is taken on trust: the relay fee must leave
-// 0 < outputAmount < amount and be at most maxAcrossRelayFeePct of amount,
-// the quote timestamp must be recent, and the fill deadline must be in the
-// future but within maxAcrossFillWindow.
+// acrossDepositParamsFromQuote checks a suggested-fees response against the
+// bounds above and returns the deposit parameters.
 func acrossDepositParamsFromQuote(amount *big.Int, res *suggestedFeesRes, now time.Time) (*acrossDepositParams, error) {
 	if amount.Sign() <= 0 {
 		return nil, fmt.Errorf("bridge amount must be positive")
@@ -507,9 +496,6 @@ func acrossDepositParamsFromQuote(amount *big.Int, res *suggestedFeesRes, now ti
 			relayFee, maxAcrossRelayFeePct, amount)
 	}
 	outputAmount := new(big.Int).Sub(amount, relayFee)
-	if outputAmount.Sign() <= 0 {
-		return nil, fmt.Errorf("the Across relay fee of %s leaves nothing of the %s being bridged", relayFee, amount)
-	}
 
 	quoteTimestamp, err := acrossUnixTime(res.Timestamp, "quote timestamp")
 	if err != nil {
