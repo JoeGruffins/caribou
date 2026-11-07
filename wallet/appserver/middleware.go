@@ -13,11 +13,8 @@ import (
 // hostMiddleware rejects requests whose Host header names a host this server
 // was not set up to answer for. That defeats DNS rebinding: a web page on
 // evil.example can re-point its own name at 127.0.0.1, and the browser then
-// treats the wallet's loopback server as same-origin with the page. Cookies
-// do not follow (they belong to 127.0.0.1), but every unauthenticated route
-// would answer it: login guessing, the global login throttle (locking the user
-// out), and /api/init on a fresh install. The browser still sends the
-// attacker's name as the Host header, which is what this checks.
+// treats the loopback server as same-origin with the page. The browser still
+// sends the page's name as the Host header, which is what this checks.
 //
 // Allowed hosts:
 //   - any IP literal. Rebinding needs a DNS name, so an IP is never an
@@ -37,7 +34,7 @@ func (s *AppServer) hostMiddleware(next http.Handler) http.Handler {
 }
 
 // allowedHost reports whether hostport, a Host header value, names this
-// server. See hostMiddleware.
+// server.
 func (s *AppServer) allowedHost(hostport string) bool {
 	host := hostOnly(hostport)
 	if host == "" {
@@ -46,11 +43,8 @@ func (s *AppServer) allowedHost(hostport string) bool {
 	if net.ParseIP(host) != nil || host == "localhost" {
 		return true
 	}
-	if cfgHost := hostOnly(s.cfgAddr); cfgHost != "" && host == cfgHost {
-		return true
-	}
-	// s.onion is set in Connect before any listener serves.
-	return s.onion != "" && host == hostOnly(s.onion)
+	// onionHost is set in Connect before any listener serves.
+	return host == s.webHost || host == s.onionHost
 }
 
 // hostOnly returns the lowercased host part of a host[:port] string, without
@@ -65,8 +59,7 @@ func hostOnly(hostport string) string {
 }
 
 // capabilityMiddleware gates every request on a capability token when one is
-// configured (Config.CapabilityToken, set by the mobile build, or
-// Config.CapabilityGate, set by the desktop shells). The token is
+// configured (Config.CapabilityToken or Config.CapabilityGate). The token is
 // handed to the WebView in the bootstrap URL (?k=...) and exchanged here for an
 // HttpOnly cookie on first load; thereafter the cookie authorizes requests.
 //
@@ -76,11 +69,7 @@ func hostOnly(hostport string) string {
 // other apps cannot present the token, so they cannot reach the SPA, the
 // unauthenticated API routes (e.g. /api/login), or the notification websocket.
 //
-// The desktop shells turn it on for the same reason against web pages: with
-// DNS rebinding a page can reach the loopback server, and this leaves it
-// nothing to talk to. hostMiddleware covers the browser and CLI cases.
-//
-// When no token is configured (CLI opened from a browser) the gate is a no-op.
+// When no token is configured the gate is a no-op.
 func (s *AppServer) capabilityMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if s.capToken == "" {
