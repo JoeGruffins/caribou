@@ -1121,18 +1121,14 @@ func (w *ExchangeWallet) estimateFee(address string, value uint64) (uint64, erro
 }
 
 // maxTxFeeRate is the highest fee, in atoms per byte of signed transaction,
-// this wallet will broadcast. wallet2 prices a transaction from the daemon's
-// get_fee_estimate and uses the answer as is, and the default daemon is a
-// public node reached over plain HTTP. So the daemon, or anyone on the network
-// path, could otherwise set the fee to most of the balance, and Monero fees
-// are not recoverable.
+// this wallet will broadcast. The fee rate comes from the daemon, which may be
+// a third party, so it is not taken on trust.
 //
 // Mainnet in July 2026 quotes 4000000 atoms per weight unit at the most
 // expensive priority (Last), so this allows 5x that. A standard 1500 byte send
 // can then cost at most 0.03 XMR. For the transactions this wallet builds (at
 // most two outputs each) weight equals size, so atoms per byte is the rate the
-// daemon quoted. This is far below maxBaseFee, which only guards the fee
-// estimate arithmetic.
+// daemon quoted.
 const maxTxFeeRate = 20_000_000
 
 // checkTxFee refuses a built transaction whose fee is above maxTxFeeRate. txHex

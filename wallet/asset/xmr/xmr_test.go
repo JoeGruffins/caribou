@@ -120,9 +120,7 @@ func TestDepositAddressPersisted(t *testing.T) {
 	}
 }
 
-// TestCheckTxFee checks the per-byte fee ceiling applied before broadcast. The
-// daemon prices transactions, and it may be a third party reached over plain
-// HTTP, so the fee wallet2 built must not be taken on trust.
+// TestCheckTxFee checks the per-byte fee ceiling applied before broadcast.
 func TestCheckTxFee(t *testing.T) {
 	// A 1500 byte signed transaction, as hex.
 	tx1500 := strings.Repeat("ab", 1500)
