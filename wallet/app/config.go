@@ -54,8 +54,7 @@ type WebConfig struct {
 	NoEmbedSite bool   `long:"no-embed-site" description:"Use on-disk UI files instead of embedded resources. For development purposes."`
 	HTTPProfile bool   `long:"httpprof" description:"Start HTTP profiler on /pprof."`
 	Tor         bool   `long:"tor" description:"Enable tor hidden service"`
-	// CapabilityGate is set by the macOS desktop shell, which opens the URL
-	// from the startup banner itself. See appserver.Config.CapabilityGate.
+
 	CapabilityGate bool `long:"capabilitygate" description:"Require a per-launch token to reach the web server, for desktop shells. The URL printed at startup carries it, and a URL without it gets nothing. Not for use from a browser: the token changes on every start."`
 }
 

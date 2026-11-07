@@ -594,8 +594,8 @@ func TestUnpairCompanionDisconnectsWS(t *testing.T) {
 func TestHostAllowlist(t *testing.T) {
 	s, _, shutdown := newTServer(t, false)
 	defer shutdown()
-	s.cfgAddr = "mywallet.lan:5758"
-	s.onion = "abcdefghijklmnopqrstuvwxyz234567abcdefghijklmnopqrstuvwx.onion"
+	s.webHost = hostOnly("mywallet.lan:5758")
+	s.onionHost = hostOnly("abcdefghijklmnopqrstuvwxyz234567abcdefghijklmnopqrstuvwx.onion")
 
 	allowed := []string{
 		"127.0.0.1:5758",

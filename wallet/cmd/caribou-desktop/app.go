@@ -204,7 +204,7 @@ func mainCore() error {
 
 	webCfg := cfg.Web(clientCore, logMaker.Logger("WEB"), utc)
 	// This shell opens every window itself, so only its windows need to
-	// reach the server. See appserver.Config.CapabilityGate.
+	// reach the server.
 	webCfg.CapabilityGate = true
 	webSrv, err := appserver.New(webCfg)
 	if err != nil {
