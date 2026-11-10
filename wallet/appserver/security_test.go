@@ -235,38 +235,38 @@ func TestGrantMiddleware(t *testing.T) {
 }
 
 func TestPasswordThrottle(t *testing.T) {
-	s := &AppServer{}
+	var pt passThrottle
 
-	if d := s.passwordThrottle(); d != 0 {
-		t.Fatalf("fresh server already throttled: %v", d)
+	if d := pt.wait(); d != 0 {
+		t.Fatalf("fresh throttle already locked: %v", d)
 	}
 
 	// The free budget does not lock the account.
 	for i := 0; i < passFailFree; i++ {
-		s.notePasswordFailure()
+		pt.fail()
 	}
-	if d := s.passwordThrottle(); d != 0 {
+	if d := pt.wait(); d != 0 {
 		t.Fatalf("throttled within the free budget: %v", d)
 	}
 
 	// One more failure starts the lockout.
-	s.notePasswordFailure()
-	if d := s.passwordThrottle(); d <= 0 {
+	pt.fail()
+	if d := pt.wait(); d <= 0 {
 		t.Fatal("no lockout after exceeding the free budget")
 	}
 
 	// A success clears it.
-	s.notePasswordSuccess()
-	if d := s.passwordThrottle(); d != 0 {
+	pt.succeed()
+	if d := pt.wait(); d != 0 {
 		t.Fatalf("lockout not cleared after success: %v", d)
 	}
 }
 
-// TestPasswordRoutesShareThrottle checks that the routes taking an explicit app
-// password all count wrong guesses against the login throttle, and are refused
+// TestPasswordRoutesThrottled checks that the routes taking an explicit app
+// password all count wrong guesses against the route throttle, and are refused
 // while it is locked out, even with the right password. Before, only /login
 // was throttled, so /exportseed was a free oracle that returned the seed.
-func TestPasswordRoutesShareThrottle(t *testing.T) {
+func TestPasswordRoutesThrottled(t *testing.T) {
 	post := func(h http.HandlerFunc, body string) string {
 		t.Helper()
 		rec := httptest.NewRecorder()
@@ -305,7 +305,7 @@ func TestPasswordRoutesShareThrottle(t *testing.T) {
 					t.Fatalf("throttled after %d wrong guesses: %s", i, resp)
 				}
 			}
-			if d := s.passwordThrottle(); d <= 0 {
+			if d := s.routeThrottle.wait(); d <= 0 {
 				t.Fatalf("no lockout after %d wrong guesses", passFailFree+1)
 			}
 
@@ -320,11 +320,65 @@ func TestPasswordRoutesShareThrottle(t *testing.T) {
 				t.Fatalf("seed returned during lockout: %s", resp)
 			}
 
-			// And the lockout covers login too.
-			if resp := post(s.apiLogin, `{"pass":"guess"}`); !strings.Contains(resp, "too many") {
-				t.Fatalf("login not throttled after guesses on %s: %s", rt.name, resp)
+			// Login has its own throttle, so it is not locked out.
+			if resp := post(s.apiLogin, `{"pass":"right"}`); strings.Contains(resp, "too many") {
+				t.Fatalf("login throttled by guesses on %s: %s", rt.name, resp)
 			}
 		})
+	}
+}
+
+// TestLoginLockoutSparesRoutes checks that wrong guesses at /api/login, which
+// is reachable before authentication, lock out login but not the password
+// checks of a user who is already logged in.
+func TestLoginLockoutSparesRoutes(t *testing.T) {
+	s, tCore, shutdown := newTServer(t, false)
+	defer shutdown()
+	prevLog := log
+	log = tLogger
+	t.Cleanup(func() { log = prevLog })
+
+	login := func(pass string) string {
+		rec := httptest.NewRecorder()
+		s.apiLogin(rec, httptest.NewRequest(http.MethodPost, "/", strings.NewReader(`{"pass":"`+pass+`"}`)))
+		return rec.Body.String()
+	}
+
+	tCore.loginErr = errWrongPass
+	for i := 0; i <= passFailFree; i++ {
+		if resp := login("guess"); strings.Contains(resp, "too many") {
+			t.Fatalf("throttled after %d wrong logins: %s", i, resp)
+		}
+	}
+	if resp := login("guess"); !strings.Contains(resp, "too many") {
+		t.Fatalf("login not locked out after %d wrong guesses: %s", passFailFree+1, resp)
+	}
+
+	tCore.verifyPasswordErr = nil
+	if err := s.checkAppPassword([]byte("right")); err != nil {
+		t.Fatalf("logged-in password check refused after login guesses: %v", err)
+	}
+}
+
+// TestLoginOtherErrorsNotCounted checks that a login error other than a wrong
+// password is returned but does not count toward the login throttle.
+func TestLoginOtherErrorsNotCounted(t *testing.T) {
+	s, tCore, shutdown := newTServer(t, false)
+	defer shutdown()
+	prevLog := log
+	log = tLogger
+	t.Cleanup(func() { log = prevLog })
+
+	tCore.loginErr = errors.New("app not initialized")
+	for i := 0; i <= passFailFree; i++ {
+		rec := httptest.NewRecorder()
+		s.apiLogin(rec, httptest.NewRequest(http.MethodPost, "/", strings.NewReader(`{"pass":"right"}`)))
+		if !strings.Contains(rec.Body.String(), "not initialized") {
+			t.Fatalf("core error not returned: %s", rec.Body.String())
+		}
+	}
+	if s.loginThrottle.fails != 0 {
+		t.Fatalf("%d non-password login errors counted as wrong guesses", s.loginThrottle.fails)
 	}
 }
 
@@ -346,8 +400,8 @@ func TestPasswordCheckOtherErrorsNotCounted(t *testing.T) {
 			t.Fatalf("core error not returned: %s", rec.Body.String())
 		}
 	}
-	if s.passFails != 0 {
-		t.Fatalf("%d non-password errors counted as wrong guesses", s.passFails)
+	if s.routeThrottle.fails != 0 {
+		t.Fatalf("%d non-password errors counted as wrong guesses", s.routeThrottle.fails)
 	}
 }
 
@@ -392,16 +446,16 @@ func TestResolvePassWrongPassword(t *testing.T) {
 	if _, err := s.resolvePass([]byte("guess"), req); !errors.Is(err, errBadCredentials) {
 		t.Fatalf("wrong password not reported as bad credentials: %v", err)
 	}
-	if s.passFails != 1 {
-		t.Fatalf("wrong password counted %d times, want 1", s.passFails)
+	if s.routeThrottle.fails != 1 {
+		t.Fatalf("wrong password counted %d times, want 1", s.routeThrottle.fails)
 	}
 
 	tCore.verifyPasswordErr = nil
 	if _, err := s.resolvePass([]byte("right"), req); err != nil {
 		t.Fatalf("right password rejected: %v", err)
 	}
-	if s.passFails != 0 {
-		t.Fatalf("right password left %d failures counted", s.passFails)
+	if s.routeThrottle.fails != 0 {
+		t.Fatalf("right password left %d failures counted", s.routeThrottle.fails)
 	}
 }
 

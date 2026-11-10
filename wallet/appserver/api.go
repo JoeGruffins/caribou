@@ -16,6 +16,7 @@ import (
 
 	"github.com/bisoncraft/caribou/util/config"
 	"github.com/bisoncraft/caribou/util/encode"
+	"github.com/bisoncraft/caribou/util/encrypt"
 	pi "github.com/bisoncraft/caribou/util/politeia/pitypes"
 	"github.com/bisoncraft/caribou/wallet/asset"
 	"github.com/bisoncraft/caribou/wallet/core"
@@ -554,22 +555,22 @@ func (e badCredentials) Error() string        { return e.err.Error() }
 func (e badCredentials) Unwrap() error        { return e.err }
 func (e badCredentials) Is(target error) bool { return target == errBadCredentials }
 
-// throttledLogin is actuallyLogin under the password throttle.
+// throttledLogin is actuallyLogin under the login password throttle.
 func (s *AppServer) throttledLogin(w http.ResponseWriter, r *http.Request, login *loginForm) error {
 	s.passCheckMtx.Lock()
 	defer s.passCheckMtx.Unlock()
-	if d := s.passwordThrottle(); d > 0 {
+	if d := s.loginThrottle.wait(); d > 0 {
 		return passwordThrottled{d}
 	}
 	if err := s.actuallyLogin(w, r, login); err != nil {
-		// Only a rejected password counts toward the throttle; environmental
+		// Only a rejected password counts toward the throttle. Environmental
 		// errors must not lock out the (single) legitimate client.
 		if errors.Is(err, errBadCredentials) {
-			s.notePasswordFailure()
+			s.loginThrottle.fail()
 		}
 		return err
 	}
-	s.notePasswordSuccess()
+	s.loginThrottle.succeed()
 	return nil
 }
 
@@ -1134,7 +1135,13 @@ func (s *AppServer) actuallyLogin(w http.ResponseWriter, r *http.Request, login 
 	}
 	err = s.core.Login(pass)
 	if err != nil {
-		return badCredentials{fmt.Errorf("login error: %w", err)}
+		err = fmt.Errorf("login error: %w", err)
+		// Only a wrong password is a rejected credential. Other login errors
+		// (not initialized, seed decryption) must not feed the throttle.
+		if errors.Is(err, encrypt.ErrIncorrectPassword) {
+			return badCredentials{err}
+		}
+		return err
 	}
 
 	if !s.isAuthed(r) {

@@ -145,8 +145,9 @@ To rotate, just generate a new token; the old hash is overwritten.
   box.
 - **Spending is still password-gated.** `send`, `bridge`, the bridge contract
   approvals (and other password-bearing actions) require the app password in
-  the body even with a valid token. Wrong passwords count toward the same
-  throttle as the login screen.
+  the body even with a valid token. Wrong passwords are throttled. The login
+  screen has its own throttle, so guesses there cannot lock a logged-in client
+  out of these actions.
 - **One token at a time.** Generating a token replaces the previous one. There
   is a single local-token slot.
 - **Shared session semantics.** The wallet has one logged-in core shared by all

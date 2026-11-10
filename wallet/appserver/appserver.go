@@ -300,11 +300,16 @@ type AppServer struct {
 	// passCheckMtx serializes app password checks, so the throttle check, the
 	// key derivation and the failure accounting are one step. Without it, a
 	// burst of concurrent guesses would all pass the throttle check before any
-	// failure was counted. It also guards passFails and passLockUntil. Take it
-	// before sessionMtx, never while holding it.
-	passCheckMtx  sync.Mutex
-	passFails     int
-	passLockUntil time.Time
+	// failure was counted. It also guards loginThrottle and routeThrottle. Take
+	// it before sessionMtx, never while holding it.
+	passCheckMtx sync.Mutex
+	// loginThrottle counts wrong passwords at /api/login, which is reachable
+	// before authentication. routeThrottle counts wrong passwords on the
+	// authenticated routes that take an explicit password. They are separate
+	// so an unauthenticated caller guessing at login cannot lock the
+	// logged-in user out of sends and other password-gated actions.
+	loginThrottle passThrottle
+	routeThrottle passThrottle
 
 	companionToken        string
 	companionTokenHash    string // hex(sha256(token)), persisted to DB
@@ -1137,35 +1142,40 @@ func hashToken(token string) string {
 	return hex.EncodeToString(h[:])
 }
 
-// passwordThrottle returns the remaining lockout duration, or 0 if an app
-// password may be tried now. The counter is global, not per-IP. The
-// passCheckMtx must be held.
-func (s *AppServer) passwordThrottle() time.Duration {
-	if d := time.Until(s.passLockUntil); d > 0 {
+// passThrottle tracks consecutive wrong app passwords for one class of
+// password check. The counter is global, not per-IP. Its methods must be
+// called with the AppServer's passCheckMtx held.
+type passThrottle struct {
+	fails     int
+	lockUntil time.Time
+}
+
+// wait returns the remaining lockout duration, or 0 if a password may be tried
+// now.
+func (t *passThrottle) wait() time.Duration {
+	if d := time.Until(t.lockUntil); d > 0 {
 		return d
 	}
 	return 0
 }
 
-// notePasswordFailure records a wrong app password. Once the free-attempt
-// budget is exhausted it extends a capped exponential lockout window. The
-// passCheckMtx must be held.
-func (s *AppServer) notePasswordFailure() {
-	s.passFails++
-	if n := s.passFails - passFailFree; n > 0 {
+// fail records a wrong app password. Once the free-attempt budget is
+// exhausted it extends a capped exponential lockout window.
+func (t *passThrottle) fail() {
+	t.fails++
+	if n := t.fails - passFailFree; n > 0 {
 		backoff := passBackoffBase << min(n-1, 20) // cap the shift well short of overflow
 		if backoff <= 0 || backoff > passBackoffMax {
 			backoff = passBackoffMax
 		}
-		s.passLockUntil = time.Now().Add(backoff)
+		t.lockUntil = time.Now().Add(backoff)
 	}
 }
 
-// notePasswordSuccess clears the failed-password state. The passCheckMtx must
-// be held.
-func (s *AppServer) notePasswordSuccess() {
-	s.passFails = 0
-	s.passLockUntil = time.Time{}
+// succeed clears the failed-password state.
+func (t *passThrottle) succeed() {
+	t.fails = 0
+	t.lockUntil = time.Time{}
 }
 
 // passwordThrottled is returned while the password throttle is locked out.
@@ -1176,23 +1186,23 @@ func (e passwordThrottled) Error() string {
 }
 
 // withAppPassword runs fn, which checks a caller-supplied app password, under
-// the password throttle. fn is not run while the throttle is locked out. An
+// the route password throttle. fn is not run while the throttle is locked out. An
 // error from fn that wraps encrypt.ErrIncorrectPassword counts as a wrong
 // guess and is returned as badCredentials. Other errors are not counted.
 func (s *AppServer) withAppPassword(fn func() error) error {
 	s.passCheckMtx.Lock()
 	defer s.passCheckMtx.Unlock()
-	if d := s.passwordThrottle(); d > 0 {
+	if d := s.routeThrottle.wait(); d > 0 {
 		return passwordThrottled{d}
 	}
 	if err := fn(); err != nil {
 		if errors.Is(err, encrypt.ErrIncorrectPassword) {
-			s.notePasswordFailure()
+			s.routeThrottle.fail()
 			return badCredentials{err}
 		}
 		return err
 	}
-	s.notePasswordSuccess()
+	s.routeThrottle.succeed()
 	return nil
 }
 
