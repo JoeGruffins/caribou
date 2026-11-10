@@ -31,7 +31,6 @@ const (
 	BipID            = 128
 	walletTypeNative = "native"
 
-	defaultFee          = 3 // Priority level 0-4, default to low
 	defaultFeeRateLimit = 30
 
 	// Refresh interval for sync status checks during normal operation.
@@ -1124,11 +1123,14 @@ func (w *ExchangeWallet) estimateFee(address string, value uint64) (uint64, erro
 // this wallet will broadcast. The fee rate comes from the daemon, which may be
 // a third party, so it is not taken on trust.
 //
-// Mainnet in July 2026 quotes 4000000 atoms per weight unit at the most
-// expensive priority (Last), so this allows 5x that. A standard 1500 byte send
-// can then cost at most 0.03 XMR. For the transactions this wallet builds (at
-// most two outputs each) weight equals size, so atoms per byte is the rate the
-// daemon quoted.
+// Under the 2021 fee scaling, with the tail emission reward of 0.6 XMR, every
+// priority's rate falls as block weight grows and the medians cannot drop
+// below 300 kB. So the honest maximum is 4000000 atoms per weight unit at the
+// most expensive priority (Last), reached on a quiet chain. A replay of every
+// block from the fork (Aug 2022) to Nov 2026 never quoted more. This allows 5x
+// that. A standard 1500 byte send can then cost at most 0.03 XMR. For the
+// transactions this wallet builds (at most two outputs each) weight equals
+// size, so atoms per byte is the rate the daemon quoted.
 const maxTxFeeRate = 20_000_000
 
 // checkTxFee refuses a built transaction whose fee is above maxTxFeeRate. txHex
