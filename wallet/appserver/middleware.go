@@ -26,7 +26,7 @@ import (
 func (s *AppServer) hostMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if !s.allowedHost(r.Host) {
-			http.Error(w, "invalid Host header", http.StatusMisdirectedRequest)
+			http.Error(w, "invalid Host header. To reach the server by this name, set it with --webaddr", http.StatusMisdirectedRequest)
 			return
 		}
 		next.ServeHTTP(w, r)
@@ -69,10 +69,17 @@ func hostOnly(hostport string) string {
 // other apps cannot present the token, so they cannot reach the SPA, the
 // unauthenticated API routes (e.g. /api/login), or the notification websocket.
 //
+// Two kinds of request skip the gate, because they carry their own proof:
+//   - a valid local API token, so automation can drive a gated server. It
+//     needs the secret token and a loopback peer.
+//   - a connection on the onion listener. Those come from the Tor network,
+//     where the companion app has its own pairing, so the gate adds nothing.
+//     The listener is identified by the connection, not the Host header.
+//
 // When no token is configured the gate is a no-op.
 func (s *AppServer) capabilityMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if s.capToken == "" {
+		if s.capToken == "" || s.isOnionRequest(r) || s.apiTokenAuthorized(r) {
 			next.ServeHTTP(w, r)
 			return
 		}

@@ -924,4 +924,35 @@ func TestCapabilityGate(t *testing.T) {
 	if rec := serve(req); rec.Code == http.StatusNotFound {
 		t.Fatal("request with the capability cookie got 404")
 	}
+
+	// A local API token gets in without the cookie, so automation still works.
+	const apiToken = "automation-token"
+	s.apiTokenHash = hashToken(apiToken)
+	tokenReq := func(token, remote string) *http.Request {
+		req := httptest.NewRequest(http.MethodGet, "http://127.0.0.1:5758/api/user", nil)
+		req.Header.Set(apiTokenHeader, token)
+		req.RemoteAddr = remote
+		return req
+	}
+	if rec := serve(tokenReq(apiToken, "127.0.0.1:40000")); rec.Code == http.StatusNotFound {
+		t.Fatal("request with a valid API token got 404")
+	}
+	if rec := serve(tokenReq("wrong", "127.0.0.1:40000")); rec.Code != http.StatusNotFound {
+		t.Fatalf("request with a wrong API token: %d, want 404", rec.Code)
+	}
+	if rec := serve(tokenReq(apiToken, "192.0.2.1:40000")); rec.Code != http.StatusNotFound {
+		t.Fatalf("API token from a remote peer: %d, want 404", rec.Code)
+	}
+
+	// The onion listener skips the gate. A Host header naming the onion does
+	// not, since only the listener marks a request as onion.
+	s.onionHost = "abc.onion"
+	req = httptest.NewRequest(http.MethodGet, "http://abc.onion/api/user", nil)
+	if rec := serve(req); rec.Code != http.StatusNotFound {
+		t.Fatalf("onion Host header without the onion listener: %d, want 404", rec.Code)
+	}
+	req = req.WithContext(context.WithValue(req.Context(), onionConnKey{}, true))
+	if rec := serve(req); rec.Code == http.StatusNotFound {
+		t.Fatal("request on the onion listener got 404")
+	}
 }
