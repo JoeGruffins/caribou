@@ -59,13 +59,13 @@ const (
 	apiTokenHeader = "X-API-Token"
 	// capCK is the capability token cookie key. See capabilityMiddleware.
 	capCK = "capkey"
-	// loginFailFree is the number of consecutive failed logins allowed before
-	// the throttle starts delaying further attempts.
-	loginFailFree = 5
-	// loginBackoffBase and loginBackoffMax bound the capped exponential
-	// lockout applied to /api/login once loginFailFree is exceeded.
-	loginBackoffBase = time.Second
-	loginBackoffMax  = 5 * time.Minute
+	// passFailFree is the number of consecutive wrong app passwords allowed
+	// before the throttle starts delaying further attempts.
+	passFailFree = 5
+	// passBackoffBase and passBackoffMax bound the capped exponential lockout
+	// applied to every app password check once passFailFree is exceeded.
+	passBackoffBase = time.Second
+	passBackoffMax  = 5 * time.Minute
 	// notifyRoute is a route used for general notifications.
 	notifyRoute = "notify"
 	// The basis for content-security-policy. connect-src must be the final
@@ -297,9 +297,19 @@ type AppServer struct {
 	// authMtx.
 	pendingGrants map[string]*sessionGrant
 
-	loginMtx       sync.Mutex
-	loginFails     int
-	loginLockUntil time.Time
+	// passCheckMtx serializes app password checks, so the throttle check, the
+	// key derivation and the failure accounting are one step. Without it, a
+	// burst of concurrent guesses would all pass the throttle check before any
+	// failure was counted. It also guards loginThrottle and routeThrottle. Take
+	// it before sessionMtx, never while holding it.
+	passCheckMtx sync.Mutex
+	// loginThrottle counts wrong passwords at /api/login, which is reachable
+	// before authentication. routeThrottle counts wrong passwords on the
+	// authenticated routes that take an explicit password. They are separate
+	// so an unauthenticated caller guessing at login cannot lock the
+	// logged-in user out of sends and other password-gated actions.
+	loginThrottle passThrottle
+	routeThrottle passThrottle
 
 	companionToken        string
 	companionTokenHash    string // hex(sha256(token)), persisted to DB
@@ -1132,40 +1142,74 @@ func hashToken(token string) string {
 	return hex.EncodeToString(h[:])
 }
 
-// loginThrottle returns the remaining lockout duration, or 0 if a login may be
-// attempted now. The counter is a single global one, not per-IP: the wallet is
-// single-client and the gate above already limits who can reach /api/login.
-func (s *AppServer) loginThrottle() time.Duration {
-	s.loginMtx.Lock()
-	defer s.loginMtx.Unlock()
-	if d := time.Until(s.loginLockUntil); d > 0 {
+// passThrottle tracks consecutive wrong app passwords for one class of
+// password check. The counter is global, not per-IP. Its methods must be
+// called with the AppServer's passCheckMtx held.
+type passThrottle struct {
+	fails     int
+	lockUntil time.Time
+}
+
+// wait returns the remaining lockout duration, or 0 if a password may be tried
+// now.
+func (t *passThrottle) wait() time.Duration {
+	if d := time.Until(t.lockUntil); d > 0 {
 		return d
 	}
 	return 0
 }
 
-// noteLoginFailure records a failed login. Once the free-attempt budget is
-// exhausted it extends a capped exponential lockout window, blunting password
-// brute-force from anything that can reach the loopback server.
-func (s *AppServer) noteLoginFailure() {
-	s.loginMtx.Lock()
-	defer s.loginMtx.Unlock()
-	s.loginFails++
-	if n := s.loginFails - loginFailFree; n > 0 {
-		backoff := loginBackoffBase << min(n-1, 20) // cap the shift well short of overflow
-		if backoff <= 0 || backoff > loginBackoffMax {
-			backoff = loginBackoffMax
+// fail records a wrong app password. Once the free-attempt budget is
+// exhausted it extends a capped exponential lockout window.
+func (t *passThrottle) fail() {
+	t.fails++
+	if n := t.fails - passFailFree; n > 0 {
+		backoff := passBackoffBase << min(n-1, 20) // cap the shift well short of overflow
+		if backoff <= 0 || backoff > passBackoffMax {
+			backoff = passBackoffMax
 		}
-		s.loginLockUntil = time.Now().Add(backoff)
+		t.lockUntil = time.Now().Add(backoff)
 	}
 }
 
-// noteLoginSuccess clears the failed-login state.
-func (s *AppServer) noteLoginSuccess() {
-	s.loginMtx.Lock()
-	defer s.loginMtx.Unlock()
-	s.loginFails = 0
-	s.loginLockUntil = time.Time{}
+// succeed clears the failed-password state.
+func (t *passThrottle) succeed() {
+	t.fails = 0
+	t.lockUntil = time.Time{}
+}
+
+// passwordThrottled is returned while the password throttle is locked out.
+type passwordThrottled struct{ wait time.Duration }
+
+func (e passwordThrottled) Error() string {
+	return fmt.Sprintf("too many wrong password attempts, try again in %s", e.wait.Round(time.Second))
+}
+
+// withAppPassword runs fn, which checks a caller-supplied app password, under
+// the route password throttle. fn is not run while the throttle is locked out. An
+// error from fn that wraps encrypt.ErrIncorrectPassword counts as a wrong
+// guess and is returned as badCredentials. Other errors are not counted.
+func (s *AppServer) withAppPassword(fn func() error) error {
+	s.passCheckMtx.Lock()
+	defer s.passCheckMtx.Unlock()
+	if d := s.routeThrottle.wait(); d > 0 {
+		return passwordThrottled{d}
+	}
+	if err := fn(); err != nil {
+		if errors.Is(err, encrypt.ErrIncorrectPassword) {
+			s.routeThrottle.fail()
+			return badCredentials{err}
+		}
+		return err
+	}
+	s.routeThrottle.succeed()
+	return nil
+}
+
+// checkAppPassword verifies a caller-supplied app password under the password
+// throttle.
+func (s *AppServer) checkAppPassword(pw []byte) error {
+	return s.withAppPassword(func() error { return s.core.VerifyPassword(pw) })
 }
 
 // getCachedPassword retrieves the cached password for the user identified by authToken and
