@@ -293,10 +293,16 @@ type ExchangeWallet struct {
 	dataDir    string
 	walletMtx  sync.RWMutex
 
-	daemonAddr  string
-	daemonUser  string
-	daemonPass  string
-	torProxy    string
+	daemonAddr string
+	daemonUser string
+	daemonPass string
+	torProxy   string
+	// TODO: Priority 4 (Last) is not honored. On the simnet harness a send
+	// at priority 4 is built and broadcast at exactly the priority 1 fee,
+	// while stock monero-wallet-rpc v0.18.5.4 quotes the full Last rate for
+	// the same transfer. Priorities 1-3 match stock. The priority reaches
+	// MONERO_Wallet_createTransaction unchanged, so the downgrade happens
+	// inside our monero_c v0.18.4.6 build. Needs investigating.
 	feePriority cxmr.Priority
 
 	tipAtConnect  uint64
