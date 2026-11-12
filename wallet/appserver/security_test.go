@@ -798,7 +798,6 @@ func TestHostAllowlist(t *testing.T) {
 	s, _, shutdown := newTServer(t, false)
 	defer shutdown()
 	s.webHost = hostOnly("mywallet.lan:5758")
-	s.onionHost = hostOnly("abcdefghijklmnopqrstuvwxyz234567abcdefghijklmnopqrstuvwx.onion")
 
 	allowed := []string{
 		"127.0.0.1:5758",
@@ -809,8 +808,6 @@ func TestHostAllowlist(t *testing.T) {
 		"LOCALHOST:5758",
 		"mywallet.lan:5758", // the configured --webaddr host
 		"mywallet.lan.",
-		"abcdefghijklmnopqrstuvwxyz234567abcdefghijklmnopqrstuvwx.onion",
-		"abcdefghijklmnopqrstuvwxyz234567abcdefghijklmnopqrstuvwx.onion:80",
 	}
 	refused := []string{
 		"evil.example:5758", // the rebinding case
@@ -818,30 +815,45 @@ func TestHostAllowlist(t *testing.T) {
 		"localhost.evil.example:5758",
 		"127.0.0.1.evil.example:5758",
 		"sub.localhost:5758",
-		"other.onion",
+		// An onion name is only trusted on the onion listener.
+		"abcdefghijklmnopqrstuvwxyz234567abcdefghijklmnopqrstuvwx.onion",
 		"",
 	}
 
-	serve := func(host string) int {
+	serve := func(host string, onion bool) int {
 		t.Helper()
 		req := httptest.NewRequest(http.MethodPost, "http://127.0.0.1/api/login", strings.NewReader(`{"pass":"x"}`))
 		req.Host = host
 		req.Header.Set("Content-Type", "application/json")
+		if onion {
+			req = req.WithContext(context.WithValue(req.Context(), onionConnKey{}, true))
+		}
 		rec := httptest.NewRecorder()
 		s.mux.ServeHTTP(rec, req)
 		return rec.Code
 	}
 	for _, h := range allowed {
-		if code := serve(h); code == http.StatusMisdirectedRequest {
+		if code := serve(h, false); code == http.StatusMisdirectedRequest {
 			t.Errorf("Host %q refused, want allowed", h)
 		}
 	}
 	for _, h := range refused {
-		if code := serve(h); code != http.StatusMisdirectedRequest {
+		if code := serve(h, false); code != http.StatusMisdirectedRequest {
 			t.Errorf("Host %q got %d, want %d", h, code, http.StatusMisdirectedRequest)
 		}
 	}
 
+	// On the onion listener the Host header is the remote Tor client's, in
+	// whatever form it sends the onion name, so it is not checked.
+	for _, h := range []string{
+		"abcdefghijklmnopqrstuvwxyz234567abcdefghijklmnopqrstuvwx.onion",
+		"abcdefghijklmnopqrstuvwxyz234567abcdefghijklmnopqrstuvwx.onion:80",
+		"ABCDEFGHIJKLMNOPQRSTUVWXYZ234567ABCDEFGHIJKLMNOPQRSTUVWX.ONION",
+	} {
+		if code := serve(h, true); code == http.StatusMisdirectedRequest {
+			t.Errorf("Host %q on the onion listener refused, want allowed", h)
+		}
+	}
 }
 
 // TestCapabilityGate checks Config.CapabilityGate, which the desktop shells
@@ -944,15 +956,36 @@ func TestCapabilityGate(t *testing.T) {
 		t.Fatalf("API token from a remote peer: %d, want 404", rec.Code)
 	}
 
-	// The onion listener skips the gate. A Host header naming the onion does
-	// not, since only the listener marks a request as onion.
-	s.onionHost = "abc.onion"
+	// The onion listener skips both the Host check and the gate. A Host header
+	// naming an onion does not, since only the listener marks a request as
+	// onion.
 	req = httptest.NewRequest(http.MethodGet, "http://abc.onion/api/user", nil)
-	if rec := serve(req); rec.Code != http.StatusNotFound {
-		t.Fatalf("onion Host header without the onion listener: %d, want 404", rec.Code)
+	if rec := serve(req); rec.Code != http.StatusMisdirectedRequest {
+		t.Fatalf("onion Host header without the onion listener: %d, want 421", rec.Code)
 	}
 	req = req.WithContext(context.WithValue(req.Context(), onionConnKey{}, true))
-	if rec := serve(req); rec.Code == http.StatusNotFound {
-		t.Fatal("request on the onion listener got 404")
+	if rec := serve(req); rec.Code == http.StatusNotFound || rec.Code == http.StatusMisdirectedRequest {
+		t.Fatalf("request on the onion listener: %d, want it past the Host check and the gate", rec.Code)
+	}
+}
+
+// TestNoBrowserBanner checks that a shell opening its own windows can turn off
+// the banner, which carries the capability token when the gate is on.
+func TestNoBrowserBanner(t *testing.T) {
+	for _, off := range []bool{false, true} {
+		s, err := New(&Config{
+			Core:            &TCore{},
+			Addr:            "127.0.0.1:0",
+			Logger:          tLogger,
+			AppVersion:      testAppVersion,
+			CapabilityGate:  true,
+			NoBrowserBanner: off,
+		})
+		if err != nil {
+			t.Fatalf("New: %v", err)
+		}
+		if want := printBrowserBanner && !off; s.banner != want {
+			t.Errorf("NoBrowserBanner %v: banner = %v, want %v", off, s.banner, want)
+		}
 	}
 }

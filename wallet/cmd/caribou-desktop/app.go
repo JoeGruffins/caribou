@@ -204,8 +204,9 @@ func mainCore() error {
 
 	webCfg := cfg.Web(clientCore, logMaker.Logger("WEB"), utc)
 	// This shell opens every window itself, so only its windows need to
-	// reach the server.
+	// reach the server, and nobody needs the banner's URL.
 	webCfg.CapabilityGate = true
+	webCfg.NoBrowserBanner = true
 	webSrv, err := appserver.New(webCfg)
 	if err != nil {
 		return fmt.Errorf("failed creating web server: %w", err)

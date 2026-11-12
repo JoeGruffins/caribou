@@ -22,11 +22,16 @@ import (
 //   - "localhost", which browsers resolve to loopback without DNS.
 //   - the host of the configured listen address (--webaddr), which may be a
 //     name.
-//   - the onion address, when the hidden service is on.
+//
+// Connections on the onion listener skip the check. Their Host header is set
+// by a remote Tor client, and a rebinding page cannot reach the relay port, so
+// the check protects nothing there. The listener is identified by the
+// connection, as in capabilityMiddleware.
 func (s *AppServer) hostMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if !s.allowedHost(r.Host) {
-			http.Error(w, "invalid Host header. To reach the server by this name, set it with --webaddr", http.StatusMisdirectedRequest)
+		if !s.isOnionRequest(r) && !s.allowedHost(r.Host) {
+			http.Error(w, "invalid Host header. To reach the server by this name, set it with --webaddr, "+
+				"or use the server's IP address in the URL", http.StatusMisdirectedRequest)
 			return
 		}
 		next.ServeHTTP(w, r)
@@ -43,8 +48,7 @@ func (s *AppServer) allowedHost(hostport string) bool {
 	if net.ParseIP(host) != nil || host == "localhost" {
 		return true
 	}
-	// onionHost is set in Connect before any listener serves.
-	return host == s.webHost || host == s.onionHost
+	return host == s.webHost
 }
 
 // hostOnly returns the lowercased host part of a host[:port] string, without
