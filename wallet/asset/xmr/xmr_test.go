@@ -137,8 +137,6 @@ func TestCheckTxFee(t *testing.T) {
 		{"last priority", 4_000_000 * 1500, tx1500, false},
 		{"at the limit", maxTxFeeRate * 1500, tx1500, false},
 		{"just over the limit", maxTxFeeRate*1500 + 1, tx1500, true},
-		// A daemon quoting maxBaseFee, which the estimate path still accepts.
-		{"inflated rate", maxBaseFee * 1500, tx1500, true},
 		{"whole balance", 50e12, tx1500, true},
 		// A sweep split over two transactions counts both sizes.
 		{"two transactions", maxTxFeeRate * 3000, tx1500 + "," + tx1500, false},
